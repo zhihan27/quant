@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
@@ -11,6 +12,7 @@ from config import settings
 from services.backtest import run_backtest, save_backtest_run
 from services.database import DatabaseError
 from services.market_data import MarketDataError, completed_daily_history, history_is_current
+from services.model_governance import current_model_status
 from services.rank_model import SCORE_KIND_RANK, objective_label
 from services.stock_scoring import analyze_stock
 from services.statistical_arbitrage import analyze_pair
@@ -19,6 +21,8 @@ from services.ui_helpers import show_backtest_metrics as _show_backtest_metrics
 from services.ui_helpers import show_candles as _show_candles
 from services.ui_helpers import loading_task, show_conclusion, show_empty_state, show_page_header, show_plain_numbers
 from services.runtime import get_market_data, get_repository
+
+SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 st.set_page_config(page_title="个股分析 | A 股量化研究", layout="wide")
 show_page_header(
@@ -51,6 +55,19 @@ def _stock_conclusion(plan: dict) -> tuple[str, str]:
         return (f"模型这次不支持直接买入（{plan.get('status')}）。下方价格仅供复核，不要据此下单。", "warn")
     return ("模型这次没有给出可用判断，原因见下方「模型判断」。", "warn")
 
+
+# 降级状态只读一次、整页共用：逐股分析里再查一次库既慢又没有意义。
+model_health = current_model_status(get_repository())
+scoring_paused = bool(model_health["degraded"])
+if scoring_paused:
+    st.error(
+        f"**{settings.DEGRADED_SCORING_MESSAGE}。** 原因：{model_health['reason'] or '未记录'}；"
+        f"自 {model_health['since'].astimezone(SHANGHAI).strftime('%Y-%m-%d %H:%M') if model_health['since'] else '未记录'}。"
+        "下方的因子观察与价格参考仍然可用，但不再包含模型判断。",
+        icon=":material/report:",
+    )
+elif model_health["error"]:
+    st.warning(f"{model_health['error']}；本次按未降级处理，模型评分正常输出。", icon=":material/warning:")
 
 service = get_market_data()
 if st.query_params.get("code") and st.session_state.get("query_code") != st.query_params.get("code"):
@@ -172,6 +189,7 @@ if run_analysis:
                 as_of=quote.get("quote_time") or quote.get("fetched_at"),
                 quote_status=quote.get("data_status"),
                 history_ready=history_is_current(completed, quote, daily_meta),
+                scoring_paused=scoring_paused,
             )
             st.session_state["stock_analysis"] = {
                 "code": selected_code,

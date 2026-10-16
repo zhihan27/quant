@@ -116,7 +116,10 @@ class QuantRepository:
 
     def initialize(self) -> None:
         """在事务和咨询锁保护下执行首次建表，不覆盖已有业务数据。"""
-        migrations = ["001_portfolio_monitor.sql", "002_monitor_indexes.sql", "003_auth.sql", "004_admin_roles.sql"]
+        migrations = [
+            "001_portfolio_monitor.sql", "002_monitor_indexes.sql", "003_auth.sql", "004_admin_roles.sql",
+            "005_model_governance.sql",
+        ]
         with self.connect() as connection:
             exists = connection.execute("SELECT to_regclass('public.quant_schema_versions') AS name").fetchone()["name"]
             version = connection.execute("SELECT COALESCE(max(version),0) AS version FROM public.quant_schema_versions").fetchone()["version"] if exists else 0

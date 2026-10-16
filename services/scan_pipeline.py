@@ -247,13 +247,25 @@ def run_scan_pipeline(
     candidates: list[dict[str, Any]],
     source_meta: dict[str, Any],
     progress: ProgressCallback | None = None,
+    governance: Any | None = None,
 ) -> ScanResult:
     """按 options 扫描 candidates 并返回可直接渲染的结果。
 
     顺序约束（原页面靠代码恰好写对才成立，这里写成结构并由单测钉住）：
     组合回测在逐股评分循环之前跑完，逐股历史在全部计算结束之后才释放。
+
+    ``governance`` 是模型治理钩子（``services/model_governance.py::ScanGovernance``），
+    按鸭子类型使用它的 ``scoring_paused()`` 与 ``after_scan()`` 两个方法。
+    **默认 None 表示完全不启用治理**——这不是为了省事，而是因为本函数的单测
+    在不连任何数据库的进程里跑（tests/test_scan_pipeline.py），
+    治理必须是可以摘掉的一层，而不是一个「默默去连库、失败就吞掉」的暗桩。
     """
     result = ScanResult(options=options, source_meta=source_meta)
+    # 治理状态在循环开始前只读一次：逐股评分时再查库既无意义又慢，
+    # 而扫描中途被降级这种情况本来就该由下一轮扫描来处理。
+    scoring_paused = bool(governance.scoring_paused()) if governance is not None else False
+    if scoring_paused:
+        result.note("warning", f"{settings.DEGRADED_SCORING_MESSAGE}：本轮扫描只输出传统因子观察，不输出模型评分。")
     benchmark = _fetch_benchmark(service, result, progress)
 
     records: list[dict[str, Any]] = []
@@ -320,9 +332,16 @@ def run_scan_pipeline(
     except (ValueError, OSError, ImportError) as exc:
         result.note("warning", f"截面模型不可用：{exc}；本次只展示传统因子观察。")
 
+    # 面板只读一次，组合回测与治理的漂移监控共用同一份：两次读盘会读到内存里两份
+    # 几十兆的 DataFrame，而它们本来就该是同一次扫描的同一个截面。
+    # 两个用途都没开时干脆不读——这份 parquet 有二十多兆，白读一次是纯浪费。
+    panel: pd.DataFrame | None = None
+    if context and (options.run_portfolio or governance is not None):
+        _, panel = load_context(include_panel=True)
+
     if options.run_portfolio and context:
         _report(progress, "正在滚动重训截面排序模型并逐日调仓回测…")
-        _, portfolio_panel = load_context(include_panel=True)
+        portfolio_panel = panel
         if portfolio_panel is None or portfolio_panel.empty:
             result.note("warning", "未能读取本次截面面板，组合回测已跳过。")
         else:
@@ -350,6 +369,7 @@ def run_scan_pipeline(
             horizons=(5, 20, 60), code=code,
             as_of=quote.get("quote_time") or quote.get("fetched_at"),
             quote_status=quote.get("data_status"), market_context=context,
+            scoring_paused=scoring_paused,
         )
         item["features"] = item["analysis"]["latest_features"]
         item["analysis"].pop("features", None)
@@ -367,6 +387,19 @@ def run_scan_pipeline(
     # 到这里组合回测与逐股评分都已用完 history，可以释放扫描期间收集的逐股历史。
     for item in ready:
         item.pop("history", None)
+
+    if governance is not None and context:
+        # 治理放在最后：它不影响本次扫描的任何结果，只负责把结果记下来并判定告警。
+        # 因此排在评分汇总之前、逐股历史释放之后，不占用任何数据依赖。
+        _report(progress, "正在写入模型通过率与漂移记录…")
+        try:
+            summary = governance.after_scan(context, panel)
+        except Exception as exc:  # 治理的任何意外都不该让已经算完的扫描结果丢掉
+            LOGGER.exception("模型治理收尾失败：%s", exc)
+            result.note("warning", f"模型治理未完成：{type(exc).__name__}: {exc}")
+        else:
+            for level, text in governance.notes(summary):
+                result.note(level, text)
 
     _report(progress, "所有股票处理结束，正在汇总评分与排序…", total, total)
     result.recommendations = rank_candidates(records)

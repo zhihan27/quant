@@ -25,9 +25,10 @@ from services.auth import (
 )
 from services.database import connection_settings
 
-# 导航始终注册的业务页；账号管理页只对管理员注册，因此不属于公开路由。
+# 导航始终注册的业务页；账号管理与模型健康页只对管理员注册，因此不属于公开路由。
 BUSINESS_PAGES = ["1_个股分析.py", "2_量化选股.py", "3_自选与持仓.py", "4_盘中监控.py"]
 ACCOUNT_PAGE = "5_账号管理.py"
+MODEL_HEALTH_PAGE = "6_模型健康.py"
 
 
 class AuthInputTests(unittest.TestCase):
@@ -377,6 +378,34 @@ class AuthDatabaseTests(unittest.TestCase):
             # 初始口令未换时页面必须持续告警，且待激活账号出现在清单里。
             self.assertTrue(any("初始密码" in item.value for item in app.warning))
             self.assertIn("newcomer", app.selectbox[0].options)
+
+    def test_model_health_page_is_registered_only_for_administrators(self):
+        """模型健康页同样只对管理员注册；普通账号既看不到入口，也不能直接打开路径。
+
+        这一页会显示降级状态与回滚按钮，越权可见等于把治理结论与生产模型的操作入口
+        一起交出去，因此路由与页内校验两道防线都要钉住。
+        """
+        self.service.create_pending_user("newcomer")
+        self.service.ensure_initial_admin()
+        health_page = str(settings.PROJECT_ROOT / "pages" / MODEL_HEALTH_PAGE)
+        with patch("services.auth_ui.get_auth_service", return_value=self.service), patch(
+            "services.runtime.get_repository", return_value=self.repository
+        ), patch.dict(os.environ, {"QUANT_DISABLE_MONITOR": "1"}):
+            app = AppTest.from_file(settings.PROJECT_ROOT / "app.py", default_timeout=20)
+            app.session_state["auth_token"] = self.service.login("tester", self.password, "127.0.0.1")
+            app.run()
+            # 导航项不在 AppTest 的可读元素里，但「未注册的路由打不开」是同一件事的
+            # 硬证据：st.navigation 没登记这条路径，switch_page 就找不到它。
+            with self.assertRaises(ValueError):
+                app.switch_page(health_page)
+
+            app.session_state["auth_token"] = self.service.login("admin", INITIAL_ADMIN_PASSWORD, "127.0.0.1")
+            app.run()
+            app.switch_page(health_page).run()
+            self.assertFalse(app.exception)
+            self.assertTrue(any("模型健康" in item.value for item in app.markdown))
+            self.assertEqual([tab.label for tab in app.tabs],
+                             ["通过率", "漂移看板", "最终留出集", "模型版本与回滚", "告警"])
 
 
 if __name__ == "__main__":

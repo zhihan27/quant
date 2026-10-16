@@ -31,6 +31,9 @@ if account and account["is_admin"]:
     navigation.append(
         st.Page(project / "pages" / "5_账号管理.py", title="账号管理", icon=":material/manage_accounts:", url_path="accounts")
     )
+    navigation.append(
+        st.Page(project / "pages" / "6_模型健康.py", title="模型健康", icon=":material/health_and_safety:", url_path="model-health")
+    )
 page = st.navigation(navigation, position="sidebar" if account else "hidden")
 require_login()
 

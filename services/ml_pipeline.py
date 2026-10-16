@@ -162,6 +162,39 @@ def normalize_predictions(frame: pd.DataFrame, prediction_column: str = "predict
     return result
 
 
+def evaluation_gates(metrics: dict[str, Any]) -> dict[str, Any]:
+    """逐道门槛的通过情况与第一道未通过的门槛，供评估与监控共用一份判定。
+
+    只读取 ``evaluate_oos`` 已经算好的标量，不重算任何指标，因此抽出来不会改变任何数值。
+    之所以要共用：页面上显示的「这轮为什么没通过」必须与当时真正拦下模型的理由逐字一致，
+    两处各写一份判定迟早会各改一半，用户看到的失败原因就成了假的。
+
+    判定顺序与原始实现逐字保持一致：样本天数 → Rank IC → HAC t → Top 超额 → Top-Bottom
+    → 排序目标看 NDCG、回归目标看 MAE。``failed_gate`` 取其中第一道未通过的。
+    """
+    ranking = metrics.get("score_kind") == SCORE_KIND_RANK
+    ic_mean, ic_t = metrics.get("rank_ic"), metrics.get("rank_ic_hac_t")
+    top, universe = metrics.get("top_excess_return"), metrics.get("universe_excess_return")
+    spread = metrics.get("top_bottom_spread")
+    ndcg_ratio = metrics.get("ndcg_ratio")
+    mae, baseline_mae = metrics.get("mae"), metrics.get("baseline_mae")
+    # 每一项都显式判 None：监控读回的是落库/落盘后再取出的记录，
+    # 未生成样本外指标时这些字段确实是空值，不能让 None 参与比较。
+    gates = {
+        "dates": int(metrics.get("dates") or 0) >= MINIMUM_OOS_DATES,
+        "rank_ic": ic_mean is not None and float(ic_mean) > MINIMUM_RANK_IC,
+        "ic_t": ic_t is not None and float(ic_t) > MINIMUM_IC_T,
+        "top_excess": top is not None and universe is not None and float(top) > max(0.0, float(universe)),
+        "top_bottom": spread is not None and float(spread) > 0,
+    }
+    if ranking:
+        gates["ndcg"] = ndcg_ratio is not None and float(ndcg_ratio) > MINIMUM_NDCG_RATIO
+    else:
+        gates["mae"] = mae is not None and baseline_mae is not None and float(mae) < float(baseline_mae)
+    failed = next((name for name, ok in gates.items() if not ok), None)
+    return {"passed": failed is None, "gates": gates, "failed_gate": failed}
+
+
 def evaluate_oos(
     frame: pd.DataFrame, horizon: int, total_stocks: int | None = None, score_kind: str = SCORE_KIND_RETURN
 ) -> dict[str, Any]:
@@ -216,18 +249,18 @@ def evaluate_oos(
     top = float(daily["top_excess_return"].mean())
     bottom = float(daily["bottom_excess_return"].mean())
     spread = top - bottom
-    passed = len(rows) >= MINIMUM_OOS_DATES and ic_mean > MINIMUM_RANK_IC and ic_t is not None and ic_t > MINIMUM_IC_T
-    passed = passed and top > max(0.0, float(daily["universe_excess_return"].mean())) and spread > 0
-    if ranking:
-        passed = passed and ndcg_ratio is not None and ndcg_ratio > MINIMUM_NDCG_RATIO
-    else:
-        passed = passed and mae < baseline_mae
+    universe = float(daily["universe_excess_return"].mean())
     metrics.update(rank_ic=ic_mean, rank_ic_hac_t=float(ic_t) if ic_t is not None else None,
                    ic_test_status="有效" if ic_t is not None else "IC方差退化，拒绝推断显著性", mae=mae, baseline_mae=baseline_mae,
                    ndcg=ndcg, ndcg_random_baseline=ndcg_baseline, ndcg_days=quality["ndcg_days"],
                    ndcg_ratio=ndcg_ratio,
                    top_excess_return=top, bottom_excess_return=bottom, top_bottom_spread=spread,
-                   top_return=float(daily["top_return"].mean()), bottom_return=float(daily["bottom_return"].mean()), validated=bool(passed))
+                   # 池均值超额原本只用在内联判定里、用完即弃；判定抽成 evaluation_gates 后
+                   # 它必须随指标一起返回，落库后页面才能复核「Top 超额是否真的优于池均值」。
+                   universe_excess_return=universe,
+                   top_return=float(daily["top_return"].mean()), bottom_return=float(daily["bottom_return"].mean()))
+    gates = evaluation_gates(metrics)
+    metrics.update(validated=bool(gates["passed"]), gate_detail=gates["gates"], failed_gate=gates["failed_gate"])
     return metrics
 
 
@@ -365,6 +398,47 @@ def predict_panel(model: dict[str, Any], panel: pd.DataFrame) -> pd.DataFrame:
     return normalize_predictions(predictions).dropna(subset=["prediction_zscore"])
 
 
+def final_holdout_context_fields() -> dict[str, Any]:
+    """模型上下文里的四个最终留出集字段。
+
+    留出集只评估一次、报告写盘后长期有效，所以这里直接读报告文件而不是查库：
+    ``train_market_context`` 会跑在没有数据库的进程里（单测也会在不连库的情况下直接调它），
+    任何查库的写法都会把训练入口绑死在 PostgreSQL 上。
+
+    未评估时如实写 False / None，绝不写「已评估」——报告不存在就是没评估过。
+    """
+    enabled = bool(settings.ENABLE_FINAL_HOLDOUT)
+    report = None
+    if enabled:
+        path = settings.MODEL_DIR / settings.FINAL_HOLDOUT_REPORT_NAME
+        if path.exists():
+            try:
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+                report = loaded if isinstance(loaded, dict) else None
+            except (OSError, ValueError):
+                LOGGER.exception("读取最终留出集报告失败，按未评估处理")
+    if not report:
+        return {
+            "final_holdout_evaluated": False,
+            "final_holdout_result": None,
+            "final_holdout_start": settings.FINAL_HOLDOUT_START if enabled else None,
+            "final_holdout_end": settings.FINAL_HOLDOUT_END if enabled else None,
+        }
+    summary = report.get("summary") or {}
+    return {
+        "final_holdout_evaluated": True,
+        "final_holdout_result": {
+            "model_version": report.get("model_version"),
+            "context_id": report.get("context_id"),
+            "evaluated_at": report.get("evaluated_at"),
+            "passed": report.get("passed"),
+            **summary,
+        },
+        "final_holdout_start": report.get("holdout_start"),
+        "final_holdout_end": report.get("holdout_end"),
+    }
+
+
 def train_market_context(
     histories: dict[str, pd.DataFrame], benchmark: pd.DataFrame, metadata: dict[str, Any] | None = None,
     progress: Callable[[str], None] | None = None, persist: bool = True,
@@ -383,6 +457,9 @@ def train_market_context(
                "objective_mode": objective or settings.DEFAULT_OBJECTIVE_MODE, "training_window_days": window,
                "exposures": panel.attrs.get("exposures"), "neutralization": panel.attrs.get("neutralization"),
                "extra_factors": panel.attrs.get("extra_factors"),
+               # 留出集状态随每次扫描重新注入：context 每轮都是新建的字典，
+               # 不从报告文件读回来的话这四个字段永远显示「未评估」。
+               **final_holdout_context_fields(),
                "limitation": "截面仅含本次成功采集历史的股票池；当前股票池回溯存在幸存者偏差，分组收益为持有期重叠的诊断指标，非可执行组合净值。"}
     for horizon in HORIZONS:
         context["models"][horizon] = []

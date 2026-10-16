@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 from config import settings
-from services.backtest import _metrics
+from services.backtest import _metrics, cost_rates
 from services.data_cleaning import clean_daily_history
 from services.ml_pipeline import MODEL_NAMES, fit_panel_model, predict_panel
 
@@ -161,8 +161,7 @@ def run_portfolio_backtest(
     trades: list[dict[str, Any]] = []
     equity_path: list[dict[str, Any]] = []
     unfilled_buys = unfilled_sells = 0
-    buy_cost = commission_rate + slippage_rate
-    sell_cost = commission_rate + stamp_duty_rate + slippage_rate
+    buy_cost, sell_cost = cost_rates(commission_rate, stamp_duty_rate, slippage_rate)
 
     for index, date in enumerate(dates):
         daily_turnover = 0.0

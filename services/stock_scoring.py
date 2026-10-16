@@ -151,8 +151,15 @@ def analyze_stock(
     quote_status: str | None = None,
     history_ready: bool = True,
     market_context: dict[str, Any] | None = None,
+    scoring_paused: bool = False,
 ) -> dict[str, Any]:
-    """供个股页和扫描页共同使用的分析入口。"""
+    """供个股页和扫描页共同使用的分析入口。
+
+    ``scoring_paused`` 由调用方从模型治理状态读出后传入，默认 False 保持既有行为不变。
+    它是一个显式的入参而不是在这里查库：本函数在逐股循环里被调用成千上万次，
+    每次都查一次降级状态没有意义；况且上一轮扫描之后才被降级这种情形，
+    本来就该由调用方在扫描开始前统一读一次。
+    """
     if any(horizon not in (5, 20, 60) for horizon in horizons):
         raise ValueError("预测周期仅支持5、20、60个交易日。")
     features = build_features(history, benchmark)
@@ -172,6 +179,15 @@ def analyze_stock(
         from services.ml_pipeline import MODEL_NAMES, unavailable_model
 
         model_results = {horizon: [unavailable_model(name, horizon, "历史行情不完整或过期，拒绝输出模型预测") for name in MODEL_NAMES] for horizon in horizons}
+    elif scoring_paused:
+        # 降级闸门放在数据血缘校验之后：历史本来就不完整时，
+        # 「历史不完整」比「模型降级」更贴近这只股票的真实处境，先说更具体的那一个。
+        from services.ml_pipeline import MODEL_NAMES, unavailable_model
+
+        model_results = {
+            horizon: [unavailable_model(name, horizon, settings.DEGRADED_SCORING_MESSAGE) for name in MODEL_NAMES]
+            for horizon in horizons
+        }
     twenty_day = model_results.get(20, [])
     signals = [signal for signal in (relative_signal(item) for item in twenty_day) if signal is not None]
     prediction = float(np.mean(signals)) if signals else None

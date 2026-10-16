@@ -10,6 +10,7 @@ from services.runtime import get_market_data, get_repository
 
 from config import settings
 from services.auth_ui import require_session
+from services.model_governance import ScanGovernance, current_model_status
 from services.rank_model import objective_label
 from services.scan_pipeline import FULL_MARKET_POOL_MODE, ScanOptions, collect_candidates, run_scan_pipeline
 from services.scan_store import build_payload, load_scan_result, save_scan_result
@@ -32,6 +33,18 @@ show_page_header(
 # 与 pages/5_账号管理.py 一样做二次校验，避免以后调整路由时越权。
 account = require_session()
 is_admin = bool(account["is_admin"])
+
+# 降级状态下本页仍可正常浏览，但评分列会是空的——先在页顶说清楚为什么，
+# 免得使用者以为是扫描坏了。状态只读一次，扫描管线内部再按同一次读取执行。
+model_health = current_model_status(get_repository())
+if model_health["degraded"]:
+    st.error(
+        f"**{settings.DEGRADED_SCORING_MESSAGE}。** 原因：{model_health['reason'] or '未记录'}。"
+        "候选排名与因子观察仍然可用；管理员可在“模型健康”页查看告警详情、解除降级或回滚到上一通过模型。",
+        icon=":material/report:",
+    )
+elif model_health["error"]:
+    st.warning(f"{model_health['error']}；本次按未降级处理。", icon=":material/warning:")
 
 NOTE_RENDERERS = {
     "caption": st.caption,
@@ -120,7 +133,10 @@ if is_admin:
                 f"更新时间 {source_meta.get('fetched_at', '用户输入')}。"
             )
             with loading_task("扫描与模型分析", f"本次共 {len(candidates):,} 只股票。进度按已处理数量计算，单只股票训练耗时可能不同。", exclusive=True) as task:
-                result = run_scan_pipeline(service, options, candidates, source_meta, task.step)
+                result = run_scan_pipeline(
+                    service, options, candidates, source_meta, task.step,
+                    governance=ScanGovernance(get_repository(), trigger="manual", operator=account["username"]),
+                )
             if options.pool_mode == "用户自定义":
                 # 试跑只留在本次会话里：落盘文件是所有账号共用的那份全市场结论，一次试跑不该把它换掉。
                 st.session_state["scan_result"] = build_payload(result)

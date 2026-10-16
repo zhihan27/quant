@@ -142,3 +142,97 @@ MINIMUM_CASHFLOW_TO_PROFIT = 0.0
 # 新增因子并入排序特征矩阵的最低覆盖率；沿用中性化因子的同类门控口径。
 EXTRA_FACTOR_MINIMUM_COVERAGE = 0.5
 
+# ---------------------------------------------------------------------------
+# 模型治理：最终留出集、通过率监控、漂移监控、告警与降级
+# ---------------------------------------------------------------------------
+
+# 最终留出集：一个从未参与任何调参、且只允许评估一次的数据段。
+#
+# 注意这个名字与需求文一致，但它**只控制 evaluate_final_holdout 那一次一次性评估**，
+# 不改变日常生产训练。需求文 §二-A-2 要求「任何训练都不能使用留出集日期范围内的数据，
+# 滚动窗口结束日严格早于 FINAL_HOLDOUT_START」；本系统有意不那样做：
+# 生产模型必须用全量历史滚动重训才能给 2026 年的截面打分，把训练窗口永久冻结在
+# 2024-01-01 之前，日常评分就失去了意义。因此留出集的口径是「评估专用」——
+# 冻结模型只用留出集之前的数据训练，日常生产模型不引用留出集。这是对需求文的有意偏离，
+# 详见 services/model_governance.py 顶部说明与 test_records 记录。
+ENABLE_FINAL_HOLDOUT: bool = True
+FINAL_HOLDOUT_START: str = "2024-01-01"
+FINAL_HOLDOUT_END: str | None = None  # None 表示到最新可用截面
+# 留出集评估报告文件名（写在 settings.MODEL_DIR 下）。
+FINAL_HOLDOUT_REPORT_NAME = "final_holdout_report.json"
+
+# 通过率监控。每轮训练每个模型每个周期各写一行，一次全量扫描约产生 6 行。
+PASS_RATE_WINDOW_DAYS = 30
+PASS_RATE_MINIMUM = 0.60
+# 连续多少次不通过触发告警。按「同一次扫描里的同一个模型/周期」计连续，不跨周期混算。
+CONSECUTIVE_FAILURE_ALERT = 3
+GATE_FAILURE_RATE_ALERT = 0.50
+# 比例类告警的最小样本量：月内不足这么多条记录时不判通过率与门槛失败率，
+# 否则每次扫描只有 6 行，上线第一天就会刷屏。连续失败告警不看这个下限（它自带 3 次的要求）。
+PASS_RATE_MINIMUM_RECORDS = 20
+
+# 漂移监控阈值。
+DRIFT_PSI_WATCH = 0.10
+DRIFT_PSI_SEVERE = 0.25
+DRIFT_IC_NEGATIVE_DAYS = 5
+DRIFT_HHI_PERCENTILE = 0.95
+# 概念漂移的滚动窗口长度（可用样本外交易日数）。
+DRIFT_CONCEPT_WINDOW_DAYS = 60
+# 特征漂移的当前分布取最近 N 个交易日池化，而不是最新一个截面日：
+# 本地股票池只有几十只，单日截面在 10 个分箱下绝大多数箱计数不足 5，
+# PSI 会剧烈抖动、天天误报严重。
+DRIFT_CURRENT_WINDOW_DAYS = 20
+DRIFT_PSI_BINS = 10
+# 参与漂移计算的最小有效样本数，低于该值判定为「样本不足」并如实标注，不给数。
+DRIFT_MINIMUM_SAMPLES = 200
+
+# 漂移监控维度 → 面板列名。
+# 值为 None 表示该维度当前无法计算，drift_monitor 必须写一条带原因的「未接入」记录，
+# 而不是跳过它——遵守「缺失数据要明确标注、不能静默」。
+# 值为哨兵 __EXTRA_FACTOR_COVERAGE__ 表示该维不是单列分布，而是筹码/日内/财报三族因子的
+# 覆盖率，由 services/extra_factors.py::summarize_extra_factors 计算。
+DRIFT_EXTRA_COVERAGE_SENTINEL = "__EXTRA_FACTOR_COVERAGE__"
+DRIFT_MONITORED_FEATURES = {
+    "估值": None,  # 行情源未提供 PE/PB/PS，见 drift_monitor 的未接入说明
+    "财务因子覆盖率": DRIFT_EXTRA_COVERAGE_SENTINEL,
+    "波动率": "volatility_20",
+    "换手率": "turnover_20",
+    "Amihud": "amihud_20",
+    "市值分布": "log_market_cap",
+    "行业分布": "industry",
+}
+# 行业不是数值列，用集中度（HHI）衡量漂移，不做 PSI。
+DRIFT_CATEGORICAL_FEATURES = ("industry",)
+# 预测漂移里的 Top-N 组合规模。与 PORTFOLIO_TOP_N 同口径。
+DRIFT_PREDICTION_TOP_N = PORTFOLIO_TOP_N
+
+# 模型归档与降级。归档保留最近 N 个「至少一个模型通过验证」的版本，
+# 回滚只在这批里选，缺归档文件的版本一律拒绝回滚。
+MODEL_ARCHIVE_LIMIT = 5
+MODEL_ARCHIVE_DIRNAME = "archive"
+# 降级时替代模型评分的那句话。放在这里而不是 model_governance.py，
+# 是因为 services/stock_scoring.py 也要用它，而它被 backtest 反向依赖，
+# 从 model_governance 取会形成循环导入。
+DEGRADED_SCORING_MESSAGE = "模型降级中，暂停评分"
+
+# 告警通道。写库与写日志是必达通道，Webhook 与邮件默认关闭，打开后地址与凭据
+# 只从环境变量读，不进本文件（沿用 QUANT_PG_* 的先例，敏感信息不硬编码）。
+ALERT_ENABLED = True
+ALERT_WEBHOOK_ENABLED = False
+ALERT_EMAIL_ENABLED = False
+ALERT_WEBHOOK_TIMEOUT_SECONDS = 5
+ALERT_SMTP_TIMEOUT_SECONDS = 10
+ALERT_EMAIL_RECIPIENTS: tuple[str, ...] = ()
+# 同一标题的告警在该小时数内只写一条：每日扫描都会重新判定一次，
+# 不做去重的话「连续 3 次未通过」会天天各写一条，告警列表很快就被同一条消息淹掉。
+ALERT_DEDUP_HOURS = 20
+
+# 告警通道的环境变量名。写在这里而不是散落在 alerting.py 的字符串里，
+# 便于部署时一眼看到需要配什么；对应的值一律不进仓库。
+ALERT_WEBHOOK_ENV = "QUANT_ALERT_WEBHOOK_URL"
+ALERT_SMTP_HOST_ENV = "QUANT_ALERT_SMTP_HOST"
+ALERT_SMTP_PORT_ENV = "QUANT_ALERT_SMTP_PORT"
+ALERT_SMTP_USER_ENV = "QUANT_ALERT_SMTP_USER"
+ALERT_SMTP_PASSWORD_ENV = "QUANT_ALERT_SMTP_PASSWORD"
+ALERT_SMTP_SENDER_ENV = "QUANT_ALERT_SMTP_SENDER"
+

@@ -16,6 +16,21 @@ from services.stock_scoring import walk_forward_predictions
 from services.timing_strategy import plan_from_features
 
 
+def cost_rates(
+    commission_rate: float = settings.DEFAULT_COSTS["commission_rate"],
+    stamp_duty_rate: float = settings.DEFAULT_COSTS["stamp_duty_rate"],
+    slippage_rate: float = settings.DEFAULT_COSTS["slippage_rate"],
+) -> tuple[float, float]:
+    """买入与卖出两侧的合计费率，全仓库唯一的费用口径出处。
+
+    回测、组合回测与最终留出集的「费用后收益」必须用同一套费率，否则同一笔交易在三处
+    会算出三个结果。本仓库有过「同一口径在多处各写一份、各改一半」的翻车史
+    （涨跌停号段曾在十处各写一份），所以这里收成一个函数。
+    卖出侧多一笔印花税，买入侧不交。
+    """
+    return commission_rate + slippage_rate, commission_rate + stamp_duty_rate + slippage_rate
+
+
 def _limit_rate(code: str | None, date: Any = None, is_st: bool = False) -> float:
     """保留原有调用名，涨跌幅制度统一由清洗模块给出，避免两处规则漂移。"""
     return price_limit_rate(code, date, is_st)
@@ -133,8 +148,7 @@ def run_backtest(
     trades = []
     equity_path = []
     unfilled_entries = unfilled_exits = 0
-    buy_cost = commission_rate + slippage_rate
-    sell_cost = commission_rate + stamp_duty_rate + slippage_rate
+    buy_cost, sell_cost = cost_rates(commission_rate, stamp_duty_rate, slippage_rate)
     for index in range(warmup, count):
         bar = bars.iloc[index]
         row = features.iloc[index]
