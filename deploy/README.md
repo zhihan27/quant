@@ -33,14 +33,34 @@ sudo bash -c 'set -a; source /etc/quantify.env; set +a; cd /opt/quantify/quant; 
 将 `deploy/nginx.conf` 放到 Nginx 的 `http` 块（常见路径为 `/etc/nginx/conf.d/quantify.conf`），替换所有 `quant.example.com` 和证书路径。提前安装有效TLS证书，不要关闭 Streamlit 的来源校验或 XSRF 保护。
 
 ```bash
-sudo install -m 644 deploy/quant-web.service deploy/quant-monitor.service /etc/systemd/system/
+sudo install -m 644 deploy/quant-web.service deploy/quant-monitor.service deploy/quant-scan.service deploy/quant-scan.timer /etc/systemd/system/
 sudo nginx -t
 sudo systemctl daemon-reload
 sudo systemctl enable --now quant-web quant-monitor
+sudo systemctl enable --now quant-scan.timer
 sudo systemctl reload nginx
 ```
 
 防火墙只对外开放需要的80/443端口，8501仅监听127.0.0.1，5432仅允许本机或受信任内网。网页服务与监控进程分开，监控沿用数据库内的开启状态，页面关闭或服务重启不影响独立任务。内存及CPU限制按实际扫描规模调整，超过限制可能终止正在运行的任务。
+
+`quant-scan.timer` 在每个交易日 15:30 触发一次全市场扫描（`Type=oneshot`，跑完即退）。**`OnCalendar` 用的是系统时区而不是本仓库里的时区，服务器必须先校准：**
+
+```bash
+sudo timedatectl set-timezone Asia/Shanghai
+systemctl list-timers quant-scan.timer     # 确认 Next 是当地时间的 15:30
+```
+
+扫描脚本自身会判定当日 K 线是否就绪和今天是否已经跑过，未就绪就整体跳过并正常退出，因此非交易日与补跑都不会白跑一轮，也不需要维护交易日历。`Persistent=true` 让停机期间错过的窗口在恢复后补跑一次，补跑同样要过这两道判定。
+
+查看运行记录：
+
+```bash
+journalctl -u quant-scan -n 200 --no-pager    # 每次触发的 stdout
+tail -f logs/daily_scan.log                   # 脚本自身的滚动日志
+sudo systemctl start quant-scan.service       # 手动立刻跑一次
+```
+
+退出码 0 表示成功或按判定正常跳过，1 表示失败（取不到计算锁、股票池为空、扫描未产出任何候选等）需要查日志。全市场扫描要一次性把整池日线与面板读进内存，`MemoryMax=4G` 是按全市场规模给的初始值，按实际容量调整。定时进程与网页端写同一份模型与面板文件，共用同一个数据库咨询锁编号，因此不会同时训练并互相覆盖。
 
 Nginx 默认每IP请求20次/秒（允许静态资源突发150次）、每IP最多10条活跃请求，WebSocket每IP最多5条连接和每分钟5次握手（突发5次），总连接100条。登录在计算Argon2id摘要前按数据库固定窗口限流：每账号15分钟5次、每来源15分钟30次、全局每分钟120次，成功后仅清除该账号计数。进程内最多并发2次密码计算。可按合法用户数量调整参数，共享出口用户会共享IP额度。
 

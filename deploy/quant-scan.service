@@ -1,0 +1,24 @@
+[Unit]
+Description=量化每日收盘后全市场扫描
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=quant
+Group=quant
+WorkingDirectory=/opt/quantify/quant
+EnvironmentFile=/etc/quantify.env
+Environment=PYTHONUTF8=1
+ExecStart=/opt/quantify/quant/.venv/bin/python scan_daily.py
+# 全市场扫描要一次性把整池日线与面板读进内存，比盘中监控重得多，因此上限放宽到 4G；
+# CPU 仍限制在 2 核，避免把同在跑网页端的机器拖慢。
+MemoryMax=4G
+CPUQuota=200%
+TimeoutStartSec=7200
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/quantify/quant/data /opt/quantify/quant/logs /opt/quantify/quant/models
+UMask=0077

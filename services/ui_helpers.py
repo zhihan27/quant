@@ -145,12 +145,19 @@ class LoadingTask:
 
 
 @contextmanager
-def loading_task(title: str, detail: str = "请保持页面打开，完成后会自动展示结果。") -> Iterator[LoadingTask]:
-    """限制重计算并发，在耗时操作期间显示真实阶段与进度。"""
+def loading_task(
+    title: str, detail: str = "请保持页面打开，完成后会自动展示结果。", *, exclusive: bool = False
+) -> Iterator[LoadingTask]:
+    """限制重计算并发，在耗时操作期间显示真实阶段与进度。
+
+    exclusive=True 的任务会占住全局计算锁，同一数据库同一时刻只允许一个。
+    这里曾经按标题字符串匹配来判断任务轻重，漏登记一个标题（例如
+    「Top-N 组合构建与摩擦成本回测」）就等于该环节静默失去并发保护，
+    因此改成由调用方显式声明。
+    """
     from services.workload import compute_slot
 
-    heavy = title in {"个股分析", "扫描与模型分析", "滚动样本外回测", "配对统计分析"}
-    with compute_slot() if heavy else nullcontext():
+    with compute_slot() if exclusive else nullcontext():
         with _loading_display(title, detail) as task:
             yield task
 

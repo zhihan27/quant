@@ -36,7 +36,7 @@ require_login()
 
 # 模型目标升级后清除会话中的旧结果，避免显示旧版绝对收益预测。
 if st.session_state.get("result_model_version") != settings.MODEL_VERSION:
-    for key in ("stock_analysis", "backtest_result", "recommendations", "scan_source", "scan_stats"):
+    for key in ("stock_analysis", "backtest_result", "scan_result", "portfolio_result"):
         st.session_state.pop(key, None)
     st.session_state["result_model_version"] = settings.MODEL_VERSION
 page.run()

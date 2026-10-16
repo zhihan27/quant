@@ -1,0 +1,15 @@
+[Unit]
+Description=每个交易日 15:30 触发全市场扫描
+Requires=quant-scan.service
+
+[Timer]
+# OnCalendar 用的是系统时区，不是本文件的时区。服务器必须先执行
+# timedatectl set-timezone Asia/Shanghai，否则 15:30 会落在别的时刻上（见 deploy/README.md）。
+OnCalendar=Mon..Fri 15:30
+# 收盘后行情源的当日 K 线有时晚几分钟才出，扫描脚本自身会判定数据是否就绪，
+# 未就绪就整体跳过并正常退出；加上 Persistent 则让停机期间错过的窗口在恢复后补跑一次，
+# 补跑同样要过这道就绪判定，因此周末与非交易日不会白跑一轮。
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -135,6 +135,8 @@ if run_analysis:
     for state_key in ("stock_analysis", "backtest_result", "pair_result"):
         st.session_state.pop(state_key, None)
     try:
+        # 单只股票只读已落盘的模型、不写任何共享产物，因此不占全局计算锁，
+        # 免得收盘后的全市场扫描把它挡在门外。
         with loading_task("个股分析", "依次获取行情、核对历史数据并读取同日共享截面模型。") as task:
             task.step("1 / 5 · 获取最新报价", 0, 5)
             quote = service.get_quote(selected_code)
@@ -378,7 +380,7 @@ if state and state.get("code") == selected_code:
     )
     if st.button("开始模拟并保存结果", key="run_backtest"):
         try:
-            with loading_task("滚动样本外回测", "回测会分时段训练模型，计算交易与持仓净值，耗时通常长于单次分析。") as task:
+            with loading_task("滚动样本外回测", "回测会分时段训练模型，计算交易与持仓净值，耗时通常长于单次分析。", exclusive=True) as task:
                 task.step("1 / 4 · 获取未复权行情", 0, 4)
                 raw_history, raw_meta = service.get_history(
                     selected_code, count=1500, period="daily", adjusted=False
@@ -454,7 +456,7 @@ if state and state.get("code") == selected_code:
         code_b = right.text_input("股票 B 代码", max_chars=6, key="pair_b")
         if st.button("检验配对关系", key="pair_test"):
             try:
-                with loading_task("配对统计分析") as task:
+                with loading_task("配对统计分析", exclusive=True) as task:
                     task.step("1 / 3 · 获取股票 A 历史", 0, 3)
                     history_a, meta_a = service.get_history(code_a, count=1000, adjusted=True)
                     task.step("2 / 3 · 获取股票 B 历史", 1, 3)

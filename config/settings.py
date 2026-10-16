@@ -48,6 +48,14 @@ BSE_LIMIT_PREFIXES = ("4", "8", "92")
 MARKET_INDEX_CODE = "000300"
 MODEL_VERSION = "2.1.0"
 
+# 跨进程计算互斥：同一数据库同时只允许一个重计算任务（扫描、组合回测、滚动重训）。
+# 网页端与每日定时扫描进程必须共用这一个编号——两者写的是同一份
+# models/market_context_v{MODEL_VERSION}.joblib 与 data/ml_panel_v{MODEL_VERSION}.parquet，
+# 各自另起一个编号等于放弃互斥，两边会同时训练并互相覆盖，
+# 而 load_context(include_panel=True) 靠 context_id 比对，读到的模型与面板会来自不同批次。
+# 建表锁 706821024 与盘中监控锁 706821025 分别见 services/database.py、services/intraday_monitor.py。
+COMPUTE_LOCK_KEY = 706821026
+
 DEFAULT_COSTS = {
     "commission_rate": 0.0003,
     "stamp_duty_rate": 0.0005,
@@ -83,6 +91,22 @@ ADJUSTMENT_GAP_TOLERANCE = 1.2
 PORTFOLIO_TOP_N = 20
 MAX_POSITION_WEIGHT = 0.05
 PORTFOLIO_BACKTEST_MAX_STOCKS = 300
+
+# 每日收盘后的定时全市场扫描。触发时刻由部署层决定（deploy/quant-scan.timer 或
+# Windows 计划任务），这里只管扫描参数，口径与管理员手动全市场扫描一致。
+# 组合回测不影响模型且是最慢的一段，逐股回测在全市场下不可接受，故定时任务都不开。
+DAILY_SCAN = {
+    "pool_mode": "沪深京全部 A 股",
+    "objective_mode": DEFAULT_OBJECTIVE_MODE,
+    "training_window": TRAINING_WINDOW_DAYS,
+    "enable_neutralization": True,
+    "use_extra_factors": True,
+    "run_portfolio": False,
+    "include_backtest": False,
+}
+# 落盘保留的展示行数：只存页面要渲染的表格，不存全池逐股分析结果。
+DAILY_SCAN_TOP_ROWS = 100
+DAILY_SCAN_LOG_MAX_BYTES = 5_000_000
 
 # 股票池状态：退市与 ST 名单来自交易所公开接口，缓存一天，避免每次扫描重复拉取。
 UNIVERSE_REFERENCE_TIMEOUT_SECONDS = 180

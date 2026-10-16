@@ -137,6 +137,7 @@ with position_tab:
 
                 data = IntradayDataService()
                 try:
+                    # 只刷新报价，不参与模型训练，不占全局计算锁。
                     with loading_task("刷新持仓报价") as task:
                         task.step("正在批量获取持仓股票报价…")
                         quotes, errors = data.get_quotes(list(dict.fromkeys(row["code"] for row in positions)))
