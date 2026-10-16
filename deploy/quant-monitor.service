@@ -1,0 +1,27 @@
+[Unit]
+Description=量化盘中监控任务
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=quant
+Group=quant
+WorkingDirectory=/opt/quantify/quant
+EnvironmentFile=/etc/quantify.env
+Environment=PYTHONUTF8=1
+ExecStart=/opt/quantify/quant/.venv/bin/python monitor.py
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/quantify/quant/data /opt/quantify/quant/logs /opt/quantify/quant/models
+UMask=0077
+MemoryMax=1G
+CPUQuota=100%
+TasksMax=128
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.py[cod]
+
+# 运行期产物：首次启动会自动重建（见 services/market_data.py 的 mkdir）
+data/
+models/
+logs/
+
+# 私有配置：仓库内只保留占位模板 config/database.example.json
+config/database.local.json
+*.env
+!*.env.example
+
+# 需求文档不随代码发布
+需求.txt

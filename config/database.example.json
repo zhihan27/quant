@@ -1,0 +1,8 @@
+{
+  "_说明": "复制本文件为同目录下的 database.local.json，再填入你自己数据库的真实值；database.local.json 已被 .gitignore 排除，不会提交。也可用 QUANT_PG_HOST / QUANT_PG_PORT / QUANT_PG_DBNAME / QUANT_PG_USER / QUANT_PG_PASSWORD 环境变量覆盖这里的每一项（环境变量优先级更高）。",
+  "host": "127.0.0.1",
+  "port": 5432,
+  "dbname": "quantify",
+  "user": "postgres",
+  "password": "请填写数据库密码"
+}

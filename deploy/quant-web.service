@@ -1,0 +1,29 @@
+[Unit]
+Description=量化研究网页服务
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=quant
+Group=quant
+WorkingDirectory=/opt/quantify/quant
+EnvironmentFile=/etc/quantify.env
+Environment=PYTHONUTF8=1
+Environment=QUANT_DISABLE_MONITOR=1
+Environment=QUANT_TRUST_PROXY=1
+ExecStart=/opt/quantify/quant/.venv/bin/python -m streamlit run app.py --server.address=127.0.0.1 --server.port=8501 --server.headless=true --server.fileWatcherType=none --server.enableCORS=true --server.enableXsrfProtection=true --server.maxUploadSize=1 --server.maxMessageSize=10 --client.showErrorDetails=none --client.toolbarMode=viewer
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/quantify/quant/data /opt/quantify/quant/logs /opt/quantify/quant/models
+UMask=0077
+MemoryMax=2G
+CPUQuota=200%
+TasksMax=128
+
+[Install]
+WantedBy=multi-user.target
