@@ -14,3 +14,7 @@ config/database.local.json
 
 # 需求文档不随代码发布
 需求.txt
+
+# 本地智能体工具链，不属于程序本体
+.claude/
+.agents/
