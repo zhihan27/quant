@@ -33,6 +33,18 @@ HISTORY_CACHE_SECONDS = 21600
 REQUEST_INTERVAL_SECONDS = 0.25
 MINIMUM_SCAN_HISTORY_BARS = 320
 MINIMUM_EXPECTED_A_SHARE_UNIVERSE = 4000
+# 交易所号段。2026 年创业板启用 302 号段，新股发行还会继续扩充号段，
+# 因此股票池过滤、缓存完整性校验与涨跌停制度判定统一引用这一份定义。
+# 只改其中一处会让新号段的股票从股票池里凭空消失，或在涨跌停判定里按错误比例计算。
+BOARD_PREFIXES = {
+    "main": ("00", "60"),
+    "chinext": ("300", "301", "302"),
+    "star": ("688", "689"),
+    "bj": ("43", "83", "87", "92"),
+}
+# 涨跌停制度只看交易所大类：北交所涵盖 43/83/87/92 起首的 4x/8x 全部号段，
+# 比股票池过滤用的具体号段更宽，故不并入 BOARD_PREFIXES。
+BSE_LIMIT_PREFIXES = ("4", "8", "92")
 MARKET_INDEX_CODE = "000300"
 MODEL_VERSION = "2.1.0"
 

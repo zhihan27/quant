@@ -18,11 +18,11 @@ FLAG_COLUMNS = ("is_suspended", "is_locked_up", "is_locked_down", "is_adjustment
 
 def price_limit_rate(code: str | None, date: Any = None, is_st: bool = False) -> float:
     """按板块与交易日期返回单日涨跌幅上限比例。"""
-    if code and code.startswith(("4", "8", "92")):
+    if code and code.startswith(settings.BSE_LIMIT_PREFIXES):
         return 0.30
-    if code and code.startswith(("688", "689")):
+    if code and code.startswith(settings.BOARD_PREFIXES["star"]):
         return 0.20
-    if code and code.startswith(("300", "301")):
+    if code and code.startswith(settings.BOARD_PREFIXES["chinext"]):
         return 0.10 if date is not None and pd.Timestamp(date) < pd.Timestamp("2020-08-24") else 0.20
     return 0.05 if is_st else 0.10
 
@@ -46,12 +46,13 @@ def open_price_fillable(bar: pd.Series, direction: str, previous_close: float, l
 
 def _limit_series(codes: pd.Series, dates: pd.Series, is_st: bool) -> pd.Series:
     """逐行计算涨跌幅上限，创业板 2020-08-24 前后的制度差异按日期区分。"""
+    chinext_mask = codes.str.startswith(settings.BOARD_PREFIXES["chinext"])
     rate = pd.Series(0.10 if not is_st else 0.05, index=codes.index, dtype=float)
-    rate = rate.mask(codes.str.startswith(("300", "301")), 0.20)
-    early_chinext = codes.str.startswith(("300", "301")) & (dates < pd.Timestamp("2020-08-24"))
+    rate = rate.mask(chinext_mask, 0.20)
+    early_chinext = chinext_mask & (dates < pd.Timestamp("2020-08-24"))
     rate = rate.mask(early_chinext, 0.10)
-    rate = rate.mask(codes.str.startswith(("688", "689")), 0.20)
-    rate = rate.mask(codes.str.startswith(("4", "8", "92")), 0.30)
+    rate = rate.mask(codes.str.startswith(settings.BOARD_PREFIXES["star"]), 0.20)
+    rate = rate.mask(codes.str.startswith(settings.BSE_LIMIT_PREFIXES), 0.30)
     return rate
 
 

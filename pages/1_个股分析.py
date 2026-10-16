@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pandas as pd
 import streamlit as st
 
@@ -26,6 +28,16 @@ show_page_header(
 )
 
 
+def _fmt_amount(value: Any) -> str:
+    """成交额按亿元显示：行情源给的是元，十位数放进并排的窄列会被省略号截断。"""
+    try:
+        if value is None or pd.isna(value):
+            return "—"
+        return f"{float(value) / 1e8:,.2f} 亿元"
+    except (TypeError, ValueError):
+        return "—"
+
+
 def _stock_conclusion(plan: dict) -> tuple[str, str]:
     """把模型判断和买卖参考浓缩成一句话，不懂指标也能直接读结论。"""
     zone = plan.get("buy_zone")
@@ -46,6 +58,7 @@ if st.query_params.get("code") and st.session_state.get("query_code") != st.quer
     st.session_state["query_code"] = st.query_params.get("code")
     st.session_state["selected_code"] = st.query_params.get("code")
     st.session_state["search_results"] = pd.DataFrame()
+    st.session_state.pop("match_selection", None)
 
 with st.form("stock_search_form"):
     search_columns = st.columns([5, 1, 1], vertical_alignment="bottom")
@@ -59,6 +72,9 @@ with st.form("stock_search_form"):
 
 if submitted or refresh_submitted:
     term = query.strip()
+    # 新一轮搜索会换掉候选列表，上一轮的选中项对新列表无效，先清掉，
+    # 否则下拉框会带着一个已不存在的值，Streamlit 只能回退到第一项。
+    st.session_state.pop("match_selection", None)
     if term.isdigit() and len(term) == 6:
         st.session_state["selected_code"] = term
         st.session_state["search_results"] = pd.DataFrame()
@@ -86,10 +102,11 @@ if submitted or refresh_submitted:
 matches = st.session_state.get("search_results", pd.DataFrame())
 if isinstance(matches, pd.DataFrame) and not matches.empty:
     labels = [f"{row.code}  {row.name}" for row in matches.itertuples()]
-    selected_label = st.selectbox("匹配结果", labels)
+    selected_label = st.selectbox("匹配结果", labels, key="match_selection")
     selected_code = selected_label.split()[0]
-    if st.button("分析所选股票", type="primary"):
-        st.session_state["selected_code"] = selected_code
+    # 下拉框选中即生效。原先这里还要再点一次「分析所选股票」，而那个按钮既不分析也不跳转，
+    # 只是把选择写进会话，与下方真正的「运行分析」重复，故合并为一个动作。
+    st.session_state["selected_code"] = selected_code
 elif st.session_state.get("selected_code"):
     selected_code = st.session_state["selected_code"]
 else:
@@ -184,14 +201,17 @@ if state and state.get("code") == selected_code:
     if quote.get("warning"):
         st.warning(f"数据提示：{quote['warning']}")
 
-    price_columns = st.columns(7)
+    # 拆成两行：七个指标挤在一行时每列不足 200px，成交量与成交额会被省略号截断。
+    price_columns = st.columns(4)
     price_columns[0].metric("最新可用价", _fmt(quote.get("price"), 2))
     price_columns[1].metric("涨跌幅", _fmt(quote.get("change_pct"), 2, "%"))
     price_columns[2].metric("成交量", _fmt(quote.get("volume_lots"), 0, " 手"))
-    price_columns[3].metric("成交额", _fmt(quote.get("amount_yuan"), 0, " 元"))
-    price_columns[4].metric("开盘", _fmt(quote.get("open"), 2))
-    price_columns[5].metric("最高 / 最低", f"{_fmt(quote.get('high'), 2)} / {_fmt(quote.get('low'), 2)}")
-    price_columns[6].metric("昨收", _fmt(quote.get("previous_close"), 2))
+    price_columns[3].metric("成交额", _fmt_amount(quote.get("amount_yuan")))
+
+    price_columns = st.columns(4)
+    price_columns[0].metric("开盘", _fmt(quote.get("open"), 2))
+    price_columns[1].metric("最高 / 最低", f"{_fmt(quote.get('high'), 2)} / {_fmt(quote.get('low'), 2)}")
+    price_columns[2].metric("昨收", _fmt(quote.get("previous_close"), 2))
 
     plan = analysis.get("trade_plan", {})
     show_conclusion(*_stock_conclusion(plan))

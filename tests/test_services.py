@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 import requests
 
+from config import settings
 from services.backtest import _is_locked, run_backtest
 from services.feature_engineering import build_features
 from services.stock_scoring import analyze_stock
@@ -127,6 +128,47 @@ class QuantServiceTests(unittest.TestCase):
         with patch("services.scanning.load_reference", return_value=(_empty_reference(), {"status": "名单已就绪"})):
             candidates, _ = candidate_codes("沪深京全部 A 股", "", 8, FakeMarketData())
         self.assertEqual(len(candidates), 105)
+
+    def test_board_prefixes_are_all_valid_codes(self) -> None:
+        """settings.BOARD_PREFIXES 里的每个号段都必须能过代码有效性白名单。
+
+        两处分开维护：号段加了、白名单忘了，整批股票会被静默剔出股票池，
+        既不报错也不提示，只能靠这条断言把它变成一次显式失败。
+        """
+        rows = []
+        for board, prefixes in settings.BOARD_PREFIXES.items():
+            for prefix in prefixes:
+                width = 6 - len(prefix)
+                self.assertGreater(width, 0, f"{board} 号段 {prefix} 不可能是六位代码前缀")
+                # 名称取中性字面量：含 "st" 或 "退" 会被 ST/退市过滤器拦下，干扰本用例的判定对象。
+                rows.append({"code": prefix + "1" * width, "name": f"样本{prefix}"})
+        frame = pd.DataFrame(rows)
+        kept, _ = MarketDataService._filter_universe_rows(frame)
+        self.assertEqual(sorted(kept["code"]), sorted(row["code"] for row in rows))
+
+    def test_chinext_scope_keeps_new_302_segment(self) -> None:
+        """302 号段漏登记时，这批股票会从创业板扫描里静默消失而不报错。"""
+        class FakeMarketData:
+            def get_universe(self, scope: str) -> tuple[pd.DataFrame, dict[str, object]]:
+                rows = [
+                    {"code": code, "name": name, "price": 10.0, "volume_lots": 1000.0, "amount_yuan": amount}
+                    for code, name, amount in (
+                        ("300001", "老创业板", 3.0), ("301001", "次新创业板", 2.0),
+                        ("302132", "新号段创业板", 1.0), ("600000", "沪市主板", 4.0),
+                    )
+                ]
+                return pd.DataFrame(rows), {
+                    "complete": True, "source_unique_symbols": 4,
+                    "valid_symbols": 4, "fetched_at": "2026-10-15T15:00:00+08:00",
+                    "source": "test", "is_stale": False,
+                }
+
+            def quote_from_universe_row(self, row: dict[str, object], meta: dict[str, object]) -> dict[str, object]:
+                return {"price": row["price"], "quote_valid": True, "data_status": "test"}
+
+        with patch("services.scanning.load_reference", return_value=(_empty_reference(), {"status": "名单已就绪"})):
+            candidates, _ = candidate_codes("创业板", "", 10, FakeMarketData())
+        self.assertEqual([item["code"] for item in candidates], ["300001", "301001", "302132"])
 
     def test_eastmoney_universe_fetches_every_page_and_rejects_partial_page(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

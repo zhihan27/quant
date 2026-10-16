@@ -30,6 +30,11 @@ class PriceLimitRateTests(unittest.TestCase):
         self.assertEqual(price_limit_rate("830001"), 0.30)
         self.assertEqual(price_limit_rate("600000", is_st=True), 0.05)
 
+    def test_new_chinext_segment_keeps_twenty_percent(self):
+        """302 是 2026 年新增的创业板号段，制度与 300/301 相同。"""
+        self.assertEqual(price_limit_rate("302132"), 0.20)
+        self.assertEqual(price_limit_rate("302132", "2026-01-05"), 0.20)
+
 
 class CleaningTests(unittest.TestCase):
     """清洗只标注与剔除不可信 K 线，不改写价格。"""
@@ -57,6 +62,15 @@ class CleaningTests(unittest.TestCase):
         self.assertFalse(cleaned.loc[6, "is_usable"])
         self.assertEqual(report["adjustment_gap_bars"], 1)
         self.assertEqual(report["adjustment"], "前复权")
+
+    def test_new_chinext_segment_real_limit_day_is_not_an_adjustment_gap(self):
+        """302 号段按 10% 判定时，一根真实的 20% 涨停会被当成复权异常整行剔除。"""
+        bars = _bars([10.0] * 6 + [12.0, 12.0, 12.0])
+        cleaned, report = clean_daily_history(bars, code="302132", adjusted=True)
+        self.assertAlmostEqual(float(cleaned.loc[6, "limit_rate"]), 0.20)
+        self.assertFalse(cleaned.loc[6, "is_adjustment_gap"])
+        self.assertTrue(cleaned.loc[6, "is_usable"])
+        self.assertEqual(report["adjustment_gap_bars"], 0)
 
     def test_raw_history_ex_dividend_gap_is_not_removed(self):
         bars = _bars([10.0, 10.1, 10.2, 10.3, 10.4, 10.5, 15.0, 15.1])

@@ -14,6 +14,7 @@ from services.runtime import get_market_data, get_repository
 
 from config import settings
 from services.backtest import run_backtest
+from services.data_cleaning import price_limit_rate
 from services.exposures import load_exposures
 from services.extra_factors import build_extra_factors
 from services.market_data import MarketDataError, completed_daily_history, history_is_current
@@ -209,7 +210,7 @@ if st.button("开始扫描", type="primary"):
                             }
                         )
                         continue
-                    limit_rate = 0.30 if code.startswith(("4", "8", "92")) else (0.20 if code.startswith(("300", "301", "688", "689")) else 0.10)
+                    limit_rate = price_limit_rate(code)
                     change_pct = quote.get("change_pct")
                     entry_trade_status = "可正常评估"
                     if change_pct is not None and abs(change_pct) >= limit_rate * 100 * 0.98:

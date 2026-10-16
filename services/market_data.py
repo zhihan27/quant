@@ -1071,16 +1071,14 @@ finally:
 
         raw_frame = self._map_universe_rows(rows)
         source_unique_codes = int(raw_frame["code"].nunique()) if not raw_frame.empty else 0
-        scope_prefixes = {
-            "main": ("00", "60"), "chinext": ("300", "301"),
-            "star": ("688", "689"), "bj": ("43", "83", "87", "92"),
-        }
         if scope != "all":
-            raw_frame = raw_frame.loc[raw_frame["code"].str.startswith(scope_prefixes[scope])].copy()
+            raw_frame = raw_frame.loc[raw_frame["code"].str.startswith(settings.BOARD_PREFIXES[scope])].copy()
         unique_codes = int(raw_frame["code"].nunique()) if not raw_frame.empty else 0
-        if source_total is not None and unique_codes < source_total:
+        # 分页完整性针对源端全量：必须拿过滤号段之前的去重数比对。
+        # 用过滤后的数量比对，会让任何一个未登记的号段被误报成“分页不完整”。
+        if source_total is not None and source_unique_codes < source_total:
             raise MarketDataError(
-                f"股票池分页不完整：源端总数 {source_total}，去重后仅 {unique_codes} 只；拒绝缓存不完整股票池。"
+                f"股票池分页不完整：源端总数 {source_total}，去重后仅 {source_unique_codes} 只；拒绝缓存不完整股票池。"
             )
         valid_frame, rejected = self._filter_universe_rows(raw_frame)
         if valid_frame.empty:
@@ -1197,10 +1195,6 @@ finally:
             function = {"main": "stock_zh_a_spot_em", "chinext": "stock_sz_a_spot_em", "star": "stock_sh_a_spot_em"}[scope]
             strategies = [(function,), ("stock_zh_a_spot",)]
         minimums = {"all": settings.MINIMUM_EXPECTED_A_SHARE_UNIVERSE, "main": 2000, "chinext": 1000, "star": 400, "bj": 150}
-        prefix_groups = {
-            "main": ("00", "60"), "chinext": ("300", "301"),
-            "star": ("688", "689"), "bj": ("43", "83", "87", "92"),
-        }
         for strategy in strategies:
             combined_rows: list[dict[str, Any]] = []
             try:
@@ -1237,7 +1231,7 @@ finally:
                         raise MarketDataError(f"AkShare {function_name} 失败：{brief_network_error(detail)}") from exc
                 frame = self._map_universe_rows(combined_rows)
                 unique_codes = int(frame["code"].nunique()) if not frame.empty else 0
-                scope_codes = unique_codes if scope == "all" else int(frame["code"].str.startswith(prefix_groups[scope]).sum())
+                scope_codes = unique_codes if scope == "all" else int(frame["code"].str.startswith(settings.BOARD_PREFIXES[scope]).sum())
                 if scope_codes < minimums[scope]:
                     raise MarketDataError(f"备用源仅取得 {scope_codes} 只 {scope} 范围股票，低于完整池校验阈值 {minimums[scope]}。")
                 if scope == "all" and not frame["code"].str.startswith(("43", "83", "87", "92")).any():
@@ -1326,8 +1320,12 @@ finally:
     @staticmethod
     def _filter_universe_rows(frame: pd.DataFrame) -> tuple[pd.DataFrame, int]:
         codes = frame["code"].astype(str)
+        # 沪深主板与科创板的号段同 BOARD_PREFIXES，创业板另列出该板块开板以来的全部号段
+        # （300、301 与 2026 年启用的 302）。新增号段时必须同步 settings.BOARD_PREFIXES 与这里，
+        # 否则整批新号段股票会被静默判为无效代码、从股票池消失且不报错；
+        # tests/test_services.py 的 test_board_prefixes_are_all_valid_codes 会拦下漏改。
         valid_code = (
-            codes.str.fullmatch(r"(?:000|001|002|003|300|301|600|601|603|605|688|689)\d{3}")
+            codes.str.fullmatch(r"(?:000|001|002|003|300|301|302|600|601|603|605|688|689)\d{3}")
             | codes.str.fullmatch(r"(?:43|83|87|92)\d{4}")
         ) & codes.ne("000000")
         special = frame["name"].astype(str).str.contains(r"\*?ST|退市?|退", case=False, regex=True, na=False)
@@ -1360,11 +1358,7 @@ finally:
                 int(meta.get("source_unique_symbols", 0)) >= minimums[scope]
                 and codes.str.startswith(("43", "83", "87", "92")).any()
             )
-        scope_prefixes = {
-            "main": ("00", "60"), "chinext": ("300", "301"),
-            "star": ("688", "689"), "bj": ("43", "83", "87", "92"),
-        }
-        return bool(codes.str.startswith(scope_prefixes[scope]).all())
+        return bool(codes.str.startswith(settings.BOARD_PREFIXES[scope]).all())
 
     def search_stocks(
         self, query: str, limit: int = 30, force_refresh: bool = False

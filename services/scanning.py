@@ -9,6 +9,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from config import settings
 from services.market_data import MarketDataError, MarketDataService
 from services.rank_model import SCORE_KIND_RANK
 from services.universe import filter_universe, load_reference
@@ -59,14 +60,19 @@ def candidate_codes(
         return [], {"status": "不可用", "error": "股票列表为空。"}
     universe["code"] = universe["code"].astype(str).str.zfill(6)
     universe["name"] = universe["name"].astype(str)
+    chinext_prefixes = settings.BOARD_PREFIXES["chinext"]
+    star_prefixes = settings.BOARD_PREFIXES["star"]
     if mode == "沪深主板":
-        universe = universe.loc[universe["code"].str.match(r"^(00[0-3]|60[0-5])") & ~universe["code"].str.startswith(("300", "301", "688", "689"))]
+        universe = universe.loc[
+            universe["code"].str.match(r"^(00[0-3]|60[0-5])")
+            & ~universe["code"].str.startswith((*chinext_prefixes, *star_prefixes))
+        ]
     elif mode == "创业板":
-        universe = universe.loc[universe["code"].str.startswith(("300", "301"))]
+        universe = universe.loc[universe["code"].str.startswith(chinext_prefixes)]
     elif mode == "科创板":
-        universe = universe.loc[universe["code"].str.startswith(("688", "689"))]
+        universe = universe.loc[universe["code"].str.startswith(star_prefixes)]
     elif mode == "北交所":
-        universe = universe.loc[universe["code"].str.startswith(("4", "8", "92"))]
+        universe = universe.loc[universe["code"].str.startswith(settings.BOARD_PREFIXES["bj"])]
     reference, reference_meta = load_universe_reference(data_service, progress)
     universe, meta, _ = _apply_universe_filter(universe, reference, {**meta, **reference_meta})
     meta["scope_valid_symbols"] = int(len(universe))
