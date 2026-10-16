@@ -15,7 +15,10 @@ def get_auth_service():
     from services.auth import AuthService
     from services.runtime import get_repository
 
-    return AuthService(get_repository())
+    service = AuthService(get_repository())
+    # 首次启动补齐初始管理员；已经存在管理员时是一次只读查询，不做任何改动。
+    service.ensure_initial_admin()
+    return service
 
 
 def client_address() -> str:
@@ -34,6 +37,19 @@ def clear_login() -> None:
     """清理全部页面数据，防止同一浏览器换账号后残留旧结果。"""
     for key in list(st.session_state):
         del st.session_state[key]
+
+
+def current_account() -> dict[str, Any] | None:
+    """渲染导航前探测当前会话，用于决定注册哪些页面；无令牌时不连接数据库。"""
+    from services.database import DatabaseError
+
+    token = st.session_state.get("auth_token", "")
+    if not token:
+        return None
+    try:
+        return get_auth_service().session(token)
+    except DatabaseError:
+        return None
 
 
 def require_session() -> dict[str, Any]:
@@ -112,27 +128,55 @@ def require_login() -> dict[str, Any]:
                 unsafe_allow_html=True,
             )
             st.title("量化研究登录")
-            st.caption("使用管理员分配的账号继续。")
+            mode = st.segmented_control(
+                "登录方式", ["登录", "首次激活"], default="登录", label_visibility="collapsed",
+            )
             if st.session_state.pop("auth_notice", None):
                 st.success("密码已修改，请使用新密码登录。")
-            with st.form("account_login", clear_on_submit=True):
-                username = st.text_input("用户名", max_chars=32, autocomplete="username", placeholder="输入授权用户名")
-                password = st.text_input(
-                    "密码", type="password", max_chars=128, autocomplete="current-password",
-                    placeholder="至少 6 位",
-                )
-                submitted = st.form_submit_button("登录", type="primary", use_container_width=True)
-            st.caption("新密码支持 6 至 128 位；常见弱密码会被拒绝。")
-            if submitted:
-                try:
-                    token = get_auth_service().login(username, password, client_address())
-                    clear_login()
-                    st.session_state["auth_token"] = token
-                    st.rerun()
-                except AuthenticationError as exc:
-                    st.error(str(exc))
-                except DatabaseError:
-                    st.error("认证服务暂不可用，请联系管理员。")
+            if mode == "首次激活":
+                st.caption("管理员只创建用户名，密码由你本人设置。")
+                with st.form("account_activate", clear_on_submit=True):
+                    username = st.text_input("用户名", max_chars=32, autocomplete="username", placeholder="管理员分配的用户名")
+                    password = st.text_input(
+                        "设置密码", type="password", max_chars=128, autocomplete="new-password",
+                        placeholder="至少 8 位",
+                    )
+                    repeated = st.text_input(
+                        "确认密码", type="password", max_chars=128, autocomplete="new-password",
+                        placeholder="再次输入",
+                    )
+                    submitted = st.form_submit_button("激活并设置密码", type="primary", width="stretch")
+                st.caption("密码支持 8 至 128 位；常见弱密码会被拒绝。")
+                if submitted:
+                    try:
+                        if password != repeated:
+                            raise ValueError("两次输入的密码不一致。")
+                        get_auth_service().activate_user(username, password)
+                        st.success("账号已激活，请切换到“登录”使用新密码登录。")
+                    except (AuthenticationError, ValueError) as exc:
+                        st.error(str(exc))
+                    except DatabaseError:
+                        st.error("认证服务暂不可用，请联系管理员。")
+            else:
+                st.caption("使用管理员分配的账号继续。")
+                with st.form("account_login", clear_on_submit=True):
+                    username = st.text_input("用户名", max_chars=32, autocomplete="username", placeholder="输入授权用户名")
+                    password = st.text_input(
+                        "密码", type="password", max_chars=128, autocomplete="current-password",
+                        placeholder="至少 8 位",
+                    )
+                    submitted = st.form_submit_button("登录", type="primary", width="stretch")
+                st.caption("忘记密码请联系管理员重置，重置后由你本人重新设置。")
+                if submitted:
+                    try:
+                        token = get_auth_service().login(username, password, client_address())
+                        clear_login()
+                        st.session_state["auth_token"] = token
+                        st.rerun()
+                    except AuthenticationError as exc:
+                        st.error(str(exc))
+                    except DatabaseError:
+                        st.error("认证服务暂不可用，请联系管理员。")
         st.stop()
     render_account_sidebar(account)
     if account["must_change_password"] or st.session_state.get("auth_change_password"):
@@ -141,7 +185,7 @@ def require_login() -> dict[str, Any]:
             st.warning("当前使用临时密码，请修改密码后进入工作台。")
         with st.form("change_password", clear_on_submit=True):
             old = st.text_input("当前密码", type="password", max_chars=128)
-            new = st.text_input("新密码（至少6位）", type="password", max_chars=128)
+            new = st.text_input("新密码（至少8位）", type="password", max_chars=128)
             repeated = st.text_input("确认新密码", type="password", max_chars=128)
             submitted = st.form_submit_button("保存新密码", type="primary")
         if submitted:

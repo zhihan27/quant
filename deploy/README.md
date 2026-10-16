@@ -16,7 +16,9 @@ sudoedit /etc/quantify.env
 
 在 `/etc/quantify.env` 填入数据库密码及真实域名。当前数据库为 `127.0.0.1:5432/quantify`，模式为 `public`。服务器上的127.0.0.1表示服务器本身，需先准备该数据库。仅部署源码不会带走本机数据库中的账号、持仓；迁移数据请使用 `pg_dump`/`pg_restore`。账号和密码摘要也在 PostgreSQL 中。
 
-postgres 超级账号与示例口令不适合作为正式公网服务的长期凭据，正式部署建议创建仅可访问 quantify/public 的业务账号，通过环境文件覆盖。项目本地的 `config/database.local.json` 是私有文件（已加入忽略列表），勿提交或对外提供下载；仓库内只保留占位模板 `config/database.example.json`。
+postgres 超级账号与示例口令不适合作为正式公网服务的长期凭据，正式部署建议创建仅可访问 quantify/public 的业务账号，通过环境文件覆盖。仓库内的 `config/database.local.json` 是随代码提交的明文配置（作者本机使用 `127.0.0.1`）；服务器上应改用 `/etc/quantify.env` 覆盖，不要把生产口令写进仓库文件。
+
+**应用启动会在没有任何管理员时自动创建 `admin` / `admin123`（初始口令写死在源码与 README 中）。** 公网部署务必按下面的顺序先建好管理员再开放端口，否则从服务启动到有人改密码之间，任何人都能用这个公开口令登录并管理账号；未更换前账号管理页会持续告警。已存在管理员时该逻辑是一次只读查询，不会改动任何账号，也不会覆盖终端创建的账号。
 
 服务器新数据库通过终端创建账号，不提供网页注册：
 
@@ -24,7 +26,7 @@ postgres 超级账号与示例口令不适合作为正式公网服务的长期�
 sudo bash -c 'set -a; source /etc/quantify.env; set +a; cd /opt/quantify/quant; .venv/bin/python manage_users.py create admin --temporary'
 ```
 
-按要求可输入初始密码 `admin`，首次登录强制设置至少12位新密码。正式密码可直接省略 `--temporary` 创建。重置和禁用命令分别为 `manage_users.py reset admin`、`manage_users.py disable admin`。重置或禁用立即撤销全部会话。本机已创建的账号不会由应用启动覆盖。
+按要求可输入初始密码，首次登录强制设置至少 8 位新密码。正式密码可直接省略 `--temporary` 创建。重置和禁用命令分别为 `manage_users.py reset admin`、`manage_users.py disable admin`，重置或禁用立即撤销全部会话。日常账号管理也可由管理员在网页「账号管理」页完成：创建账号只填用户名，密码由使用者本人在登录页「首次激活」自行设置，管理员不经手。系统禁止禁用或重置最后一个可登录的管理员，也禁止管理员禁用自己正在使用的账号。
 
 登录令牌只保存在当前 Streamlit 会话，刷新整页或服务重启需要重新登录；会话最多12小时、30分钟无业务执行后失效，每个账号最多5个会话。监控页自动刷新会持续更新活动时间，12小时绝对期限仍有效。所有授权账号共用现有自选、持仓与监控工作台，不提供多租户数据隔离。
 
