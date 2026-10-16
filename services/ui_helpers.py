@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager, nullcontext
 from html import escape
-from typing import TYPE_CHECKING, Any, Iterator
+from typing import TYPE_CHECKING, Any, Iterator, Sequence
 
 import streamlit as st
 
@@ -104,6 +104,19 @@ def show_empty_state(title: str, description: str) -> None:
         f'<h3>{escape(title)}</h3><p>{escape(description)}</p></section>',
         unsafe_allow_html=True,
     )
+
+
+def show_conclusion(text: str, tone: str = "info") -> None:
+    """把本次结果的一句话结论放在最前面：先让人看懂结论，再往下看依据。"""
+    {"info": st.info, "good": st.success, "warn": st.warning, "bad": st.error}[tone](text, title="一句话结论")
+
+
+def show_plain_numbers(items: Sequence[tuple[str, str, str]], columns: int = 3) -> None:
+    """成组展示关键数字，每个数字下面跟一句白话解释，避免只给数字不给含义。"""
+    for start in range(0, len(items), columns):
+        for slot, (label, value, note) in zip(st.columns(columns), items[start:start + columns]):
+            slot.metric(label, value)
+            slot.caption(note)
 
 
 class LoadingTask:
@@ -226,19 +239,38 @@ def show_candles(frame: pd.DataFrame, title: str, count: int) -> None:
 
 
 def show_backtest_metrics(metrics: dict[str, Any], benchmark_return: float | None) -> None:
+    """用白话标签展示模拟交易结果，专业名称和含义放进悬停说明。"""
     columns = st.columns(6)
-    columns[0].metric("样本外总收益", format_number(_percent(metrics.get("total_return")), 2, "%"))
-    columns[1].metric("年化收益", format_number(_percent(metrics.get("annualized_return")), 2, "%"))
-    columns[2].metric("最大回撤", format_number(_percent(metrics.get("maximum_drawdown")), 2, "%"))
-    columns[3].metric("夏普", format_number(metrics.get("sharpe_ratio"), 2))
-    columns[4].metric("胜率", format_number(_percent(metrics.get("win_rate")), 1, "%"))
-    columns[5].metric("盈亏比", format_number(metrics.get("profit_loss_ratio"), 2))
+    columns[0].metric(
+        "总收益（模拟）", format_number(_percent(metrics.get("total_return")), 2, "%"),
+        help="按本页规则在历史上模拟交易的总盈亏比例（样本外总收益）。模拟不是预测，不代表未来也这样。",
+    )
+    columns[1].metric(
+        "折算成年", format_number(_percent(metrics.get("annualized_return")), 2, "%"),
+        help="把总收益折算成“平均一年赚多少”（年化收益），方便不同时间长度互相比较。",
+    )
+    columns[2].metric(
+        "最大亏损幅度", format_number(_percent(metrics.get("maximum_drawdown")), 2, "%"),
+        help="历史上从最高点跌到最低点的最大幅度（最大回撤），用来估计最难熬时会亏多少。",
+    )
+    columns[3].metric(
+        "性价比（夏普）", format_number(metrics.get("sharpe_ratio"), 2),
+        help="每承担一份波动能换来多少收益（夏普比率）：大于 1 算不错，小于 0 表示这段路在亏钱。",
+    )
+    columns[4].metric(
+        "赚钱次数占比", format_number(_percent(metrics.get("win_rate")), 1, "%"),
+        help="盈利的交易占全部交易的比例（胜率）。胜率高不代表一定赚钱，还要看每次赚亏多少。",
+    )
+    columns[5].metric(
+        "平均赚亏比", format_number(metrics.get("profit_loss_ratio"), 2),
+        help="平均每笔赚的钱 ÷ 平均每笔亏的钱（盈亏比）：大于 1 才有机会整体赚钱。",
+    )
     st.write(
         {
-            "交易数": metrics.get("trades"),
-            "年化换手次数": metrics.get("annualized_turnover"),
-            "扣费前收益": metrics.get("gross_return"),
-            "沪深 300 全区间买入持有": benchmark_return,
+            "总共交易几笔": metrics.get("trades"),
+            "平均一年换几轮": metrics.get("annualized_turnover"),
+            "不扣手续费的收益": metrics.get("gross_return"),
+            "同期沪深 300 买入不动": benchmark_return,
         }
     )
 

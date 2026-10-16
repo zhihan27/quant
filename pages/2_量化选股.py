@@ -23,14 +23,57 @@ from services.stock_scoring import analyze_stock
 from services.ml_pipeline import load_context, train_market_context
 from services.portfolio_backtest import run_portfolio_strategy
 from services.rank_model import objective_label
-from services.ui_helpers import loading_task, show_backtest_metrics, show_empty_state, show_page_header
+from services.ui_helpers import (
+    format_number,
+    loading_task,
+    show_backtest_metrics,
+    show_conclusion,
+    show_empty_state,
+    show_page_header,
+)
 
 st.set_page_config(page_title="量化选股 | A 股量化研究", layout="wide")
 show_page_header(
     "量化选股",
-    "设定股票范围，结合传统因子与模型验证筛选候选，查看每只股票的入选依据。",
+    "设定股票范围，一次扫描整池，先看筛出几只候选和各自的评分，再看每只凭什么入选。",
     "研究工作台 / 量化选股",
 )
+
+
+def _zone_text(zone: Any) -> str:
+    """买入区间是元组，直接用会连括号和引号一起显示，这里转成「下沿 ~ 上沿」。"""
+    if not zone:
+        return "—"
+    try:
+        return f"{float(zone[0]):.2f} ~ {float(zone[1]):.2f}"
+    except (TypeError, ValueError, IndexError):
+        return "—"
+
+
+def _percent_text(value: Any) -> str:
+    """回测里的比例都是小数（0.12 表示 12%），统一转成百分比文字再展示。"""
+    return "—" if value is None else format_number(value * 100, 2, "%")
+
+
+def _cost_text(costs: Any) -> str:
+    """把费率字典整理成一行白话，避免页面上直接露出英文字段名。"""
+    if not costs:
+        return "—"
+    return (
+        f"佣金每边 {_percent_text(costs.get('commission_rate_each_side'))}，"
+        f"印花税只在卖出时收 {_percent_text(costs.get('stamp_duty_sell_side'))}，"
+        f"滑点每边 {_percent_text(costs.get('slippage_each_side'))}"
+    )
+
+
+def _score_kind_label(score_kind: Any) -> str:
+    """模型分数含义的标识转成一句人话，未登记的取值原样返回，不猜。"""
+    if not score_kind:
+        return "—"
+    return {
+        "rank_score": "同一天内的相对排名（百分位）",
+        "excess_return": "预期比大盘多赚多少",
+    }.get(str(score_kind), str(score_kind))
 
 
 service = get_market_data()
@@ -38,16 +81,22 @@ with st.container(border=True):
     st.subheader("筛选条件")
     scope_columns = st.columns([3, 1])
     pool_mode = scope_columns[0].selectbox("股票范围", ["沪深京全部 A 股", "沪深主板", "创业板", "科创板", "北交所", "用户自定义"])
-    scan_limit = scope_columns[1].number_input("展示前 N 个结果", min_value=1, max_value=100, value=20, step=1)
+    scan_limit = scope_columns[1].number_input(
+        "表格最多显示几行", min_value=1, max_value=100, value=20, step=1,
+        help="只影响页面显示多少行，实际扫描的股票数量不受它限制。",
+    )
     custom_codes = st.text_input("自定义代码（逗号或空格分隔）", placeholder="例：600000,000001", disabled=pool_mode != "用户自定义")
-    include_backtest = st.checkbox("同时计算每只股票的滚动样本外模型回测（全市场耗时较长）", value=False)
+    include_backtest = st.checkbox(
+        "同时看每只股票的历史模拟回测（全市场会很慢）", value=False,
+        help="对每只候选股票单独回放一遍历史买卖，用来判断它的规则在过去是否有效，会明显拉长扫描时间。",
+    )
     training_columns = st.columns([2, 1, 2], vertical_alignment="bottom")
     objective_mode = training_columns[0].selectbox(
         "训练目标",
         settings.RANK_OBJECTIVE_MODES,
         index=settings.RANK_OBJECTIVE_MODES.index(settings.DEFAULT_OBJECTIVE_MODE),
         format_func=objective_label,
-        help="排序目标只在同一交易日的截面内比胜负，避免回归目标在全市场上涨时给出全线看多的分数；自动择优会同时训练两种目标并按样本外 Rank IC 选择。",
+        help="排序目标让模型只在同一天里比谁更强，避免全市场普涨时所有股票都被判为看多；回归目标直接预测能比大盘多赚多少；自动择优会两种都训练，再挑历史表现更好的那个。",
     )
     training_window = training_columns[1].number_input(
         "滚动训练窗口（交易日）",
@@ -55,23 +104,30 @@ with st.container(border=True):
         max_value=2000,
         value=int(settings.TRAINING_WINDOW_DAYS),
         step=50,
-        help="每次重训只使用最近 N 个交易日的样本，以适应 A 股风格切换；0 表示使用全部可用历史。",
+        help="每次重训只看最近 N 个交易日的历史，好让模型跟上 A 股风格切换；填 0 表示用上全部历史。",
     )
     enable_neutralization = training_columns[2].checkbox(
-        "启用市值与行业中性化（申万一级）",
+        "剔除市值和行业的影响（中性化）",
         value=True,
-        help="对每个交易日的截面按流通市值对数与申万一级行业哑变量做回归，取残差作为纯净 Alpha 因子；需要联网获取暴露数据，覆盖率过低时自动退回截面 Z 分数因子。",
+        help="把「大盘股天生占优」「某个行业整体在涨」这类影响先扣掉，只留下个股自身的强弱；需要联网取行业数据，数据覆盖不足时会自动退回普通算法。",
     )
     portfolio_columns = st.columns([2, 1, 1, 1], vertical_alignment="bottom")
     run_portfolio = portfolio_columns[0].checkbox(
-        "扫描后运行 Top-N 组合回测（含 T+1 与交易费用）",
+        "扫描后模拟一个组合（按评分自动买卖，含 T+1 与交易费用）",
         value=False,
-        help="对本次股票池滚动重训截面排序模型，每日取前 N 名等权持有，按 T+1、涨跌停与停牌约束撮合并逐笔计入佣金、印花税和滑点。",
+        help="用本次扫描的结果，每天买入评分最高的前 N 名等权持有，按 A 股 T+1、涨跌停和停牌规则模拟成交，并逐笔扣掉佣金、印花税和滑点。",
     )
-    portfolio_top_n = portfolio_columns[1].number_input("组合持仓数 Top N", min_value=1, max_value=100, value=int(settings.PORTFOLIO_TOP_N), step=1, disabled=not run_portfolio)
-    max_position_weight = portfolio_columns[2].number_input("单股仓位上限", min_value=0.01, max_value=1.0, value=float(settings.MAX_POSITION_WEIGHT), step=0.01, format="%.2f", disabled=not run_portfolio)
-    rebalance_every = portfolio_columns[3].number_input("调仓间隔（交易日）", min_value=1, max_value=60, value=1, step=1, disabled=not run_portfolio)
-    st.caption("先获取完整股票池历史，再按交易日汇总截面训练共享模型；至少需要5只有效股票，同日覆盖须达到本次有效池的80%。")
+    portfolio_top_n = portfolio_columns[1].number_input("组合同时持有几只", min_value=1, max_value=100, value=int(settings.PORTFOLIO_TOP_N), step=1, disabled=not run_portfolio)
+    max_position_weight = portfolio_columns[2].number_input(
+        "单只股票最多占比", min_value=0.01, max_value=1.0, value=float(settings.MAX_POSITION_WEIGHT),
+        step=0.01, format="%.2f", disabled=not run_portfolio,
+        help="单只股票占组合的上限（1.00 表示 100%），用来避免押注过度集中。",
+    )
+    rebalance_every = portfolio_columns[3].number_input(
+        "每隔几天调仓一次", min_value=1, max_value=60, value=1, step=1, disabled=not run_portfolio,
+        help="调仓越勤，交易费用越多；填 1 表示每个交易日都按最新评分换股。",
+    )
+    st.caption("扫描会先下载股票池的历史行情，再训练一个覆盖全池的模型。参与训练的股票太少（不足 5 只）或数据缺失太多（覆盖不到本次股票池的 80%）时不会给出评分。")
 
 if st.button("开始扫描", type="primary"):
     with loading_task("获取完整股票池", "首次获取或启用备用数据源时会逐页核对完整股票池，通常需要一至两分钟。") as task:
@@ -256,6 +312,7 @@ if not recommendations:
     show_empty_state("配置范围，开始发现候选股票", "首次可使用少量自定义代码体验。全市场扫描包含逐股行情获取与模型训练，耗时取决于股票数量和网络。")
 if recommendations:
     rows = []
+    detail_rows = []
     usable = []
     failed_rows = []
     for item in recommendations:
@@ -269,6 +326,7 @@ if recommendations:
         xgboost = next((model for model in models if model["model"] == "XGBoost"), {})
         plan = item["analysis"].get("trade_plan", {})
         backtest_metrics = (item.get("backtest") or {}).get("metrics") or {}
+        # 默认表只留看得懂的部分；技术字段统一进明细表，避免首屏堆满行话。
         rows.append(
             {
                 "综合评分": item.get("cross_section_score"),
@@ -276,9 +334,19 @@ if recommendations:
                 "名称": item["name"],
                 "最新价": quote.get("price"),
                 "涨跌幅": quote.get("change_pct"),
+                "参考买入区间": _zone_text(plan.get("buy_zone")),
+                "止损参考": plan.get("initial_stop"),
+                "交易状态": item.get("entry_trade_status", "未评估"),
+                "推荐理由": item.get("reason"),
+                "主要风险": item.get("risk"),
+            }
+        )
+        detail_rows.append(
+            {
+                "代码": item["code"],
+                "名称": item["name"],
                 "行情时间": quote.get("quote_time") or quote.get("fetched_at"),
                 "数据状态": quote.get("data_status"),
-                "交易状态": item.get("entry_trade_status", "未评估"),
                 "时序因子分": item["analysis"].get("factor_score"),
                 "LightGBM 20日预测值": _validated_return(lightgbm),
                 "LightGBM 截面Z分数": lightgbm.get("prediction_zscore"),
@@ -288,24 +356,57 @@ if recommendations:
                 "XGBoost 截面Z分数": xgboost.get("prediction_zscore"),
                 "XGBoost Rank IC": (xgboost.get("oos_metrics") or {}).get("rank_ic"),
                 "XGBoost 排名": item.get("xgboost_rank"),
-                "参考买入区间": plan.get("buy_zone"),
-                "止损参考": plan.get("initial_stop"),
                 "退出条件": plan.get("trailing_exit"),
                 "样本外回测收益": backtest_metrics.get("total_return"),
                 "回测状态": (item.get("backtest") or {}).get("status", "未计算"),
                 "信号生成时间": plan.get("generated_at"),
                 "截面日期": item["analysis"].get("prediction_reference_date"),
                 "模型上下文": item["analysis"].get("market_context_id"),
-                "推荐理由": item.get("reason"),
-                "主要风险": item.get("risk"),
             }
         )
     scan_stats = st.session_state.get("scan_stats", {})
-    st.caption(
-        f"本次扫描 {scan_stats.get('scanned', 0):,} 只；有效评分 {scan_stats.get('scored', 0):,} 只；"
-        f"失败或排除 {scan_stats.get('failed', 0):,} 只。"
+    scored_rows = [row for row in rows if row.get("综合评分") is not None]
+    best = max(scored_rows, key=lambda row: row["综合评分"]) if scored_rows else None
+    show_conclusion(
+        f"本次扫描 {scan_stats.get('scanned', 0):,} 只股票，筛出 {len(rows):,} 只候选"
+        + (f"，其中评分最高的是 {best['名称']}（{best['代码']}）。" if best else "。")
+        + " 评分是“同一天里相对更值得看”的排名，不是涨跌预测，也不保证赚钱。"
     )
-    st.dataframe(pd.DataFrame(rows[: int(scan_limit)]), hide_index=True, use_container_width=True)
+    st.caption(
+        f"扫描明细：有效评分 {scan_stats.get('scored', 0):,} 只；失败或排除 {scan_stats.get('failed', 0):,} 只。"
+    )
+    st.dataframe(
+        pd.DataFrame(rows[: int(scan_limit)]),
+        hide_index=True,
+        width="stretch",
+        column_config={
+            "综合评分": st.column_config.NumberColumn(
+                "综合评分",
+                format="%.1f",
+                help="把因子分和模型分加权后的总分（0~100）。只和同一天的其他股票比，分数高表示相对更值得看。",
+            ),
+            "涨跌幅": st.column_config.NumberColumn(
+                "涨跌幅", format="%.2f", help="最近一次行情相对上一收盘价的涨跌，单位是百分比。"
+            ),
+            "参考买入区间": st.column_config.TextColumn(
+                "参考买入区间",
+                help="按日常波动幅度算出的参考价，不是成交价。次日开盘不在这个区间内，就不假设买到了。",
+            ),
+            "止损参考": st.column_config.NumberColumn(
+                "止损参考", format="%.2f", help="跌破这个价格就按规则卖出，用来限制单只股票最多亏多少。"
+            ),
+            "推荐理由": st.column_config.TextColumn("推荐理由", width="large"),
+            "主要风险": st.column_config.TextColumn("主要风险", width="large"),
+        },
+    )
+    with st.expander(f"展开技术指标明细（{len(detail_rows):,} 行，给懂行的人看）"):
+        st.caption(
+            "截面Z分数＝这只股票的模型分比当天全市场平均值高出多少（0 是平均，正数更看好）；"
+            "Rank IC＝样本外每天“模型排名”和“真实涨跌排名”的相关性，越高说明模型排序越靠谱；"
+            "20日预测值在排序目标下只是同一天里的相对排名百分位，只有回归目标下才是预期超额收益；"
+            "时序因子分只看这只股票自己的历史，和全市场比出来的综合评分不是一回事。"
+        )
+        st.dataframe(pd.DataFrame(detail_rows[: int(scan_limit)]), hide_index=True, width="stretch")
     if failed_rows:
         with st.expander(f"查看失败或排除股票（{len(failed_rows):,}）"):
             st.dataframe(pd.DataFrame(failed_rows), hide_index=True, use_container_width=True)
@@ -338,63 +439,139 @@ if recommendations:
             except (DatabaseError, ValueError) as exc:
                 st.error(str(exc))
         st.page_link(str(settings.PROJECT_ROOT / "pages" / "1_个股分析.py"), label=f"打开 {selected_code} 个股分析", query_params={"code": selected_code})
-        st.caption("综合评分=40%同日截面因子分+60%通过验证的模型百分位；Z分数以同日有效股票池均值为0，标准差为1。模型验证失败只展示因子观察，不输出预测评分。排序目标下 20 日预测值是同日截面的相对排序百分位，只有在回归目标下才是预期超额收益。")
+        with st.expander("综合评分是怎么算出来的"):
+            st.write("综合评分 = 40% × 同日因子分 + 60% × 通过验证的模型分。")
+            st.caption(
+                "因子分是把它近期的涨跌、波动、量能放在一起打的 0~100 分；模型分是模型在同一天全市场里的相对位置。"
+                "模型没通过历史检验时，只展示因子观察，不给预测分。"
+                "选「排序目标」时，20 日预测值只是同一天里的相对排名，不是预期能赚多少；选「回归目标」才是预期超额收益。"
+            )
 
 portfolio_result = st.session_state.get("portfolio_result")
 if portfolio_result:
     st.divider()
-    st.subheader("Top-N 组合回测（含 T+1 与交易摩擦）")
+    st.subheader("模拟组合回测（按评分自动买卖）")
     portfolio_metrics = portfolio_result.get("metrics")
     if not portfolio_metrics:
         st.warning(portfolio_result.get("status", "组合回测未产生结果。"))
     else:
-        show_backtest_metrics(portfolio_metrics, portfolio_result.get("benchmark_buy_hold_return"))
+        total_return = portfolio_metrics.get("total_return")
+        benchmark_return = portfolio_result.get("benchmark_buy_hold_return")
+        gap_text = ""
+        if total_return is not None and benchmark_return is not None:
+            diff = (total_return - benchmark_return) * 100
+            gap_text = (
+                f"；同期沪深 300 买入不动是 {_percent_text(benchmark_return)}，"
+                f"{'跑赢' if diff >= 0 else '跑输'} {abs(diff):.2f} 个百分点"
+            )
+        show_conclusion(
+            f"历史上完全按这套规则自动买卖，模拟总收益 {_percent_text(total_return)}{gap_text}。"
+            "这是回放过去、并且扣掉了手续费和滑点，不代表以后也会这样。"
+        )
+        show_backtest_metrics(portfolio_metrics, benchmark_return)
         portfolio = portfolio_result.get("portfolio", {})
         universe = portfolio_result.get("universe", {})
         score_range = portfolio_result.get("score_range", {})
         universe_note = universe.get("status") or f"股票池未超过 {universe.get('limit')} 只上限"
         st.caption(
-            f"每日截面取前 {portfolio.get('top_n')} 名等权持有，单股目标仓位 {portfolio.get('per_stock_weight')}，"
-            f"单股上限 {portfolio.get('max_weight')}；调仓间隔 {portfolio_result.get('rebalance_every')} 个交易日；"
+            f"规则：每个交易日按评分买前 {portfolio.get('top_n')} 名、等权持有，"
+            f"单只目标仓位 {_percent_text(portfolio.get('per_stock_weight'))}、上限 {_percent_text(portfolio.get('max_weight'))}；"
+            f"每 {portfolio_result.get('rebalance_every')} 个交易日调仓一次。"
             f"打分区间 {score_range.get('start')} 至 {score_range.get('end')}，共 {score_range.get('dates')} 个交易日；"
-            f"股票池 {universe.get('kept')} 只（{universe_note}）。"
+            f"可用股票 {universe.get('kept')} 只（{universe_note}）。"
         )
         st.write(
             {
-                "组合持仓数": portfolio.get("average_holdings"),
-                "资金投入比例": portfolio.get("invested_ratio"),
-                "现金比例": portfolio.get("cash_ratio"),
-                "单股上限是否生效": portfolio.get("cap_binding"),
-                "已平仓交易数": portfolio_metrics.get("trades"),
-                "买入未成交笔数": portfolio_result.get("unfilled_buys"),
-                "卖出未成交笔数": portfolio_result.get("unfilled_sells"),
-                "股票池等权收益": portfolio_result.get("universe_equal_weight_return"),
-                "费用明细": portfolio_result.get("costs"),
+                "平均同时持几只": format_number(portfolio.get("average_holdings"), 1, " 只"),
+                "资金投入比例": _percent_text(portfolio.get("invested_ratio")),
+                "留作现金的比例": _percent_text(portfolio.get("cash_ratio")),
+                "单股上限有没有被触发": "是" if portfolio.get("cap_binding") else "否",
+                "已卖出的交易笔数": portfolio_metrics.get("trades"),
+                "想买没买到的笔数（涨停或停牌）": portfolio_result.get("unfilled_buys"),
+                "想卖没卖掉的笔数（跌停或停牌）": portfolio_result.get("unfilled_sells"),
+                "整个股票池平均买一遍的收益": _percent_text(portfolio_result.get("universe_equal_weight_return")),
+                "交易费用": _cost_text(portfolio_result.get("costs")),
                 "模型版本": portfolio_result.get("model_version"),
             }
         )
-        st.caption("撮合约束：" + "；".join(portfolio_result.get("constraints", [])))
+        st.caption("模拟成交时遵守的规则：" + "；".join(portfolio_result.get("constraints", [])))
         open_positions = portfolio_result.get("open_positions") or []
         if open_positions:
-            st.markdown("**回测结束时的未平仓持仓**")
-            st.dataframe(pd.DataFrame(open_positions), hide_index=True, width="stretch")
+            st.markdown("**回测结束时还拿着没卖的**")
+            st.dataframe(
+                pd.DataFrame(open_positions).rename(
+                    columns={
+                        "code": "代码",
+                        "entry_date": "买入日",
+                        "entry_price": "买入价",
+                        "shares": "股数",
+                        "market_value": "当前市值",
+                        "unrealized_return": "浮动盈亏",
+                    }
+                ),
+                hide_index=True,
+                width="stretch",
+                column_config={
+                    "浮动盈亏": st.column_config.NumberColumn(
+                        "浮动盈亏", help="比例数：0.05 表示浮盈 5%，已按卖出费用折算。"
+                    ),
+                },
+            )
         trades = portfolio_result.get("trades") or []
         if trades:
-            with st.expander(f"查看组合成交明细（{len(trades):,} 笔）"):
-                st.dataframe(pd.DataFrame(trades), hide_index=True, width="stretch")
+            with st.expander(f"展开每一笔买卖明细（{len(trades):,} 笔）"):
+                st.caption("收益都是比例数：0.05 表示赚 5%。")
+                st.dataframe(
+                    pd.DataFrame(trades).rename(
+                        columns={
+                            "entry_date": "买入日",
+                            "exit_date": "卖出日",
+                            "code": "代码",
+                            "entry_price": "买入价",
+                            "exit_price": "卖出价",
+                            "gross_return": "不计费用收益",
+                            "net_return": "扣费后收益",
+                            "holding_days": "持有天数",
+                            "exit_reason": "卖出原因",
+                        }
+                    ),
+                    hide_index=True,
+                    width="stretch",
+                )
         daily_equity = portfolio_result.get("daily_equity") or []
         if daily_equity:
             equity_frame = pd.DataFrame(daily_equity).set_index("date")[["equity", "gross_equity"]]
+            equity_frame = equity_frame.rename(columns={"equity": "扣费后净值", "gross_equity": "不扣费净值"})
+            equity_frame.index.name = "日期"
             st.line_chart(equity_frame)
-            st.caption("equity 为计入佣金、印花税与滑点后的净值；gross_equity 为同一撮合路径下不计费用的毛净值。")
+            st.caption(
+                "两条线都从 1.0 开始：扣费后净值算进了佣金、印花税和滑点，不扣费净值是同一条买卖路径但不计费用，"
+                "两条线之间的差距就是交易成本吃掉的收益。"
+            )
         training_log = portfolio_result.get("training_log") or []
         if training_log:
-            with st.expander(f"查看滚动重训记录（{len(training_log):,} 段）"):
+            with st.expander(f"展开每段重新训练的检验结果（{len(training_log):,} 段）"):
                 # 摊平每段里每个模型的检验数值，直接看出是哪条门槛拦住了打分。
-                rows = [
-                    {"打分起始日": block.get("prediction_start"), "训练截至": block.get("trained_through"), **model}
-                    for block in training_log for model in block.get("models", [])
+                log_rows = [
+                    {
+                        "打分起始日": block.get("prediction_start"),
+                        "训练数据截止": block.get("trained_through"),
+                        "模型": model.get("model"),
+                        "训练目标": objective_label(model["objective"]) if model.get("objective") else "—",
+                        "分数含义": _score_kind_label(model.get("score_kind")),
+                        "是否通过验证": model.get("status"),
+                        "训练交易日数": model.get("training_dates"),
+                        "Rank IC": model.get("rank_ic"),
+                        "NDCG 比值": model.get("ndcg_ratio"),
+                        "MAE": model.get("mae"),
+                        "验证规则": model.get("validation_rule"),
+                    }
+                    for block in training_log
+                    for model in block.get("models", [])
                 ]
-                st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
-                st.caption("每段按起始日只用该日之前的历史重训；验证规则为当日生效的门槛，"
-                           "排序目标看 NDCG 与随机基线之比，回归目标看 MAE 是否优于训练中位数基线。")
+                st.caption(
+                    "每一段只用该起始日之前的历史重新训练，不会用到未来数据。"
+                    "Rank IC 看排序是否靠谱；排序目标按「NDCG 与随机猜的比值」判定，回归目标看 MAE 是否优于「直接猜中位数」的基线。"
+                    "只有通过验证的模型才参与打分。"
+                )
+                st.dataframe(pd.DataFrame(log_rows), hide_index=True, width="stretch")

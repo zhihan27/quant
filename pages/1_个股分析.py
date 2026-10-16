@@ -15,15 +15,29 @@ from services.statistical_arbitrage import analyze_pair
 from services.ui_helpers import format_number as _fmt
 from services.ui_helpers import show_backtest_metrics as _show_backtest_metrics
 from services.ui_helpers import show_candles as _show_candles
-from services.ui_helpers import loading_task, show_empty_state, show_page_header
+from services.ui_helpers import loading_task, show_conclusion, show_empty_state, show_page_header, show_plain_numbers
 from services.runtime import get_market_data, get_repository
 
 st.set_page_config(page_title="个股分析 | A 股量化研究", layout="wide")
 show_page_header(
     "个股分析",
-    "输入股票代码或名称，从行情走势、传统因子到模型结果，逐步了解一只股票。",
+    "输入股票代码或名称，先看结论和买卖参考价，再看它凭什么这么判断。",
     "研究工作台 / 个股分析",
 )
+
+
+def _stock_conclusion(plan: dict) -> tuple[str, str]:
+    """把模型判断和买卖参考浓缩成一句话，不懂指标也能直接读结论。"""
+    zone = plan.get("buy_zone")
+    if zone and plan.get("signal_active"):
+        return (
+            f"模型看多。参考在 {zone[0]} ~ {zone[1]} 元买入，跌破 {plan.get('initial_stop')} 元止损。"
+            "这是研究结论，不是保证会涨。",
+            "good",
+        )
+    if zone:
+        return (f"模型这次不支持直接买入（{plan.get('status')}）。下方价格仅供复核，不要据此下单。", "warn")
+    return ("模型这次没有给出可用判断，原因见下方「模型判断」。", "warn")
 
 
 service = get_market_data()
@@ -179,7 +193,10 @@ if state and state.get("code") == selected_code:
     price_columns[5].metric("最高 / 最低", f"{_fmt(quote.get('high'), 2)} / {_fmt(quote.get('low'), 2)}")
     price_columns[6].metric("昨收", _fmt(quote.get("previous_close"), 2))
 
-    chart_tab, factor_tab, model_tab, signal_tab = st.tabs(["行情图表", "因子分析", "模型结果", "交易参考"])
+    plan = analysis.get("trade_plan", {})
+    show_conclusion(*_stock_conclusion(plan))
+
+    chart_tab, factor_tab, model_tab, signal_tab = st.tabs(["行情图表", "走势打分", "模型判断", "买卖参考"])
     with chart_tab:
         st.caption(f"周线状态：{state['weekly_meta'].get('status', '可用')}")
         st.caption(
@@ -191,25 +208,46 @@ if state and state.get("code") == selected_code:
         _show_candles(weekly, "周 K 线及成交量", 100)
     with factor_tab:
         st.caption(state.get("benchmark_status", ""))
-        st.metric("时序多因子评分", _fmt(analysis.get("factor_score"), 1, " / 100"))
+        show_plain_numbers([
+            (
+                "走势打分",
+                _fmt(analysis.get("factor_score"), 1, " / 100"),
+                "把近期的涨跌、波动、量能等放在一起算出的 0~100 分（时序多因子评分）。"
+                "这只股票现在跟它自己的历史比是什么水平，分数越高越强。",
+            ),
+        ], columns=1)
         factors = analysis.get("factor_details", [])
         if factors:
             factor_frame = pd.DataFrame(factors).rename(
-                columns={"factor": "因子", "value": "当前值", "z_score": "时序 Z 值", "score": "子分", "weight": "权重"}
+                columns={"factor": "打分项", "value": "当前值", "z_score": "比平时高多少", "score": "这项得几分", "weight": "占多大分量"}
             )
-            st.dataframe(factor_frame, hide_index=True, use_container_width=True)
+            st.dataframe(
+                factor_frame,
+                hide_index=True,
+                use_container_width=True,
+                column_config={
+                    "比平时高多少": st.column_config.NumberColumn(
+                        help="拿这只股票自己的历史当尺子：0 表示和平时一样，+2 表示明显比平时高，-2 表示明显比平时低（时序 Z 值）。"
+                    ),
+                    "占多大分量": st.column_config.NumberColumn(help="这一项在总分里占的比重（权重）。"),
+                },
+            )
         else:
-            st.info("当前历史长度不足以计算稳定的因子评分。")
+            st.info("当前历史长度不足以计算稳定的打分。")
         latest = analysis.get("latest_features", {})
         st.write(
             {
-                "5 日收益": latest.get("momentum_5"),
-                "20 日收益": latest.get("momentum_20"),
-                "60 日收益": latest.get("momentum_60"),
-                "20 日年化波动率": latest.get("volatility_20"),
-                "ATR / 价格": latest.get("atr_pct"),
-                "相对沪深 300 20 日表现": latest.get("relative_strength_20"),
+                "近 5 个交易日涨跌": latest.get("momentum_5"),
+                "近 20 个交易日涨跌": latest.get("momentum_20"),
+                "近 60 个交易日涨跌": latest.get("momentum_60"),
+                "波动大小（折算成年）": latest.get("volatility_20"),
+                "日常波动幅度 ÷ 价格": latest.get("atr_pct"),
+                "近 20 日比沪深 300 强多少": latest.get("relative_strength_20"),
             }
+        )
+        st.caption(
+            "「日常波动幅度」指这只股票平均一天上下波动的幅度（ATR），除以价格好和别的股票横向比较；"
+            "数值越大代表价格越不老实，买卖参考价也要留出更大空间。"
         )
         st.caption(analysis.get("fundamental_status", ""))
     with model_tab:
@@ -219,10 +257,13 @@ if state and state.get("code") == selected_code:
             for item in models:
                 metrics = item.get("oos_metrics") or {}
                 ranking = item.get("score_kind") == SCORE_KIND_RANK
+                percentile = item.get("prediction_percentile")
                 model_rows.append(
                     {
                         "模型": item["model"],
                         "预测周期": f"{horizon} 个交易日",
+                        "模型这次怎么说": item.get("status"),
+                        "在当天全市场的位置": f"排在前 {100 - percentile * 100:.0f}%" if percentile is not None else "—",
                         "目标口径": objective_label(item.get("objective")) if item.get("objective") else None,
                         "模型预测值": item.get("predicted_excess_return"),
                         "同日截面Z分数": item.get("prediction_zscore"),
@@ -247,42 +288,75 @@ if state and state.get("code") == selected_code:
                         {"模型": item["model"], **row}
                         for row in item.get("feature_importance", [])[:5]
                     )
-        st.dataframe(pd.DataFrame(model_rows), hide_index=True, use_container_width=True)
-        st.caption(
-            "排序目标下模型预测值只是同日截面内的相对排序分，判断依据是 NDCG 相对随机基线的提升；只有回归目标下的预测值才是相对沪深 300 的预期超额收益。"
-            "Z分数按同日股票池标准化，不换算绝对价格。请先在量化选股扫描至少5只股票建立共享截面模型。"
-        )
-        st.caption(analysis.get("cross_section_scope", ""))
-        if importance_rows:
-            st.markdown("**20 日模型特征重要性**")
-            st.dataframe(pd.DataFrame(importance_rows), hide_index=True, use_container_width=True)
-        st.warning("基线、Rank IC或Top/Bottom分组检验不通过时不输出预测评分；分组持有期收益含重叠，不代表组合回测净收益。")
+        if model_rows:
+            st.dataframe(
+                pd.DataFrame(model_rows)[["模型", "预测周期", "模型这次怎么说", "在当天全市场的位置"]],
+                hide_index=True,
+                use_container_width=True,
+            )
+            st.caption(
+                "「在当天全市场的位置」＝这只股票当天的分数在候选股票里排第几，排在前 10% 表示比 90% 的股票更被看好。"
+                "排名靠前只说明相对更强，不等于这只股票一定会涨。"
+            )
+        st.warning("模型没通过检验时不会给出预测分数，只显示它为什么没通过——宁可说“这次不知道”，也不给一个看着像结论的数字。")
+        with st.expander("展开技术指标（Rank IC、NDCG、HAC t 值等）"):
+            st.dataframe(pd.DataFrame(model_rows), hide_index=True, use_container_width=True)
+            st.caption(
+                "Rank IC 衡量模型把当天该涨的股票排在前面的能力，0.02 以上才算有点用；"
+                "NDCG 看排在前 20% 的那批股票准不准，和随机乱排相比高 5% 以上才算过关；"
+                "HAC t 值是判断 Rank IC 是不是碰巧的统计量，要大于 1.645。"
+                "这三项加上分组收益检验，任意一项不通过就不输出评分。"
+            )
+            st.caption(
+                "排序目标下模型预测值只是同日截面内的相对排序分，判断依据是 NDCG 相对随机基线的提升；"
+                "只有回归目标下的预测值才是相对沪深 300 的预期超额收益。"
+                "Z分数按同日股票池标准化，不换算绝对价格。请先在量化选股扫描至少5只股票建立共享截面模型。"
+            )
+            st.caption(analysis.get("cross_section_scope", ""))
+            if importance_rows:
+                st.markdown("**20 日模型特征重要性**")
+                st.dataframe(pd.DataFrame(importance_rows), hide_index=True, use_container_width=True)
     with signal_tab:
-        plan = analysis.get("trade_plan", {})
-        st.write(f"**状态：** {plan.get('status', '不可用')}")
+        st.caption(f"当前状态：{plan.get('status', '不可用')}")
         if plan.get("buy_zone"):
+            zone = plan["buy_zone"]
+            show_plain_numbers([
+                ("参考买入区间", f"{zone[0]} ~ {zone[1]} 元", "按最近波动算出的低吸区间，不是预测价，也不保证一定买得到。"),
+                ("跌破就卖（止损）", f"{_fmt(plan.get('initial_stop'), 2)} 元", "跌到这里说明这次判断错了，认赔离场，别硬扛。"),
+                ("涨到就先卖（止盈）", f"{_fmt(plan.get('take_profit'), 2)} 元", "到达这个价位先落袋，避免赚到的又还回去。"),
+            ])
             st.write(
                 {
-                    "参考买入区间": plan.get("buy_zone"),
-                    "参考价（非成交价）": plan.get("reference_price"),
-                    "入场条件": plan.get("entry_trigger"),
-                    "初始止损参考": plan.get("initial_stop"),
-                    "止盈参考": plan.get("take_profit"),
-                    "移动止盈 / 趋势退出": plan.get("trailing_exit"),
-                    "持仓周期": plan.get("holding_period"),
-                    "生成时间 / 有效期": f"{plan.get('generated_at')} / {plan.get('valid_until')}",
-                    "失效条件": plan.get("invalidation"),
-                    "计算依据": plan.get("calculation"),
+                    "大概持有多久": plan.get("holding_period"),
+                    "什么情况会作废": plan.get("invalidation"),
+                    "参考价（不是成交价）": plan.get("reference_price"),
                 }
             )
+            with st.expander("展开判断依据（入场条件、退出规则、计算方式）"):
+                st.write(
+                    {
+                        "入场条件": plan.get("entry_trigger"),
+                        "移动止盈 / 趋势退出": plan.get("trailing_exit"),
+                        "计算依据": plan.get("calculation"),
+                        "生成时间 / 有效期": f"{plan.get('generated_at')} / {plan.get('valid_until')}",
+                    }
+                )
+                st.caption(
+                    "上面提到的「ATR」是这只股票平均一天上下波动的幅度。买入区间是参考价上下各 0.25 倍，止损是 −2 倍，止盈是 +3 倍；"
+                    "倍数越大留给价格的空间越宽。参考价取最新一根完整日线的收盘价。"
+                )
             st.warning(plan.get("risk_note", ""))
         else:
-            st.info("价格或 ATR 数据不足，未生成交易价格。")
+            st.info("价格或日常波动幅度（ATR）数据不足，未生成买卖参考价。")
 
     st.divider()
-    st.subheader("滚动样本外回测")
-    st.caption("回测使用当时训练验证通过的模型和页面相同的交易规则；包含逐日持仓净值及T+1/停牌/涨跌停近似限制。")
-    if st.button("运行并保存回测", key="run_backtest"):
+    st.subheader("历史表现回顾（模拟交易）")
+    st.caption(
+        "把本页的买卖规则放到历史上跑一遍，看它过去表现如何。用的是当时训练出来的模型，"
+        "并且算上了 T+1（今天买的明天才能卖）、停牌和一字涨跌停根本买不到／卖不出的情况。"
+        "过去这样不代表以后也这样。"
+    )
+    if st.button("开始模拟并保存结果", key="run_backtest"):
         try:
             with loading_task("滚动样本外回测", "回测会分时段训练模型，计算交易与持仓净值，耗时通常长于单次分析。") as task:
                 task.step("1 / 4 · 获取未复权行情", 0, 4)
@@ -329,16 +403,32 @@ if state and state.get("code") == selected_code:
                 f"未成交进场 {backtest_result.get('unfilled_entries')}，未成交退出 {backtest_result.get('unfilled_exits')}。"
             )
             if backtest_result.get("daily_equity"):
-                equity_frame = pd.DataFrame(backtest_result["daily_equity"]).set_index("date")
-                st.line_chart(equity_frame[["equity", "gross_equity"]])
+                equity_frame = pd.DataFrame(backtest_result["daily_equity"]).set_index("date").rename(
+                    columns={"equity": "扣费后净值", "gross_equity": "不扣费净值"}
+                )
+                equity_frame.index.name = "日期"
+                st.line_chart(equity_frame[["扣费后净值", "不扣费净值"]])
+                st.caption(
+                    "净值＝每 1 元本金变成了多少钱，起点都是 1。两条线的差距就是手续费、印花税和滑点吃掉的部分。"
+                )
             if backtest_result.get("open_position"):
-                st.write({"期末未平仓（已计入净值）": backtest_result["open_position"]})
+                st.write({"模拟结束时还拿着没卖的（已经算进上面的净值）": backtest_result["open_position"]})
             if backtest_result.get("trades"):
-                st.dataframe(pd.DataFrame(backtest_result["trades"]).tail(30), hide_index=True, use_container_width=True)
+                st.dataframe(
+                    pd.DataFrame(backtest_result["trades"]).tail(30).rename(
+                        columns={
+                            "entry_date": "买入日", "exit_date": "卖出日", "entry_price": "买入价", "exit_price": "卖出价",
+                            "gross_return": "不扣费收益", "net_return": "扣费后收益",
+                            "holding_days": "持有几天", "exit_reason": "卖出原因",
+                        }
+                    ),
+                    hide_index=True,
+                    use_container_width=True,
+                )
         else:
             st.warning(backtest_result.get("status"))
 
-    with st.expander("统计套利：检验一组配对股票"):
+    with st.expander("配对观察：找两只长期同涨同跌的股票"):
         left, right = st.columns(2)
         code_a = left.text_input("股票 A 代码", max_chars=6, key="pair_a")
         code_b = right.text_input("股票 B 代码", max_chars=6, key="pair_b")
@@ -358,8 +448,22 @@ if state and state.get("code") == selected_code:
                 st.error(str(exc))
         pair_result = st.session_state.get("pair_result")
         if pair_result:
+            st.caption(
+                "思路：两只股票如果长期同涨同跌，暂时拉开明显差距时，可以押注差距收回去。"
+                "这需要能融券做空其中一只，普通账户不一定做得到。"
+            )
             st.write(pair_result.get("status"))
-            st.json(pair_result)
+            if pair_result.get("current_z_score") is not None:
+                show_plain_numbers([
+                    ("差距拉大到平时几倍", _fmt(pair_result.get("current_z_score"), 2),
+                     "两只股票当前的差距相当于平时的几倍：0 表示和平时一样，超过 ±2 才值得留意（Z 值）。"),
+                    ("两只股票怎么配比", _fmt(pair_result.get("hedge_ratio_kalman"), 3),
+                     "买 1 份 A 要同时卖空多少份 B，才能抵消掉大盘涨跌的影响（对冲比例）。"),
+                    ("现在怎么做", pair_result.get("signal") or "暂无",
+                     "差距偏大就反过来做，偏小就正着做；回到 0 附近就平仓观察。"),
+                ])
+            with st.expander("展开原始检验数据（beta、协整 p 值等，给懂行的人看）"):
+                st.json(pair_result)
 
 
 
