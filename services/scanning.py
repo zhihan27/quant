@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any
 
@@ -10,14 +11,45 @@ import pandas as pd
 
 from services.market_data import MarketDataError, MarketDataService
 from services.rank_model import SCORE_KIND_RANK
+from services.universe import filter_universe, load_reference
+
+LOGGER = logging.getLogger("quant.scanning")
+
+
+def load_universe_reference(data_service: MarketDataService, progress: Any = None) -> tuple[Any, dict[str, Any]]:
+    """读取退市与 ST 名单；接口不可用时降级为证券简称启发式，并如实说明降级原因。"""
+    try:
+        return load_reference(getattr(data_service, "panels", None), progress=progress)
+    except (OSError, ValueError, ImportError) as exc:
+        LOGGER.warning("股票池状态名单不可用 detail=%s", exc)
+        return None, {"status": f"股票池状态名单不可用，改用证券简称启发式：{type(exc).__name__}"}
+
+
+def _apply_universe_filter(
+    frame: pd.DataFrame, reference: Any, meta: dict[str, Any]
+) -> tuple[pd.DataFrame, dict[str, Any], dict[str, Any]]:
+    """统一入口：所有扫描模式（含用户自定义代码）都必须先过股票池状态过滤。"""
+    kept, report = filter_universe(frame, reference)
+    merged = {**meta, "universe_filter": report}
+    if report.get("excluded"):
+        merged["warning"] = "；".join(filter(None, [meta.get("warning"), report["status"]]))
+    return kept, merged, report
 
 
 def candidate_codes(
-    mode: str, raw_codes: str, limit: int, data_service: MarketDataService
+    mode: str, raw_codes: str, limit: int, data_service: MarketDataService, progress: Any = None
 ) -> tuple[list[dict[str, str]], dict[str, Any]]:
     if mode == "用户自定义":
         codes = list(dict.fromkeys(re.findall(r"(?<!\d)\d{6}(?!\d)", raw_codes)))
-        return ([{"code": code, "name": code} for code in codes], {"status": "用户输入", "fetched_at": None, "complete": True})
+        frame = pd.DataFrame({"code": codes, "name": codes})
+        reference, reference_meta = load_universe_reference(data_service, progress)
+        # 名单状态放在前面展开，免得把「用户输入」这个来源说明覆盖掉；名单详情见 universe_filter。
+        frame, meta, report = _apply_universe_filter(frame, reference, {
+            **reference_meta, "status": "用户输入", "fetched_at": None, "complete": True,
+        })
+        if report.get("excluded"):
+            meta["error"] = f"输入的代码中有 {report['excluded']} 只被股票池规则排除：{report['status']}"
+        return frame.to_dict("records"), meta
     try:
         scope = {"沪深主板": "main", "创业板": "chinext", "科创板": "star", "北交所": "bj"}.get(mode, "all")
         universe, meta = data_service.get_universe(scope=scope)
@@ -27,7 +59,6 @@ def candidate_codes(
         return [], {"status": "不可用", "error": "股票列表为空。"}
     universe["code"] = universe["code"].astype(str).str.zfill(6)
     universe["name"] = universe["name"].astype(str)
-    universe = universe.loc[~universe["name"].str.contains(r"ST|退市|退", case=False, regex=True, na=False)]
     if mode == "沪深主板":
         universe = universe.loc[universe["code"].str.match(r"^(00[0-3]|60[0-5])") & ~universe["code"].str.startswith(("300", "301", "688", "689"))]
     elif mode == "创业板":
@@ -36,6 +67,12 @@ def candidate_codes(
         universe = universe.loc[universe["code"].str.startswith(("688", "689"))]
     elif mode == "北交所":
         universe = universe.loc[universe["code"].str.startswith(("4", "8", "92"))]
+    reference, reference_meta = load_universe_reference(data_service, progress)
+    universe, meta, _ = _apply_universe_filter(universe, reference, {**meta, **reference_meta})
+    meta["scope_valid_symbols"] = int(len(universe))
+    if universe.empty:
+        meta["error"] = "股票池经退市与 ST 过滤后为空。"
+        return [], meta
     if "amount_yuan" in universe:
         universe = universe.sort_values("amount_yuan", ascending=False, na_position="last")
     rows = universe.to_dict("records")

@@ -72,3 +72,37 @@ PORTFOLIO_TOP_N = 20
 MAX_POSITION_WEIGHT = 0.05
 PORTFOLIO_BACKTEST_MAX_STOCKS = 300
 
+# 股票池状态：退市与 ST 名单来自交易所公开接口，缓存一天，避免每次扫描重复拉取。
+UNIVERSE_REFERENCE_TIMEOUT_SECONDS = 180
+UNIVERSE_STATUS_CACHE_SECONDS = 86400
+
+# 筹码分布：按价格分箱堆积，换手衰减系数控制历史筹码的遗忘速度。
+CHIP_PRICE_BINS = 120
+CHIP_DECAY_FACTOR = 1.0
+# 成本区间宽度取 90% 筹码覆盖范围；获利盘比例按当日收盘价在成本分布中的位置计算。
+CHIP_COVERAGE_RATIO = 0.90
+# 筹码分布至少需要的历史交易日；不足时不出因子，不用短样本冒充稳态筹码。
+CHIP_MINIMUM_BARS = 120
+
+# 日内高频因子落盘：分钟线按 code=*.parquet 累积，随时间增长历史深度。
+INTRADAY_PANEL_DIRNAME = "intraday"
+# 东财分钟接口的单次可得窗口有限，累积超过该交易日数后只保留最近部分，控制磁盘占用。
+INTRADAY_PANEL_MAX_DAYS = 250
+INTRADAY_MINIMUM_BARS_PER_DAY = 30
+
+# PIT 财务因子：财报归属期与公告日的对齐容忍度。
+FUNDAMENTAL_REFERENCE_TIMEOUT_SECONDS = 240
+FUNDAMENTAL_CACHE_SECONDS = 604800
+# 单季同比至少需要的历史报告期数；TTM 需要连续四个季度。
+FUNDAMENTAL_MINIMUM_QUARTERS = 5
+# Altman Z-Score 财务困境预警：低于该阈值的标的按需求降权/否决。
+# 采用 Z''（1993，非制造业与新兴市场）变体的判定阈值；该变体的 X4 以账面权益计量，
+# 与 PIT 财务面板不掺入价格的口径自洽，因此不能沿用原始 Z（1968）的 1.81 / 2.99。
+ALTMAN_Z_DISTRESS_THRESHOLD = 1.10
+ALTMAN_Z_SAFE_THRESHOLD = 2.60
+# 现金流质量：经营性现金流净额占净利润比例低于该值视为现金流恶化。
+MINIMUM_CASHFLOW_TO_PROFIT = 0.0
+
+# 新增因子并入排序特征矩阵的最低覆盖率；沿用中性化因子的同类门控口径。
+EXTRA_FACTOR_MINIMUM_COVERAGE = 0.5
+

@@ -15,8 +15,12 @@ import numpy as np
 import pandas as pd
 
 from config import settings
+from services.extra_factors import apply_health_veto, attach_extra_factors
 from services.feature_engineering import FEATURE_COLUMNS, add_forward_returns, build_features, normalize_cross_section
-from services.neutralization import attach_market_cap_exposure, neutralize_cross_section, neutralized_feature_columns
+from services.neutralization import (
+    NEUTRAL_PREFIX, attach_market_cap_exposure, neutralize_cross_section, neutralized_feature_columns,
+)
+from services.panel_store import PanelStore
 from services.rank_model import (
     SCORE_KIND_RANK, SCORE_KIND_RETURN, evaluate_ndcg, make_ranker, summarize_importances,
 )
@@ -64,9 +68,14 @@ def relative_signal(item: dict[str, Any]) -> float | None:
 
 
 def build_market_panel(
-    histories: dict[str, pd.DataFrame], benchmark: pd.DataFrame, exposures: pd.DataFrame | None = None
+    histories: dict[str, pd.DataFrame], benchmark: pd.DataFrame, exposures: pd.DataFrame | None = None,
+    extra_factors: dict[str, Any] | None = None, store: PanelStore | None = None,
 ) -> pd.DataFrame:
-    """构造可追溯的股票日截面，可选对市值与行业暴露中性化，保留标签结束日以便按日期清除重叠样本。"""
+    """构造可追溯的股票日截面，可选对市值与行业暴露中性化，保留标签结束日以便按日期清除重叠样本。
+
+    传入 ``extra_factors`` 时，筹码分布、日内高频与 PIT 财务因子按覆盖率门控自动并入排序特征矩阵；
+    不传时行为与既有版本完全一致。
+    """
     if benchmark is None or benchmark.empty:
         raise ValueError("沪深300历史不可用，不能训练超额收益模型。")
     if len(histories) < MINIMUM_STOCKS:
@@ -80,6 +89,12 @@ def build_market_panel(
         columns += [f"{prefix}_{horizon}" for horizon in HORIZONS for prefix in ("target", "forward_return", "label_end")]
         frames.append(labelled[columns])
     panel = pd.concat(frames, ignore_index=True).sort_values(["date", "code"]).reset_index(drop=True)
+    # 新增因子先装配、财务健康否决先生效，之后才做截面标准化：被否决的标的不能参与自己所在截面的
+    # 均值与标准差，否则「打分校准的股票池」与「实际可交易的股票池」会不一致。
+    extra_report: dict[str, Any] = {"status": "未提供新增因子", "families": {}}
+    if extra_factors:
+        panel, extra_report = attach_extra_factors(panel, extra_factors, store=store)
+    panel, veto_report = apply_health_veto(panel)
     panel = normalize_cross_section(panel, FEATURE_COLUMNS, MINIMUM_STOCKS, MINIMUM_COVERAGE)
     model_features = [f"xs_{column}" for column in FEATURE_COLUMNS]
     neutralization: dict[str, Any] = {"status": "未启用市值与行业中性化，模型使用截面Z分数因子"}
@@ -97,10 +112,38 @@ def build_market_panel(
                 **neutralization, "coverage": coverage,
                 "status": f"{neutralization['status']}；中性化因子覆盖率 {coverage:.0%} 偏低，模型改用截面Z分数因子",
             }
+    accepted = list(extra_report.get("accepted_columns") or [])
+    if accepted:
+        features: list[str] = []
+        coverage = 0.0
+        neutralized = bool(model_features) and model_features[0].startswith(NEUTRAL_PREFIX)
+        # 基础因子做过中性化时新增因子也必须一起做，否则模型会绕过中性化，
+        # 顺着新增因子把市值与行业暴露重新学回来。
+        if neutralized:
+            panel, extra_neutralization = neutralize_cross_section(panel, accepted)
+            candidates = neutralized_feature_columns(panel, accepted)
+            coverage = float(panel[candidates].notna().all(axis=1).mean()) if candidates else 0.0
+            if candidates and coverage >= MINIMUM_NEUTRAL_COVERAGE:
+                features = candidates
+            extra_report = {**extra_report, "neutralization": {**extra_neutralization, "coverage": coverage}}
+        if not features:
+            # 树模型对特征的单调变换不敏感，这里统一做截面Z分数只为与基础因子保持同一口径；
+            # 中性化覆盖率不足时也走这条路，原因写进报告便于核对。
+            panel = normalize_cross_section(panel, accepted, MINIMUM_STOCKS, MINIMUM_COVERAGE)
+            features = [f"xs_{column}" for column in accepted if f"xs_{column}" in panel]
+            if neutralized:
+                extra_report["neutralization"] = {
+                    **extra_report["neutralization"],
+                    "status": f"新增因子中性化覆盖率 {coverage:.0%} 偏低，改用截面Z分数",
+                }
+        model_features = [*model_features, *features]
+        extra_report = {**extra_report, "model_features": len(features)}
     # 截面覆盖只针对本次成功取得历史的股票池，不能冒充历史全市场成分。
     panel.attrs["universe_codes"] = sorted(histories)
     panel.attrs["exposures"] = exposure_report
     panel.attrs["neutralization"] = neutralization
+    panel.attrs["extra_factors"] = extra_report
+    panel.attrs["health_veto"] = veto_report
     panel.attrs["model_feature_columns"] = model_features
     return panel
 
@@ -326,9 +369,10 @@ def train_market_context(
     histories: dict[str, pd.DataFrame], benchmark: pd.DataFrame, metadata: dict[str, Any] | None = None,
     progress: Callable[[str], None] | None = None, persist: bool = True,
     exposures: pd.DataFrame | None = None, objective: str | None = None, window: int | None = None,
+    extra_factors: dict[str, Any] | None = None, store: PanelStore | None = None,
 ) -> dict[str, Any]:
     """一次扫描汇总历史后按滚动窗口训练共享模型，供个股页和扫描页读取相同结果。"""
-    panel = build_market_panel(histories, benchmark, exposures=exposures)
+    panel = build_market_panel(histories, benchmark, exposures=exposures, extra_factors=extra_factors, store=store)
     latest_date = panel["date"].max()
     live = panel.loc[panel["date"].eq(latest_date)]
     window = int(settings.TRAINING_WINDOW_DAYS if window is None else window)
@@ -338,6 +382,7 @@ def train_market_context(
                "reference_closes": dict(zip(live["code"], live["close"])),
                "objective_mode": objective or settings.DEFAULT_OBJECTIVE_MODE, "training_window_days": window,
                "exposures": panel.attrs.get("exposures"), "neutralization": panel.attrs.get("neutralization"),
+               "extra_factors": panel.attrs.get("extra_factors"),
                "limitation": "截面仅含本次成功采集历史的股票池；当前股票池回溯存在幸存者偏差，分组收益为持有期重叠的诊断指标，非可执行组合净值。"}
     for horizon in HORIZONS:
         context["models"][horizon] = []

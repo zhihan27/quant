@@ -15,6 +15,7 @@ from services.runtime import get_market_data, get_repository
 from config import settings
 from services.backtest import run_backtest
 from services.exposures import load_exposures
+from services.extra_factors import build_extra_factors
 from services.market_data import MarketDataError, completed_daily_history, history_is_current
 from services.scanning import candidate_codes as _candidate_codes
 from services.scanning import rank_candidates as _rank_candidates
@@ -110,6 +111,11 @@ with st.container(border=True):
         "剔除市值和行业的影响（中性化）",
         value=True,
         help="把「大盘股天生占优」「某个行业整体在涨」这类影响先扣掉，只留下个股自身的强弱；需要联网取行业数据，数据覆盖不足时会自动退回普通算法。",
+    )
+    use_extra_factors = st.checkbox(
+        "叠加筹码、日内与财报因子（PIT 时点对齐）",
+        value=True,
+        help="在原有量价因子之上，再叠加筹码分布集中度、日内波动率衰减与订单流代理、以及按公告日对齐的财报因子。财报因子只在公告日之后才生效，不会用到当时还没公布的数字；某一类因子覆盖不到的交易日会留空，覆盖率不足时模型自动忽略该类因子。",
     )
     portfolio_columns = st.columns([2, 1, 1, 1], vertical_alignment="bottom")
     run_portfolio = portfolio_columns[0].checkbox(
@@ -239,17 +245,35 @@ if st.button("开始扫描", type="primary"):
                     exposures = None
                     st.warning(f"市值与行业暴露不可用，本次不做中性化：{type(exc).__name__}: {exc}")
             context = {}
+            extra_factors: dict[str, Any] = {}
+            extra_store = None
+            if use_extra_factors:
+                task.step("正在装配筹码、日内与 PIT 财报因子…")
+                extra_store = service.panels
+                extra_factors, extra_meta = build_extra_factors(
+                    extra_store, [item["code"] for item in ready],
+                    histories={item["code"]: item["history"] for item in ready}, progress=task.step,
+                )
+                st.caption(
+                    f"新增因子：{extra_meta.get('status')}；"
+                    f"日内 {extra_meta.get('intraday', {}).get('codes_computed', 0)} 只、"
+                    f"财报 {extra_meta.get('financial', {}).get('codes', 0)} 只。"
+                )
             try:
                 context = train_market_context(
                     {item["code"]: item["history"] for item in ready}, benchmark,
                     metadata={**source_meta, "pool_mode": pool_mode}, progress=task.step,
                     exposures=exposures, objective=objective_mode, window=int(training_window),
+                    extra_factors=extra_factors or None, store=extra_store,
                 )
                 st.info(f"共享模型上下文 {context['context_id'][:12]} · 截面日期 {context['reference_date']} · {len(ready)}只有效股票")
                 st.caption(
                     f"训练目标 {objective_label(context['objective_mode'])}；滚动窗口 "
                     f"{context['training_window_days'] or '不限'}个交易日；中性化状态：{context['neutralization']['status']}。"
                 )
+                extra_report = context.get("extra_factors") or {}
+                if extra_report.get("families"):
+                    st.caption(f"新增因子并入结果：{extra_report.get('status')}")
                 st.caption(context["limitation"])
             except (ValueError, OSError, ImportError) as exc:
                 st.warning(f"截面模型不可用：{exc}；本次只展示传统因子观察。")

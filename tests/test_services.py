@@ -20,6 +20,11 @@ from services.scanning import candidate_codes
 from services.market_data import MarketDataError, MarketDataService
 
 
+def _empty_reference() -> pd.DataFrame:
+    """不含任何退市/ST 记录的状态名单，用来把「过滤」与「取名单」这两件事分开测。"""
+    return pd.DataFrame(columns=["code", "name", "stock_status", "status_source", "delist_date"])
+
+
 def _history(count: int = 420) -> pd.DataFrame:
     dates = pd.bdate_range("2020-01-01", periods=count)
     trend = np.arange(count, dtype=float) * 0.025
@@ -95,7 +100,9 @@ class QuantServiceTests(unittest.TestCase):
         self.assertTrue(all(trade["entry_date"] < trade["exit_date"] for trade in result["trades"]))
 
     def test_custom_stock_list_parses_unique_six_digit_codes(self) -> None:
-        candidates, meta = candidate_codes("用户自定义", "600000, 000001 600000", 10, None)
+        # 用空闲名单隔离缓存/联网，这两条断言只关心代码解析与来源说明。
+        with patch("services.scanning.load_reference", return_value=(_empty_reference(), {"status": "名单已就绪"})):
+            candidates, meta = candidate_codes("用户自定义", "600000, 000001 600000", 10, None)
         self.assertEqual([item["code"] for item in candidates], ["600000", "000001"])
         self.assertEqual(meta["status"], "用户输入")
 
@@ -116,7 +123,9 @@ class QuantServiceTests(unittest.TestCase):
             def quote_from_universe_row(self, row: dict[str, object], meta: dict[str, object]) -> dict[str, object]:
                 return {"price": row["price"], "quote_valid": True, "data_status": "test"}
 
-        candidates, _ = candidate_codes("沪深京全部 A 股", "", 8, FakeMarketData())
+        # 本测试只验证显示上限不截断候选列表，因此用空闲名单把退市/ST 过滤隔离掉。
+        with patch("services.scanning.load_reference", return_value=(_empty_reference(), {"status": "名单已就绪"})):
+            candidates, _ = candidate_codes("沪深京全部 A 股", "", 8, FakeMarketData())
         self.assertEqual(len(candidates), 105)
 
     def test_eastmoney_universe_fetches_every_page_and_rejects_partial_page(self) -> None:

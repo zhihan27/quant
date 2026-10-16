@@ -22,6 +22,9 @@ from config import settings
 
 LOGGER = logging.getLogger("quant.panel_store")
 ADJUSTMENT_LABELS = {"qfq": "qfq", "raw": "raw"}
+# 按 code=*.parquet 分区的衍生数据目录：PIT 财务面板、筹码分布因子、高频日内因子，
+# 以及用于累积历史深度的原始分钟线。
+PARTITION_DIRECTORIES = ("fundamentals", "chip", "intraday", "intraday_bars")
 
 
 def _now_text() -> str:
@@ -45,6 +48,8 @@ class PanelStore:
         self.history_dir = self.root / "history"
         self.factor_dir = self.root / "factors"
         self.exposure_dir = self.root / "exposures"
+        self.universe_dir = self.root / "universe"
+        self.partition_dirs = {name: self.root / name for name in PARTITION_DIRECTORIES}
 
     # ---------------------------------------------------------------- 历史行情
     def history_path(self, code: str, adjustment: str = "qfq") -> Path:
@@ -126,6 +131,68 @@ class PanelStore:
         temporary.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
         os.replace(temporary, path)
 
+    # ------------------------------------------------------- 按代码分区的衍生数据
+    def partition_dir_for(self, name: str) -> Path:
+        """返回已登记的衍生数据分区目录；未登记的名称直接报错，避免写到别处。"""
+        if name not in self.partition_dirs:
+            raise ValueError(f"未登记的分区名称：{name}；可用 {'、'.join(PARTITION_DIRECTORIES)}。")
+        return self.partition_dirs[name]
+
+    def partition_path(self, name: str, code: str) -> Path:
+        return self.partition_dir_for(name) / f"code={str(code).zfill(6)}.parquet"
+
+    def write_partition(self, name: str, code: str, frame: pd.DataFrame) -> Path:
+        """整体覆盖写入单只股票的分区文件；重复写入不做增量拼接，避免新旧口径混存。"""
+        stored = frame.copy()
+        stored["code"] = str(code).zfill(6)
+        stored["stored_at"] = _now_text()
+        return _atomic_write(stored, self.partition_path(name, code))
+
+    def read_partition(self, name: str, code: str) -> pd.DataFrame | None:
+        path = self.partition_path(name, code)
+        if not path.exists():
+            return None
+        try:
+            return pd.read_parquet(path)
+        except (OSError, ValueError) as exc:
+            LOGGER.warning("读取 Parquet 分区失败 name=%s code=%s detail=%s", name, code, exc)
+            return None
+
+    def partition_codes(self, name: str) -> list[str]:
+        directory = self.partition_dir_for(name)
+        if not directory.exists():
+            return []
+        return sorted(path.stem.split("=", 1)[-1] for path in directory.glob("code=*.parquet"))
+
+    def load_partition(self, name: str, columns: list[str] | None = None) -> pd.DataFrame | None:
+        """拼接某个分区的全部股票文件；目录不存在时返回 None，由调用方决定是否报错。"""
+        directory = self.partition_dir_for(name)
+        if not directory.exists() or not any(directory.glob("code=*.parquet")):
+            return None
+        frames = []
+        for path in sorted(directory.glob("code=*.parquet")):
+            try:
+                frames.append(pd.read_parquet(path, columns=columns))
+            except (OSError, ValueError) as exc:
+                LOGGER.warning("读取 Parquet 分区文件失败 path=%s detail=%s", path.name, exc)
+        if not frames:
+            return None
+        return pd.concat(frames, ignore_index=True)
+
+    def load_universe_status(self) -> pd.DataFrame | None:
+        """读取股票池状态快照（含退市与特别处理名单）。"""
+        path = self.universe_dir / "status.parquet"
+        if not path.exists():
+            return None
+        try:
+            return pd.read_parquet(path)
+        except (OSError, ValueError) as exc:
+            LOGGER.warning("读取股票池状态失败 detail=%s", exc)
+            return None
+
+    def save_universe_status(self, frame: pd.DataFrame) -> Path:
+        return _atomic_write(frame, self.universe_dir / "status.parquet")
+
     # ---------------------------------------------------------------- DuckDB
     @staticmethod
     def duckdb_available() -> bool:
@@ -148,6 +215,15 @@ class PanelStore:
         panel_glob = str(self.factor_dir / "panel_v*.parquet")
         if any(self.factor_dir.glob("panel_v*.parquet")):
             connection.execute(f"CREATE VIEW factor_panel AS SELECT * FROM read_parquet('{panel_glob}')")
+        # 财务、筹码与高频衍生因子按 code=*.parquet 分区，同样映射为只读视图，
+        # 便于与 history 做 ASOF JOIN 等高性能关联查询。
+        for name in PARTITION_DIRECTORIES:
+            directory = self.partition_dirs[name]
+            if any(directory.glob("code=*.parquet")):
+                glob = str(directory / "code=*.parquet")
+                connection.execute(
+                    f"CREATE VIEW {name} AS SELECT * FROM read_parquet('{glob}', hive_partitioning=true)"
+                )
         for name, frame in (extra_views or {}).items():
             connection.register(name, frame)
         return connection
