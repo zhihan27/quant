@@ -33,7 +33,12 @@ def _compact_portfolio(portfolio_result: dict[str, Any] | None) -> dict[str, Any
     return {key: value for key, value in portfolio_result.items() if key not in PORTFOLIO_DETAIL_KEYS}
 
 
-def _payload(result: ScanResult) -> dict[str, Any]:
+def build_payload(result: ScanResult) -> dict[str, Any]:
+    """把扫描产物整理成页面直接渲染的字典。
+
+    落盘与不落盘两条展示路径共用这一份口径：页面上的试跑结果不写文件，但必须与
+    读回的文件长得一模一样，否则同一张表会因为来源不同而少几个字段。
+    """
     limit = int(result.options.scan_limit)
     return {
         "model_version": settings.MODEL_VERSION,
@@ -57,7 +62,7 @@ def save_scan_result(result: ScanResult, path: Path | None = None) -> Path:
     target = Path(path or SCAN_RESULT_PATH)
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_name(target.name + ".tmp")
-    temporary.write_text(json.dumps(_payload(result), ensure_ascii=False, default=str), encoding="utf-8")
+    temporary.write_text(json.dumps(build_payload(result), ensure_ascii=False, default=str), encoding="utf-8")
     os.replace(temporary, target)
     LOGGER.info("扫描结果已落盘 path=%s kind=%s", target, result.options.trigger)
     return target

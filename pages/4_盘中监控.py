@@ -1,4 +1,4 @@
-"""秒级快照、分钟卡尔曼提醒和配对统计研究的控制及展示页面。"""
+"""秒级快照与分钟卡尔曼提醒的控制及展示页面。"""
 
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -15,7 +15,7 @@ from services.ui_helpers import show_page_header
 
 show_page_header(
     "盘中监控",
-    "跟踪自选与持仓的行情快照，查看分钟级卡尔曼提醒、配对信号及其有效状态。",
+    "跟踪自选与持仓的行情快照，查看分钟级卡尔曼提醒及其有效状态。",
     "交易工作台 / 盘中监控",
 )
 st.caption("3至60秒批量快照，分钟级买卖提醒；行情快照并非逐笔数据，当前未连接自动下单。")
@@ -37,16 +37,13 @@ with st.form("monitor_configuration"):
     minute = columns[1].number_input("分钟线同步（秒）", min_value=30, max_value=300, value=int(configuration["minute_seconds"]), step=30)
     entry = columns[2].number_input("入场偏离 Z", min_value=1.5, max_value=5.0, value=float(configuration["entry_z"]), step=0.1)
     exit_z = columns[3].number_input("回归偏离 Z", min_value=0.0, max_value=4.9, value=float(configuration["exit_z"]), step=0.1)
-    pair_columns = st.columns(2)
-    pair_a = pair_columns[0].text_input("配对A代码（可留空）", value=configuration["pair_a"], max_chars=6)
-    pair_b = pair_columns[1].text_input("配对B代码（可留空）", value=configuration["pair_b"], max_chars=6)
-    borrow = st.checkbox("我已确认配对所需借券条件", value=configuration["borrow_confirmed"])
-    st.caption("监控包含开启监控的自选、全部持仓和上面的配对代码。最多50只，实际轮询速度受网络和行情源限制。非交易时段快照每60秒采集，分钟线每5分钟同步。")
+    st.caption("监控范围只有开启监控的自选和全部持仓，其余代码一律不监控。最多50只，实际轮询速度受网络和行情源限制。非交易时段快照每60秒采集，分钟线每5分钟同步。")
     if st.form_submit_button("保存监控设置", type="primary"):
         try:
             configuration = validate_monitor_config({
                 "poll_seconds": poll, "minute_seconds": minute, "entry_z": entry, "exit_z": exit_z,
-                "pair_a": pair_a, "pair_b": pair_b, "borrow_confirmed": borrow,
+                # 配对代码是上一版留下的字段，这里显式清空，好让存量配置也停止配对监控。
+                "pair_a": "", "pair_b": "",
             })
             repository.save_monitor_config(enabled, configuration)
             st.success("监控设置已保存，后台将在本轮结束后应用。")
@@ -74,8 +71,6 @@ def show_live_status() -> None:
         if not market_is_open(now):
             st.info("当前不在连续竞价时段，有效买卖提醒已关闭。")
         codes = repository.monitored_codes()
-        cfg = {**DEFAULT_MONITOR_CONFIG, **status["config"]}
-        codes = list(dict.fromkeys(codes + [code for code in (cfg["pair_a"], cfg["pair_b"]) if code]))
         quotes = repository.latest_quotes(codes)
         st.subheader("监控行情")
         if codes:
@@ -89,7 +84,7 @@ def show_live_status() -> None:
                 })
             st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
         else:
-            st.info("请先加入自选或持仓，或填写配对代码。")
+            st.info("请先加入自选或持仓。")
         st.subheader("分钟信号与失效原因")
         signals = repository.signals()
         if signals:

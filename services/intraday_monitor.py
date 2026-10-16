@@ -13,7 +13,7 @@ import pandas as pd
 
 from services.database import DatabaseError, QuantRepository
 from services.intraday_data import IntradayDataService, market_is_open
-from services.intraday_strategy import analyze_intraday_pair, analyze_intraday_stock, validate_monitor_config
+from services.intraday_strategy import analyze_intraday_stock, validate_monitor_config
 from services.market_data import MarketDataError
 from services.portfolio import summarize_positions
 
@@ -77,9 +77,9 @@ class IntradayMonitor:
             self.repository.prune_monitor_history()
             self._last_pruned = started
         configuration = validate_monitor_config(stored["config"])
+        # 只监控开启监控的自选与全部持仓：配对等研究用代码不再顺带订阅，
+        # 免得有限的单次请求额度被不在自选、也不在持仓里的代码占掉。
         codes = self.repository.monitored_codes()
-        pair = [configuration["pair_a"], configuration["pair_b"]] if configuration["pair_a"] else []
-        codes = list(dict.fromkeys(codes + pair))
         if len(codes) > 50:
             self.repository.monitor_heartbeat(0, "当前公开源单次最多监控50只，请缩小自选监控范围；未静默截断。")
             return 10
@@ -113,12 +113,6 @@ class IntradayMonitor:
                 self.repository.save_signal(signal)
             except (ValueError, KeyError, DatabaseError) as exc:
                 errors.append(f"{code}：分钟信号计算失败（{type(exc).__name__}）")
-        if pair:
-            try:
-                signal = analyze_intraday_pair(pair[0], pair[1], frames[pair[0]], frames[pair[1]], quote_map, configuration, now)
-                self.repository.save_signal(signal)
-            except (ValueError, KeyError, DatabaseError) as exc:
-                errors.append(f"配对：计算失败（{type(exc).__name__}）")
         elapsed = time.monotonic() - started
         self.repository.monitor_heartbeat(elapsed, "；".join(errors) if errors else None)
         requested = configuration["poll_seconds"] if market_is_open(now) else 60

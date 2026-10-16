@@ -43,11 +43,12 @@ with watch_tab:
     if watch_tab.open:
         with st.form("add_watch"):
             st.subheader("添加关注股票")
-            columns = st.columns(3, vertical_alignment="center")
+            columns = st.columns(2, vertical_alignment="center")
             code = columns[0].text_input("股票代码", max_chars=6)
-            name = columns[1].text_input("股票名称（可选）", max_chars=80)
-            enabled = columns[2].checkbox("加入监控", value=True)
-            note = st.text_input("备注", max_chars=2000)
+            enabled = columns[1].checkbox("加入监控", value=True)
+            with st.expander("更多（可选）"):
+                name = st.text_input("股票名称（可选）", max_chars=80)
+                note = st.text_input("备注", max_chars=2000)
             if st.form_submit_button("加入自选", type="primary"):
                 try:
                     repository.save_watch(code, name, note, enabled)
@@ -58,13 +59,14 @@ with watch_tab:
             watchlist = repository.watchlist()
         if watchlist:
             frame = pd.DataFrame(watchlist)[["code", "name", "monitor_enabled", "note"]]
-            frame["remove"] = False
+            # 删除列放第一列：编辑表从左往右读，勾选框留在最后容易被当成又一处备注。
+            frame.insert(0, "remove", False)
             with st.form("edit_watch"):
                 edited = st.data_editor(
                     frame, hide_index=True, use_container_width=True, disabled=["code"], key=f"watch_editor_{revision}",
                     column_config={
+                        "remove": st.column_config.CheckboxColumn("删除"),
                         "code": "代码", "name": "名称", "monitor_enabled": "开启监控", "note": "备注",
-                        "remove": st.column_config.CheckboxColumn("移出自选"),
                     },
                 )
                 if st.form_submit_button("保存自选修改"):
@@ -81,29 +83,38 @@ with watch_tab:
 with position_tab:
     if position_tab.open:
         today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
-        with st.expander("录入一笔持仓", expanded=True):
-            with st.form("add_position"):
-                first = st.columns(3)
-                position_code = first[0].text_input("持仓代码", max_chars=6)
-                position_name = first[1].text_input("持仓名称（可选）", max_chars=80)
-                bought = first[2].date_input("买入日期", value=today, max_value=today)
-                second = st.columns(4)
-                price = second[0].number_input("买入价（元/股）", min_value=0.001, value=10.0, step=0.01, format="%.3f")
-                shares = second[1].number_input("持仓股数", min_value=1, value=100, step=1)
-                available = second[2].number_input("确认可卖股数", min_value=0, value=100, step=1)
-                fees = second[3].number_input("本笔买入费用（元）", min_value=0.0, value=0.0, step=1.0)
+        # 这里不用 expander 包住表单：表单里已经有一个「更多（可选）」折叠区，而 Streamlit 不允许 expander 嵌套。
+        with st.form("add_position"):
+            st.subheader("录入一笔持仓")
+            first = st.columns(2, vertical_alignment="bottom")
+            position_code = first[0].text_input("持仓代码", max_chars=6)
+            bought = first[1].date_input("买入日期", value=today, max_value=today)
+            second = st.columns(2, vertical_alignment="bottom")
+            price = second[0].number_input("买入价（元/股）", min_value=0.001, value=10.0, step=0.01, format="%.3f")
+            shares = second[1].number_input(
+                "持仓股数", min_value=100, value=100, step=100,
+                help="按整手录入，加减以 100 股为单位。",
+            )
+            with st.expander("更多（可选）"):
+                position_name = st.text_input("持仓名称（可选）", max_chars=80)
+                optional = st.columns(2)
+                available = optional[0].number_input(
+                    "确认可卖股数", min_value=0, value=100, step=100,
+                    help="填写券商显示的实际可卖数量，加减以 100 股为单位；今日买入的批次不论填多少都按零可卖处理。",
+                )
+                fees = optional[1].number_input("本笔买入费用（元）", min_value=0.0, value=0.0, step=1.0)
                 position_note = st.text_input("持仓备注", max_chars=2000)
-                st.caption("支持同代码多批买入。成本包含本笔费用；今日买入批次即使填写可卖数量，T+1下也按零可卖处理。")
-                if st.form_submit_button("保存持仓", type="primary"):
-                    try:
-                        repository.add_position({
-                            "code": position_code, "name": position_name, "buy_date": bought,
-                            "buy_price": price, "shares": shares, "available_shares": available,
-                            "fees": fees, "note": position_note,
-                        })
-                        _saved("持仓已保存。")
-                    except (ValueError, DatabaseError) as exc:
-                        st.error(str(exc))
+            st.caption("支持同代码多批买入。成本包含本笔费用；今日买入批次即使填写可卖数量，T+1下也按零可卖处理。")
+            if st.form_submit_button("保存持仓", type="primary"):
+                try:
+                    repository.add_position({
+                        "code": position_code, "name": position_name, "buy_date": bought,
+                        "buy_price": price, "shares": shares, "available_shares": available,
+                        "fees": fees, "note": position_note,
+                    })
+                    _saved("持仓已保存。")
+                except (ValueError, DatabaseError) as exc:
+                    st.error(str(exc))
         with st.spinner("加载中 · 正在读取持仓批次…", show_time=True):
             positions = repository.positions()
         if positions:
@@ -111,18 +122,21 @@ with position_tab:
             frame = pd.DataFrame(positions)[["id", "version", "code", "name", "buy_date", "buy_price", "shares", "available_shares", "fees", "note"]]
             for column in ("buy_price", "fees"):
                 frame[column] = frame[column].astype(float)
-            frame["remove"] = False
+            # 与自选一致：删除列放第一列，勾上即删除这一批持仓。
+            frame.insert(0, "remove", False)
             with st.form("edit_positions"):
                 edited = st.data_editor(
                     frame, hide_index=True, use_container_width=True, disabled=["id", "version"], key=f"position_editor_{revision}",
                     column_config={
+                        "remove": st.column_config.CheckboxColumn("删除"),
                         "id": None, "version": None, "code": "股票代码", "name": "名称",
                         "buy_date": st.column_config.DateColumn("买入日期", max_value=today),
                         "buy_price": st.column_config.NumberColumn("买入价", min_value=0.000001, format="%.6f"),
-                        "shares": st.column_config.NumberColumn("持仓股数", min_value=1, step=1),
-                        "available_shares": st.column_config.NumberColumn("确认可卖股数", min_value=0, step=1),
+                        # min_value 保持 1：历史上因送股、配股产生的零股仍要能改能存，步长只管加减按钮。
+                        "shares": st.column_config.NumberColumn("持仓股数", min_value=1, step=100),
+                        "available_shares": st.column_config.NumberColumn("确认可卖股数", min_value=0, step=100),
                         "fees": st.column_config.NumberColumn("买入费用", min_value=0.0, format="%.4f"),
-                        "note": "备注", "remove": st.column_config.CheckboxColumn("删除此批次"),
+                        "note": "备注",
                     },
                 )
                 if st.form_submit_button("保存持仓修改"):

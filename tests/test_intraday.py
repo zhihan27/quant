@@ -3,6 +3,7 @@
 import unittest
 from datetime import datetime, timedelta
 from decimal import Decimal
+from unittest.mock import Mock
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -10,6 +11,7 @@ import pandas as pd
 
 from services.database import validate_position
 from services.intraday_data import normalize_minutes, quote_is_fresh
+from services.intraday_monitor import IntradayMonitor
 from services.intraday_strategy import analyze_intraday_pair, analyze_intraday_stock, validate_monitor_config
 from services.market_data import MarketDataError
 from services.portfolio import summarize_positions
@@ -76,6 +78,43 @@ class PortfolioTests(unittest.TestCase):
         for change in ({"shares": 1.5}, {"available_shares": 101}, {"buy_price": float("nan")}, {"shares": 0}, {"code": "6;DROP"}):
             with self.assertRaises(ValueError):
                 validate_position({**values, **change})
+
+
+class MonitorScopeTests(unittest.TestCase):
+    """盘中监控只订阅开启监控的自选与全部持仓，其余代码一律不订阅。
+
+    单次请求额度有限（超过 50 只就直接报错不采集），历史配置里遗留的配对代码
+    若仍被顺带订阅，会挤掉真正在盯的持仓。
+    """
+
+    def _monitor(self, stored_config: dict, codes: list[str]) -> tuple[IntradayMonitor, Mock]:
+        repository = Mock()
+        repository.monitor_config.return_value = {"enabled": True, "config": stored_config}
+        repository.monitored_codes.return_value = codes
+        repository.positions.return_value = []
+        repository.minute_history.return_value = []
+        data = Mock()
+        data.get_quotes.return_value = ([], [])
+        data.get_minutes.return_value = (pd.DataFrame(), "测试源")
+        return IntradayMonitor(repository), data
+
+    def test_cycle_only_subscribes_watchlist_and_positions(self):
+        stored = {"poll_seconds": 5, "minute_seconds": 60, "entry_z": 2.5, "exit_z": 0.5,
+                  "pair_a": "600519", "pair_b": "000858", "borrow_confirmed": True}
+        monitor, data = self._monitor(stored, ["600000"])
+        monitor.run_cycle(data)
+        data.get_quotes.assert_called_once_with(["600000"])
+        self.assertEqual([call.args[0] for call in data.get_minutes.call_args_list], ["600000"])
+
+    def test_legacy_pair_config_alone_does_not_start_collection(self):
+        """只剩配对代码、自选和持仓都为空时，应当提示去添加，而不是拿配对代码去采集。"""
+        stored = {"poll_seconds": 5, "minute_seconds": 60, "entry_z": 2.5, "exit_z": 0.5,
+                  "pair_a": "600519", "pair_b": "000858", "borrow_confirmed": True}
+        monitor, data = self._monitor(stored, [])
+        monitor.run_cycle(data)
+        data.get_quotes.assert_not_called()
+        monitor.repository.monitor_heartbeat.assert_called_once()
+        self.assertIn("自选", monitor.repository.monitor_heartbeat.call_args.args[1])
 
 
 class IntradaySignalTests(unittest.TestCase):

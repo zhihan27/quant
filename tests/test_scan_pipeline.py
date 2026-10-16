@@ -8,7 +8,7 @@ from unittest.mock import patch
 import pandas as pd
 
 from config import settings
-from services.scan_pipeline import POOL_MODES, ScanOptions, run_scan_pipeline
+from services.scan_pipeline import FULL_MARKET_POOL_MODE, POOL_MODES, ScanOptions, run_scan_pipeline
 
 
 def _history(end: str = "2026-10-15", bars: int = 400) -> pd.DataFrame:
@@ -75,6 +75,11 @@ class ScanOptionsTests(unittest.TestCase):
         self.assertEqual(options.trigger, "scheduled")
         self.assertFalse(options.include_backtest)
         self.assertFalse(options.run_portfolio)
+
+    def test_full_market_mode_is_the_scope_shared_by_page_and_schedule(self):
+        """只有全市场口径会落盘给所有账号看，因此页面与定时任务必须引用同一个常量。"""
+        self.assertIn(FULL_MARKET_POOL_MODE, POOL_MODES)
+        self.assertEqual(settings.DAILY_SCAN["pool_mode"], FULL_MARKET_POOL_MODE)
 
 
 class PipelineOrderTests(unittest.TestCase):

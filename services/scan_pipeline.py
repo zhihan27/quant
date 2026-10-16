@@ -36,7 +36,9 @@ SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 # 股票池范围标签的唯一出处。services/scanning.py 用 .get(mode, "all") 兜底，
 # 写错一个标签会静默退化成全市场扫描，而不是报错，因此这里必须做一次校验。
-POOL_MODES = ("沪深京全部 A 股", "沪深主板", "创业板", "科创板", "北交所", "用户自定义")
+# 全市场是要落盘、给所有账号共用的那一个口径，单独起个名字，免得页面靠下标取它。
+FULL_MARKET_POOL_MODE = "沪深京全部 A 股"
+POOL_MODES = (FULL_MARKET_POOL_MODE, "沪深主板", "创业板", "科创板", "北交所", "用户自定义")
 
 ProgressCallback = Callable[[str, int | None, int | None], None]
 

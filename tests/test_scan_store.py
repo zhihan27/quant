@@ -7,7 +7,7 @@ from pathlib import Path
 
 from config import settings
 from services.scan_pipeline import ScanOptions, ScanResult
-from services.scan_store import load_scan_result, save_scan_result
+from services.scan_store import build_payload, load_scan_result, save_scan_result
 
 
 def _result(scan_limit: int = 2, trigger: str = "manual") -> ScanResult:
@@ -72,6 +72,21 @@ class ScanStoreTests(unittest.TestCase):
     def test_write_is_atomic_and_leaves_no_temporary_file(self):
         save_scan_result(_result(), self.path)
         self.assertFalse(self.path.with_name(self.path.name + ".tmp").exists())
+
+    def test_preview_payload_matches_the_saved_file_field_by_field(self):
+        """自定义代码试跑不落盘，但渲染口径必须与读回落盘文件完全一致。
+
+        页面上的试跑结果直接用 build_payload 渲染；两条路径一旦分叉，同一张表就会
+        因为来源不同而少几个字段，而且只在试跑时才看得出来。
+        """
+        result = _result()
+        save_scan_result(result, self.path)
+        payload = load_scan_result(self.path)
+        preview = build_payload(result)
+        self.assertEqual(set(preview), set(payload))
+        self.assertEqual(preview["pool_mode"], payload["pool_mode"])
+        self.assertEqual(preview["rows"], payload["rows"])
+        self.assertEqual(preview["scan_stats"], payload["scan_stats"])
 
     def test_missing_file_returns_none(self):
         self.assertIsNone(load_scan_result(self.path))
