@@ -256,7 +256,10 @@ def build_holdout_evaluation(
         line.update(
             usable=True,
             status=frozen.get("status"),
-            metrics=metrics,
+            # 逐日明细必须留在这里：报告会用 allow_nan=False 落盘，逐日行里任何一个非有限值
+            # 都会让整份报告写不出去，而它除了本函数内的换手率（走 evaluations 的 DataFrame，
+            # 不读这里）没有别的读者。落在 horizons 里还会让每次评估的 JSON 白白大一截。
+            metrics={key: value for key, value in metrics.items() if key != "daily_groups"},
             train_baseline=baseline,
             training={
                 "available_dates": available_dates,
@@ -566,8 +569,14 @@ def registry_versions(repository: QuantRepository, limit: int = 50) -> list[dict
     for row in rows:
         path = Path(row["archive_path"]) if row["archive_path"] else None
         # 登记的路径可能已经不存在（手工清理、磁盘迁移）。回滚按钮必须据此禁用，
-        # 而不是等点了以后再报错。
-        available = bool(path and (path / f"market_context_v{row['model_version']}.joblib").exists())
+        # 而不是等点了以后再报错。校验的三个文件与 rollback_to 一致，否则会出现
+        # 「按钮点得动、点了报错」。
+        available = bool(path and all(
+            (path / name).exists()
+            for name in (f"market_context_v{row['model_version']}.joblib",
+                         f"market_context_v{row['model_version']}.json",
+                         f"ml_panel_v{row['model_version']}.parquet")
+        ))
         result.append({**row, "rollbackable": bool(row["passed"] and not row["is_active"] and available)})
     return result
 
@@ -594,8 +603,9 @@ def rollback_to(repository: QuantRepository, context_id: str, operator: str) -> 
         raise FinalHoldoutError("该版本的归档目录已不存在，无法回滚。")
     archived_model = directory / f"market_context_v{version}.joblib"
     archived_panel = directory / f"ml_panel_v{version}.parquet"
-    if not archived_model.exists() or not archived_panel.exists():
-        raise FinalHoldoutError("该版本的归档文件不完整（模型或面板缺失），无法回滚。")
+    archived_summary = directory / f"market_context_v{version}.json"
+    if not archived_model.exists() or not archived_panel.exists() or not archived_summary.exists():
+        raise FinalHoldoutError("该版本的归档文件不完整（模型、面板或摘要缺失），无法回滚。")
 
     context, panel = load_context(include_panel=True)
     if context and panel is not None:
@@ -608,8 +618,13 @@ def rollback_to(repository: QuantRepository, context_id: str, operator: str) -> 
 
     active_model = settings.MODEL_DIR / f"market_context_v{version}.joblib"
     active_panel = settings.DATA_DIR / f"ml_panel_v{version}.parquet"
+    # 摘要 JSON 也要一起换回来：它是归档的组成部分，只换模型和面板会留下一份描述着
+    # 「被换掉的那个版本」的摘要，下一次归档再把它当成本版本的产物存进去。
+    active_summary = settings.MODEL_DIR / f"market_context_v{version}.json"
     # 复制到临时文件再 os.replace：页面随时可能在读，不能让它读到半个文件。
-    for source, destination in ((archived_model, active_model), (archived_panel, active_panel)):
+    for source, destination in (
+        (archived_model, active_model), (archived_panel, active_panel), (archived_summary, active_summary)
+    ):
         temporary = destination.with_suffix(".rollback.tmp")
         shutil.copy2(source, temporary)
         os.replace(temporary, destination)
@@ -769,7 +784,7 @@ class ScanGovernance:
         summary: dict[str, Any] = {
             "trigger": self.trigger, "errors": self.errors,
             "validation_rows": 0, "feature_rows": 0, "concept_rows": 0, "prediction_rows": 0,
-            "pass_rate": None, "alerts": 0, "alert_result": None, "degraded": False,
+            "pass_rate": None, "alerts": 0, "alert_result": None, "degraded": False, "archive": None,
         }
         if not context:
             self.errors.append("本次扫描未生成模型上下文，通过率与漂移均未写入")
@@ -777,12 +792,27 @@ class ScanGovernance:
             return summary
 
         # 通过率与漂移各自独立 try：一边失败不该让另一边的数据也丢掉。
+        records: list[dict[str, Any]] = []
         try:
             records = model_monitor.validation_records(context, trigger=self.trigger)
             summary["validation_rows"] = model_monitor.log_validation(self.repository, records)
             summary["pass_rate"] = model_monitor.get_pass_rate(self.repository)
         except DatabaseError as exc:
             self.errors.append(f"通过率记录写入失败：{exc}")
+
+        # 归档登记：模型健康页的「回滚候选」只可能来自这里，不登记就永远是空列表。
+        # 放在告警之前：下面告警写入失败会提前 return，回滚候选不该被告警通道连坐——
+        # 而且归档说的是「活动文件现在是哪一份」，与告警判定本来就无关。
+        # 归档文件缺一不可（archive_context 会校验 joblib/json/parquet 三个都存在），
+        # 所以它只会登记本轮真正落盘的产物。
+        try:
+            base_rate = (sum(1 for record in records if record["pass"]) / len(records)) if records else None
+            summary["archive"] = archive_context(
+                self.repository, context, panel,
+                passed=any(record["pass"] for record in records), base_rate=base_rate,
+            )
+        except (FinalHoldoutError, OSError, DatabaseError) as exc:
+            self.errors.append(f"模型归档失败，本版本不会出现在回滚候选里：{type(exc).__name__}: {exc}")
 
         feature_rows: list[dict[str, Any]] = []
         concept_rows: list[dict[str, Any]] = []
@@ -853,6 +883,12 @@ class ScanGovernance:
             if rate.get("recent_failure"):
                 text += f"；最近一次失败卡在「{rate['recent_failure']['reason']}」"
             lines.append(("caption", text))
+        if summary.get("archive"):
+            archive = summary["archive"]
+            lines.append(("caption", (
+                f"模型归档：context {str(archive.get('context_id'))[:12]}"
+                + ("，已登记为回滚候选" if archive.get("passed") else "，本轮没有通过验证的模型，不进入回滚候选")
+            )))
         if summary.get("feature_rows"):
             lines.append(("caption", (
                 f"漂移监控：特征 {summary['feature_rows']} 项、"

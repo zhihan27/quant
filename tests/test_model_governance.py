@@ -580,6 +580,15 @@ class ModelGovernanceDatabaseTests(unittest.TestCase):
                                   for index, code in enumerate(codes)}},
         }
 
+    def _scan(self, panel: pd.DataFrame, context: dict | None = None, **kwargs) -> dict:
+        """按真实顺序跑一轮扫描治理：先落盘活动产出，再写通过率、漂移、归档与告警。
+
+        ``after_scan`` 归档的是 ``save_context`` 刚写下的那三个文件，所以这里必须先发布一份，
+        否则归档会（正确地）报「活动文件缺失」，回滚候选也就永远是空的。
+        """
+        self._publish("ctx-scan")
+        return ScanGovernance(self.repository, **kwargs).after_scan(context or self._scan_context(panel), panel)
+
     def _drift_row(self, table: str, **filters) -> dict | None:
         clause = "".join(f" AND {name}=%s" for name in filters)
         with self.repository.connect() as connection:
@@ -589,7 +598,7 @@ class ModelGovernanceDatabaseTests(unittest.TestCase):
 
     def test_scan_writes_all_three_drift_tables_and_the_validation_log(self):
         panel = self._panel()
-        summary = ScanGovernance(self.repository, trigger="scheduled").after_scan(self._scan_context(panel), panel)
+        summary = self._scan(panel, trigger="scheduled")
         self.assertEqual(summary["errors"], [])
         self.assertEqual(summary["validation_rows"], 2, "通过的和没通过的都要写，分母不能被悄悄缩小")
         self.assertEqual(summary["feature_rows"], len(settings.DRIFT_MONITORED_FEATURES))
@@ -610,7 +619,7 @@ class ModelGovernanceDatabaseTests(unittest.TestCase):
         self.assertEqual(prediction["stocks"], settings.DRIFT_PREDICTION_TOP_N)
 
         # 重复扫描只更新当天的行，不追加重复行。
-        ScanGovernance(self.repository, trigger="scheduled").after_scan(self._scan_context(panel), panel)
+        self._scan(panel, trigger="scheduled")
         with self.repository.connect() as connection:
             counts = connection.execute(
                 "SELECT (SELECT count(*) FROM public.quant_concept_drift) AS concept,"
@@ -625,9 +634,7 @@ class ModelGovernanceDatabaseTests(unittest.TestCase):
         """摘要 JSON 往返后周期键是 str。若只认 int，预测漂移会被写成「本轮没有通过验证的模型」——
         那是把「取不到预测」说成「模型都没通过」，因此这里连同落库结果一起校验。"""
         panel = self._panel()
-        summary = ScanGovernance(self.repository, trigger="manual").after_scan(
-            self._scan_context(panel, as_json_keys=True), panel
-        )
+        summary = self._scan(panel, context=self._scan_context(panel, as_json_keys=True), trigger="manual")
         self.assertEqual(summary["concept_rows"], 1)
         self.assertEqual(summary["prediction_rows"], 1)
         report_date = str(panel["date"].max().date())
@@ -647,10 +654,36 @@ class ModelGovernanceDatabaseTests(unittest.TestCase):
         self.assertIn("PE/PB", valuation["note"])
         self.assertEqual(drift_monitor.evaluate_drift_alerts([valuation], [], []), [])
 
+    def test_scan_registers_a_rollback_candidate(self):
+        """扫描必须真的登记版本。归档只被回滚调用过的话（老实现就是如此），
+        「模型版本与回滚」页永远是空列表，出了一次坏模型就只能干看着。"""
+        self._archive("ctx-good")
+        summary = self._scan(self._panel())
+        self.assertEqual(summary["archive"]["context_id"], "ctx-scan")
+        self.assertTrue(summary["archive"]["passed"])
+        registry = self._registry()
+        self.assertEqual(set(registry), {"ctx-good", "ctx-scan"})
+        self.assertTrue(registry["ctx-scan"]["is_active"], "本轮产物就是当前活动版本")
+        self.assertFalse(registry["ctx-good"]["is_active"], "上一版退位，但仍然可回滚")
+        versions = {row["context_id"]: row for row in registry_versions(self.repository)}
+        self.assertTrue(versions["ctx-good"]["rollbackable"])
+
+    def test_scan_archives_even_when_no_model_passes(self):
+        """没有模型通过验证时也要登记：不通过回滚候选，但「这版变差了」本身是信息。"""
+        context = self._scan_context(self._panel())
+        context["models"][20] = [dict(model, validated=False, oos_metrics=None) for model in context["models"][20]]
+        summary = self._scan(self._panel(), context=context)
+        self.assertFalse(summary["archive"]["passed"])
+        self.assertEqual(summary["pass_rate"]["pass_rate"], 0.0)
+        registry = self._registry()
+        self.assertFalse(registry["ctx-scan"]["passed"])
+        self.assertFalse({row["context_id"]: row for row in registry_versions(self.repository)}
+                         ["ctx-scan"]["rollbackable"])
+
     def test_severe_drift_degrades_automatically_but_never_rolls_back(self):
         self._archive("ctx-good")
         panel = self._panel(volatility_shift=True)
-        summary = ScanGovernance(self.repository, trigger="scheduled").after_scan(self._scan_context(panel), panel)
+        summary = self._scan(panel, trigger="scheduled")
         self.assertEqual(summary["alerts"], 1, "只有波动率这一维真的漂移了")
         self.assertTrue(summary["degraded"], "严重漂移必须自动降级，否则系统照常出分")
         self.assertIn("特征漂移严重：波动率", summary["degradation_reason"])
@@ -662,16 +695,16 @@ class ModelGovernanceDatabaseTests(unittest.TestCase):
         acknowledge_alert(self.repository, alerts[0]["id"], "admin")
         self.assertEqual(recent_alerts(self.repository, only_open=True), [])
         # 自动动作只到「标降级 + 停分 + 写告警」：生产模型一个字节都不该被换掉。
-        self.assertEqual(self._active_context_id(), "ctx-good")
+        self.assertEqual(self._active_context_id(), "ctx-scan", "降级不换模型，活动版本仍是本轮产出")
         self.assertTrue((self.model_dir / settings.MODEL_ARCHIVE_DIRNAME / "ctx-good").exists())
 
     def test_persistent_drift_degrades_again_after_a_manual_clear(self):
         """管理员解除降级是「我确认过了」，不是「模型没事了」：漂移还在，下一轮就再降回来。"""
         panel = self._panel(volatility_shift=True)
-        ScanGovernance(self.repository).after_scan(self._scan_context(panel), panel)
+        self._scan(panel)
         clear_degradation(self.repository, operator="admin", note="先解一次看看到底是不是误报")
         self.assertFalse(model_status(self.repository)["degraded"])
-        summary = ScanGovernance(self.repository).after_scan(self._scan_context(panel), panel)
+        summary = self._scan(panel)
         self.assertTrue(summary["degraded"])
         self.assertEqual(summary["alert_result"]["suppressed"], 1, "告警被去重抑制，但降级判定照常执行")
 
@@ -680,7 +713,7 @@ class ModelGovernanceDatabaseTests(unittest.TestCase):
         只要有任意一条检验记录，连续失败告警就会 KeyError——
         而它被扫描管线兜住，表现为页面上一句「模型治理未完成」，通过率告警悄悄失效。"""
         panel = self._panel()
-        ScanGovernance(self.repository).after_scan(self._scan_context(panel), panel)
+        self._scan(panel)
         streaks = model_monitor.fetch_failure_streaks(self.repository, limit=settings.CONSECUTIVE_FAILURE_ALERT)
         self.assertTrue(streaks)
         for row in streaks:
