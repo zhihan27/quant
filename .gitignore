@@ -8,6 +8,7 @@ models/
 logs/
 
 # 私有配置：仓库内只保留占位模板 config/database.example.json
+config/database.local.json
 *.env
 !*.env.example
 

@@ -135,12 +135,12 @@ class AuthService:
                 (username, PASSWORD_HASHER.hash(PENDING_PASSWORD)),
             )
 
-    def activate_user(self, username: str, new_password: str) -> None:
+    def activate_user(self, username: str, new_password: str, address: str = "") -> None:
         """使用者本人首次设置密码并激活账号，不需要旧密码，也不经过管理员。"""
         username = normalize_username(username)
         validate_password(new_password)
         # 激活入口对未登录者开放，沿用登录限流，避免被用来试探账号名或批量抢占用户名。
-        self._reserve_login(username, "activate")
+        self._reserve_login(username, address)
         if not HASH_SLOTS.acquire(blocking=False):
             raise AuthenticationError("认证服务繁忙，请稍后重试。")
         try:
@@ -233,8 +233,12 @@ class AuthService:
 
     def _reserve_login(self, username: str, address: str) -> None:
         # 先计数再计算密码摘要，数据库原子更新避免并发绕过和重启清零。
-        limits = [("global", 120, 60), ("ip:" + token_digest(address), 30, 900),
-                  ("user:" + token_digest(username), 5, 900)]
+        limits = [("global", 120, 60)]
+        # 只在能确认真实来源时才启用来源桶：退化成一个所有客户端共用的常量桶，
+        # 会让单个攻击者用30次失败尝试把全体用户挡在门外15分钟。
+        if address:
+            limits.append(("ip:" + token_digest(address), 30, 900))
+        limits.append(("user:" + token_digest(username), 5, 900))
         blocked = False
         with self.repository.connect() as connection:
             connection.execute("DELETE FROM public.quant_login_limits WHERE window_started < now()-interval '1 day'")
@@ -324,7 +328,7 @@ class AuthService:
         with self.repository.connect() as connection:
             connection.execute("DELETE FROM public.quant_auth_sessions WHERE token_hash=%s", (token_digest(token),))
 
-    def change_password(self, token: str, old_password: str, new_password: str) -> None:
+    def change_password(self, token: str, old_password: str, new_password: str, address: str = "") -> None:
         """用当前密码确认修改，完成后撤销该账号全部会话。"""
         validate_password(new_password)
         if new_password == old_password:
@@ -335,7 +339,7 @@ class AuthService:
             account = self.session(token)
             if not account:
                 raise AuthenticationError("登录已失效，请重新登录。")
-            self._reserve_login(account["username"], "password-change")
+            self._reserve_login(account["username"], address)
             with self.repository.connect() as connection:
                 row = connection.execute("SELECT password_hash FROM public.quant_users WHERE id=%s FOR UPDATE", (account["id"],)).fetchone()
                 active = connection.execute(

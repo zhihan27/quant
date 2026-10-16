@@ -31,6 +31,11 @@ def _now_text() -> str:
     return datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(timespec="seconds")
 
 
+def _duckdb_literal(value: str) -> str:
+    """转义 DuckDB 字符串字面量；CREATE VIEW 不能被预编译，只能安全拼接。"""
+    return "'" + value.replace("'", "''") + "'"
+
+
 def _atomic_write(frame: pd.DataFrame, path: Path) -> Path:
     """先写临时文件再替换，避免中断留下半个面板。"""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -210,11 +215,13 @@ class PanelStore:
         history_glob = str(self.history_dir / "adjustment=*" / "code=*.parquet")
         if any(self.history_dir.glob("adjustment=*/code=*.parquet")):
             connection.execute(
-                f"CREATE VIEW history AS SELECT * FROM read_parquet('{history_glob}', hive_partitioning=true)"
+                f"CREATE VIEW history AS SELECT * FROM read_parquet({_duckdb_literal(history_glob)}, hive_partitioning=true)"
             )
         panel_glob = str(self.factor_dir / "panel_v*.parquet")
         if any(self.factor_dir.glob("panel_v*.parquet")):
-            connection.execute(f"CREATE VIEW factor_panel AS SELECT * FROM read_parquet('{panel_glob}')")
+            connection.execute(
+                f"CREATE VIEW factor_panel AS SELECT * FROM read_parquet({_duckdb_literal(panel_glob)})"
+            )
         # 财务、筹码与高频衍生因子按 code=*.parquet 分区，同样映射为只读视图，
         # 便于与 history 做 ASOF JOIN 等高性能关联查询。
         for name in PARTITION_DIRECTORIES:
@@ -222,7 +229,7 @@ class PanelStore:
             if any(directory.glob("code=*.parquet")):
                 glob = str(directory / "code=*.parquet")
                 connection.execute(
-                    f"CREATE VIEW {name} AS SELECT * FROM read_parquet('{glob}', hive_partitioning=true)"
+                    f'CREATE VIEW "{name}" AS SELECT * FROM read_parquet({_duckdb_literal(glob)}, hive_partitioning=true)'
                 )
         for name, frame in (extra_views or {}).items():
             connection.register(name, frame)

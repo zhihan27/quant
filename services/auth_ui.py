@@ -22,15 +22,20 @@ def get_auth_service():
 
 
 def client_address() -> str:
-    """仅在受信任的本机反向代理模式下读取被覆盖的真实地址。"""
+    """仅在受信任的本机反向代理模式下读取被覆盖的真实地址。
+
+    拿不到可信来源时返回空串（不启用来源限流），而不是一个常量占位符：
+    所有客户端共用一个来源桶时，任意一个攻击者都能用少量失败尝试把全体用户锁在门外。
+    """
     if os.environ.get("QUANT_TRUST_PROXY") == "1":
         value = st.context.headers.get("X-Real-IP", "")
         try:
             return str(ipaddress.ip_address(value))
         except ValueError:
-            return "proxy-missing"
-    # 直连模式采用共享来源桶，不将可伪造的转发头用作安全依据。
-    return "direct"
+            # 代理已配置但转发头异常，同样不能退化成共享桶。
+            return ""
+    # 直连模式不将可伪造的转发头用作安全依据，也拿不到真实来源。
+    return ""
 
 
 def clear_login() -> None:
@@ -151,7 +156,7 @@ def require_login() -> dict[str, Any]:
                     try:
                         if password != repeated:
                             raise ValueError("两次输入的密码不一致。")
-                        get_auth_service().activate_user(username, password)
+                        get_auth_service().activate_user(username, password, client_address())
                         st.success("账号已激活，请切换到“登录”使用新密码登录。")
                     except (AuthenticationError, ValueError) as exc:
                         st.error(str(exc))
@@ -192,7 +197,7 @@ def require_login() -> dict[str, Any]:
             try:
                 if new != repeated:
                     raise ValueError("两次输入的新密码不一致。")
-                get_auth_service().change_password(token, old, new)
+                get_auth_service().change_password(token, old, new, client_address())
                 clear_login()
                 st.session_state["auth_notice"] = True
                 st.rerun()

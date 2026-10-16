@@ -137,13 +137,11 @@ Linux / Nginx 部署见 [deploy/README.md](deploy/README.md)。
    }
    ```
 
-2. **注意：本仓库的 `config/database.local.json` 是随代码一起提交的**，里面写的就是作者的本地配置（`127.0.0.1` / `postgres` / 明文口令）。这是刻意的选择——只连本机数据库，方便开箱即用。请据此判断：
+2. `config/database.local.json` 已被 `.gitignore` 忽略，**不会进入版本库**，可以放心写本机口令。仓库里只保留 `config/database.example.json` 这个占位模板。
 
-   - 若你的数据库同样只监听本机、且该口令没有在别处复用，直接用即可。
-   - 若口令与任何其他环境相同，**请改掉它**：明文口令已随公开仓库发布，等同公开。
-   - 换成自己的配置后，本文件会显示为已修改；`git update-index --skip-worktree config/database.local.json` 可让它不再出现在提交里。
-
-   模板 `config/database.example.json` 的内容与之一致，仅作占位说明。
+   - 不复制也能启动：连接项会退回到 `127.0.0.1` / `5432` / `quantify` / `postgres` / 空口令，只适合本机无口令的开发库。
+   - 由于该文件不进版本库，每位协作者都需要各自复制一次。
+   - `git update-index --skip-worktree` 之类的旧办法不再需要。
 
 3. 也可以改用环境变量覆盖其中任意一项，环境变量优先级更高：
 
