@@ -24,6 +24,7 @@ from services.neutralization import (
 )
 from services.panel_store import PanelStore
 from services.progress import throttled
+from services.label_processing import winsorize_training_labels
 from services.rank_model import (
     SCORE_KIND_RANK, SCORE_KIND_RETURN, evaluate_ndcg, make_ranker, summarize_importances,
 )
@@ -40,7 +41,7 @@ MINIMUM_NDCG_RATIO = 1.05
 # 中性化因子覆盖率低于该比例时退回截面Z分数因子，避免样本被残差缺失过度削减。
 MINIMUM_NEUTRAL_COVERAGE = 0.5
 MODEL_NAMES = ("LightGBM", "XGBoost")
-HORIZONS = (5, 20, 60)
+HORIZONS = settings.MODEL_HORIZONS
 LOGGER = logging.getLogger("quant.ml")
 
 
@@ -277,7 +278,8 @@ def evaluate_oos(
 def _selection_key(result: dict[str, Any]) -> tuple[int, float]:
     """目标函数对比时的择优口径：先看是否通过验证，再看样本外Rank IC。"""
     metrics = result.get("oos_metrics") or {}
-    return (1 if result.get("validated") else 0, float(metrics.get("rank_ic") or -1.0))
+    rank_ic = metrics.get("rank_ic")
+    return (1 if result.get("validated") else 0, float(rank_ic) if rank_ic is not None else -1.0)
 
 
 def fit_panel_model(
@@ -291,6 +293,9 @@ def fit_panel_model(
     if requested not in settings.RANK_OBJECTIVE_MODES:
         raise ValueError(f"目标函数仅支持 {'、'.join(settings.RANK_OBJECTIVE_MODES)}；当前为 {requested}。")
     window = int(settings.TRAINING_WINDOW_DAYS if window is None else window)
+    validation_block = int(settings.OOS_RETRAIN_DAYS)
+    if validation_block < 1:
+        raise ValueError("样本外重训间隔必须为正整数。")
     frame = panel.loc[panel["date"] < cutoff].copy() if cutoff is not None else panel
     target, endpoint = f"target_{horizon}", f"label_end_{horizon}"
     feature_pool = list(panel.attrs.get("model_feature_columns") or [f"xs_{column}" for column in FEATURE_COLUMNS])
@@ -322,12 +327,16 @@ def fit_panel_model(
             return _make_model(name)
         return make_ranker(name)
 
-    def _fit(estimator: Any, sample: pd.DataFrame) -> Any:
+    def _fit(estimator: Any, sample: pd.DataFrame, candidate: str) -> tuple[Any, dict[str, Any]]:
+        labels = sample[target]
+        processing = {"enabled": False, "reason": "排序目标保留原始标签，避免截尾产生并列名次"}
+        if candidate == "regression":
+            labels, processing = winsorize_training_labels(labels, sample["date"], minimum_stocks=MINIMUM_STOCKS)
         if hasattr(estimator, "fit_cross_section"):
-            estimator.fit_cross_section(sample[features], sample[target], sample["date"])
+            estimator.fit_cross_section(sample[features], labels, sample["date"])
         else:
-            estimator.fit(sample[features], sample[target])
-        return estimator
+            estimator.fit(sample[features], labels)
+        return estimator, processing
 
     def _run(candidate: str) -> dict[str, Any]:
         result = unavailable_model(name, horizon, "截面样本不足，未生成预测", objective=candidate, window=window)
@@ -339,7 +348,10 @@ def fit_panel_model(
         oos: list[pd.DataFrame] = []
         fold_details = []
         try:
-            for train_dates, test_dates in TimeSeriesSplit(n_splits=3).split(dates):
+            first_test = next(TimeSeriesSplit(n_splits=3).split(dates))[1][0]
+            for block_start in range(int(first_test), len(dates), validation_block):
+                train_dates = np.arange(block_start)
+                test_dates = np.arange(block_start, min(block_start + validation_block, len(dates)))
                 test_start = pd.Timestamp(dates[test_dates[0]])
                 train = labelled.loc[labelled["date"].isin(dates[train_dates]) & (labelled[endpoint] < test_start)]
                 if window > 0:
@@ -348,7 +360,7 @@ def fit_panel_model(
                 test = labelled.loc[labelled["date"].isin(dates[test_dates])]
                 if train["date"].nunique() < MINIMUM_TRAIN_DATES:
                     continue
-                model = _fit(_estimator(candidate), train)
+                model, processing = _fit(_estimator(candidate), train, candidate)
                 predictions = np.asarray(model.predict(test[features]), dtype=float)
                 fold = test[["date", "code"]].copy()
                 fold["prediction"] = predictions
@@ -360,19 +372,24 @@ def fit_panel_model(
                                      "trained_from": str(train["date"].min().date()),
                                      "training_dates": int(train["date"].nunique()),
                                      "latest_training_label_end": str(train[endpoint].max().date()),
-                                     "test_start": str(test_start.date()), "test_end": str(pd.Timestamp(dates[test_dates[-1]]).date())})
+                                      "test_start": str(test_start.date()), "test_end": str(pd.Timestamp(dates[test_dates[-1]]).date()),
+                                      "label_processing": processing})
             if len(oos) < 2:
                 result["status"] = "有效日期验证折不足，未生成预测"
                 return result
             evaluation = pd.concat(oos, ignore_index=True)
             metrics = evaluate_oos(evaluation, horizon, panel["code"].nunique(), score_kind=result["score_kind"])
             metrics["folds"] = fold_details
-            result.update(oos_metrics=metrics, features_used=features)
+            result.update(oos_metrics=metrics, features_used=features,
+                          regression_loss=settings.REGRESSION_LOSS if candidate == "regression" else None,
+                          validation_retrain_days=validation_block,
+                          label_processing={"folds": [fold["label_processing"] for fold in fold_details]})
             if not metrics["validated"]:
                 result["status"] = "未通过样本外基线、Rank IC或分组收益检验"
                 return result
             final = labelled.loc[labelled["date"].isin(dates[-window:] if window > 0 else dates)]
-            model = _fit(_estimator(candidate), final)
+            model, final_processing = _fit(_estimator(candidate), final, candidate)
+            result["label_processing"]["final"] = final_processing
             importance = np.asarray(getattr(model, "feature_importances_", np.zeros(len(features))), dtype=float)
             result.update(validated=True, status="通过样本外基线、Rank IC与分组收益检验", estimator=model,
                           feature_importance=summarize_importances(features, importance))
@@ -391,7 +408,10 @@ def fit_panel_model(
     best["objective_selection"] = [
         {"objective": item["objective"], "score_kind": item["score_kind"], "validated": item["validated"],
          "rank_ic": (item["oos_metrics"] or {}).get("rank_ic"), "ndcg": (item["oos_metrics"] or {}).get("ndcg"),
-         "status": item["status"]}
+          "status": item["status"], "selected": item is best,
+          "training_dates": item.get("training_dates"), "samples": item.get("samples"),
+          "regression_loss": item.get("regression_loss"), "label_processing": item.get("label_processing"),
+          "oos_metrics": {key: value for key, value in (item.get("oos_metrics") or {}).items() if key != "daily_groups"}}
         for item in attempts
     ]
     return best
@@ -429,7 +449,7 @@ def final_holdout_context_fields() -> dict[str, Any]:
         if path.exists():
             try:
                 loaded = json.loads(path.read_text(encoding="utf-8"))
-                report = loaded if isinstance(loaded, dict) else None
+                report = loaded if isinstance(loaded, dict) and loaded.get("model_version") == settings.MODEL_VERSION else None
             except (OSError, ValueError):
                 LOGGER.exception("读取最终留出集报告失败，按未评估处理")
     if not report:
@@ -480,6 +500,9 @@ def train_market_context(
                "universe_codes": sorted(histories), "source": metadata or {}, "models": {}, "predictions": {},
                "reference_closes": dict(zip(live["code"], live["close"])),
                "objective_mode": objective or settings.DEFAULT_OBJECTIVE_MODE, "training_window_days": window,
+                "label_winsor_upper_quantile": settings.LABEL_WINSOR_UPPER_QUANTILE,
+                "regression_loss": settings.REGRESSION_LOSS,
+                "validation_retrain_days": settings.OOS_RETRAIN_DAYS,
                "exposures": panel.attrs.get("exposures"), "neutralization": panel.attrs.get("neutralization"),
                "extra_factors": panel.attrs.get("extra_factors"),
                # 留出集状态随每次扫描重新注入：context 每轮都是新建的字典，
@@ -509,6 +532,21 @@ def train_market_context(
     return context
 
 
+def save_context_summary(context: dict[str, Any], path: Path) -> None:
+    """原子保存模型摘要，避免原地改写污染指向同一文件的历史归档。
+
+    参数为模型上下文与摘要目标路径；不修改模型、面板或数据库。
+    """
+    summary = {key: value for key, value in context.items() if key not in ("models", "predictions", "reference_closes")}
+    summary["validation"] = {str(horizon): [{key: value for key, value in model.items() if key != "estimator"} for model in models] for horizon, models in context["models"].items()}
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(json.dumps(summary, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def save_context(context: dict[str, Any], panel: pd.DataFrame) -> None:
     """版本化原子保存模型、截面与指标；旧版绝对收益模型不复用。"""
     import joblib
@@ -524,9 +562,7 @@ def save_context(context: dict[str, Any], panel: pd.DataFrame) -> None:
     joblib.dump(context, model_temporary)
     os.replace(panel_temporary, panel_path)
     os.replace(model_temporary, model_path)
-    summary = {key: value for key, value in context.items() if key not in ("models", "predictions", "reference_closes")}
-    summary["validation"] = {str(horizon): [{key: value for key, value in model.items() if key != "estimator"} for model in models] for horizon, models in context["models"].items()}
-    (settings.MODEL_DIR / f"market_context_v{settings.MODEL_VERSION}.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
+    save_context_summary(context, settings.MODEL_DIR / f"market_context_v{settings.MODEL_VERSION}.json")
 
 
 def load_context(include_panel: bool = False) -> tuple[dict[str, Any] | None, pd.DataFrame | None]:

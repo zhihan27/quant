@@ -251,12 +251,12 @@ if run_analysis:
                 benchmark = None
                 benchmark_status = f"沪深 300 指数不可用；相对市场因子未计算：{exc}"
             completed = completed_daily_history(daily)
-            task.step("5 / 5 · 计算因子并核对 5、20、60 日超额收益模型上下文", 4, 5)
+            task.step("5 / 5 · 计算因子并核对 5、20、30、60 日超额收益模型上下文", 4, 5)
             analysis = analyze_stock(
                 completed,
                 current_price=quote.get("price"),
                 benchmark=benchmark,
-                horizons=(5, 20, 60),
+                horizons=settings.MODEL_HORIZONS,
                 code=selected_code,
                 as_of=quote.get("quote_time") or quote.get("fetched_at"),
                 quote_status=quote.get("data_status"),

@@ -76,7 +76,8 @@ BOARD_PREFIXES = {
 # 比股票池过滤用的具体号段更宽，故不并入 BOARD_PREFIXES。
 BSE_LIMIT_PREFIXES = ("4", "8", "92")
 MARKET_INDEX_CODE = "000300"
-MODEL_VERSION = "2.1.0"
+MODEL_VERSION = "2.2.0"
+MODEL_HORIZONS = (5, 20, 30, 60)
 
 # 跨进程计算互斥：同一数据库同时只允许一个重计算任务（扫描、组合回测、滚动重训）。
 # 网页端与每日定时扫描进程必须共用这一个编号——两者写的是同一份
@@ -98,6 +99,12 @@ DEFAULT_OBJECTIVE_MODE = "lambdarank"
 RANK_GRADE_COUNT = 5
 # 滚动窗口：每次重训只用最近 N 个交易日，自适应风格切换；0 表示不限制。
 TRAINING_WINDOW_DAYS = 750
+# 回归训练标签按同日截面只截上尾；1.0 表示关闭，0.975 表示上侧 97.5% 分位。
+LABEL_WINSOR_UPPER_QUANTILE = 0.99
+# MAE 验收对应 L1 训练目标；保留 l2 / huber 供相同验证口径下对照实验。
+REGRESSION_LOSS = "l1"
+# 样本外每 60 个交易日重新拟合，避免一个模型固定预测整段约一年的验证区间。
+OOS_RETRAIN_DAYS = 60
 # 单个估计器的训练线程数。两个模型仍顺序训练、不同时占满 CPU；
 # 内存吃紧或需要与网页进程错峰时，用环境变量调小。
 TRAINING_N_JOBS = _env_int("QUANT_TRAINING_N_JOBS", max(1, min(8, os.cpu_count() or 1)))

@@ -25,7 +25,7 @@ def _panel(days=420, stocks=10):
             value = (stock - (stocks - 1) / 2) / 3
             row = {"date": date, "code": str(stock).zfill(6), "close": 10.0}
             row.update({"xs_" + column: value for column in FEATURE_COLUMNS})
-            for horizon in (5, 20, 60):
+            for horizon in settings.MODEL_HORIZONS:
                 mature = day + horizon < days
                 outcome = value * 0.02 + 0.01 * np.sin(day * 0.7 + stock * 1.4)
                 row[f"target_{horizon}"] = outcome if mature else np.nan
@@ -166,6 +166,21 @@ class PanelValidationTests(unittest.TestCase):
         panel.loc[panel["date"].ge(cutoff), "target_20"] = 999
         second = fit_panel_model(panel, "LightGBM", 20, lambda _: _ExactModel(), cutoff=cutoff)
         self.assertEqual(first["oos_metrics"], second["oos_metrics"])
+
+    def test_real_regressors_train_thirty_day_winsorized_labels(self):
+        panel = _panel()
+        original = panel["target_30"].copy()
+        for name in ("LightGBM", "XGBoost"):
+            result = fit_panel_model(panel, name, 30, objective="regression")
+            self.assertTrue(result["validated"], result["status"])
+            self.assertEqual(result["regression_loss"], "l1")
+            self.assertEqual(result["validation_retrain_days"], settings.OOS_RETRAIN_DAYS)
+            self.assertGreater(result["label_processing"]["final"]["clipped_samples"], 0)
+            for fold in result["oos_metrics"]["folds"]:
+                self.assertLess(fold["latest_training_label_end"], fold["test_start"])
+                days = pd.bdate_range(fold["test_start"], fold["test_end"])
+                self.assertLessEqual(len(days), settings.OOS_RETRAIN_DAYS)
+        pd.testing.assert_series_equal(panel["target_30"], original)
 
     def test_snapshot_version_and_context_lineage(self):
         panel = _panel(10)

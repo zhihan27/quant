@@ -23,7 +23,7 @@ def _panel(days=1200, stocks=20, drift=0.0):
             quality = (stock - (stocks - 1) / 2) / 5
             row = {"date": date, "code": str(stock).zfill(6), "close": 10.0}
             row.update({"xs_" + column: quality for column in FEATURE_COLUMNS})
-            for horizon in (5, 20, 60):
+            for horizon in settings.MODEL_HORIZONS:
                 mature = day + horizon < days
                 outcome = drift + quality * 0.02 + 0.004 * np.sin(day * 0.7 + stock * 1.4)
                 row[f"target_{horizon}"] = outcome if mature else np.nan

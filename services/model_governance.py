@@ -96,7 +96,10 @@ def holdout_window(panel: pd.DataFrame) -> tuple[pd.Timestamp, pd.Timestamp]:
     return start, end
 
 
-def training_baseline(panel: pd.DataFrame, start: pd.Timestamp, target: str, endpoint: str) -> float:
+def training_baseline(
+    panel: pd.DataFrame, start: pd.Timestamp, target: str, endpoint: str,
+    features: list[str] | None = None, window: int | None = None,
+) -> float:
     """冻结模型的训练样本中位数基线。
 
     取的是**冻结模型真正训练过的那段样本**的中位数，不是留出集自己的中位数：
@@ -104,8 +107,12 @@ def training_baseline(panel: pd.DataFrame, start: pd.Timestamp, target: str, end
     「MAE 优于基线」退化成自己跟自己比。
     """
     train = panel.loc[panel["date"] < start]
-    labelled = train.dropna(subset=[target, endpoint])
+    labelled = train.dropna(subset=[target, endpoint, *(features or [])])
     labelled = labelled.loc[labelled[endpoint] < start]
+    window = int(settings.TRAINING_WINDOW_DAYS if window is None else window)
+    if window > 0:
+        dates = np.sort(labelled["date"].unique())
+        labelled = labelled.loc[labelled["date"].isin(dates[-window:])]
     if labelled.empty:
         raise FinalHoldoutError("留出集之前没有任何完整标签样本，无法计算冻结模型的基线。")
     baseline = float(labelled[target].median())
@@ -233,7 +240,7 @@ def build_holdout_evaluation(
             results[str(horizon)] = line
             continue
         features = list(frozen["features_used"])
-        baseline = training_baseline(frame, start, target, endpoint)
+        baseline = training_baseline(frame, start, target, endpoint, features=features, window=window)
         subset = holdout.dropna(subset=[*features, target])
         if settings.FINAL_HOLDOUT_END:
             # 设了终点时，标签也必须落在终点之内，否则「留出集」会把终点之后的行情算进来。
@@ -438,7 +445,7 @@ def _write_report(payload: dict[str, Any]) -> Path:
 
 
 def holdout_report() -> dict[str, Any] | None:
-    """读取已落盘的留出集报告，供管理员页展示。"""
+    """读取当前模型版本的留出集报告，避免跨版本展示验收结论。"""
     path = _report_path()
     if not path.exists():
         return None
@@ -447,7 +454,9 @@ def holdout_report() -> dict[str, Any] | None:
     except (OSError, ValueError):
         LOGGER.exception("读取最终留出集报告失败")
         return None
-    return loaded if isinstance(loaded, dict) else None
+    if not isinstance(loaded, dict) or loaded.get("model_version") != settings.MODEL_VERSION:
+        return None
+    return loaded
 
 
 # ---------------------------------------------------------------------------
@@ -466,6 +475,17 @@ def _link_or_copy(source: Path, target: Path) -> None:
         os.link(source, target)
     except OSError:
         shutil.copy2(source, target)
+
+
+def _archive_summary_matches(directory: Path, version: str, context_id: str) -> bool:
+    """校验归档摘要所属批次，拒绝使用被后续训练覆盖的历史元数据。"""
+    path = directory / f"market_context_v{version}.json"
+    try:
+        summary = json.loads(path.read_text(encoding="utf-8"))
+        return isinstance(summary, dict) and summary.get("context_id") == context_id and summary.get("model_version") == version
+    except (OSError, ValueError):
+        LOGGER.warning("模型摘要缺失或损坏：%s", path)
+        return False
 
 
 def archive_context(
@@ -492,6 +512,8 @@ def archive_context(
     missing = [name for name, path in sources.items() if not path.exists()]
     if missing:
         raise FinalHoldoutError(f"归档失败：活动文件缺失 {', '.join(missing)}。")
+    if not _archive_summary_matches(settings.MODEL_DIR, version, context_id):
+        raise FinalHoldoutError("归档失败：活动摘要与待归档的模型批次或版本不一致。")
     targets = {
         "model": directory / f"market_context_v{version}.joblib",
         "summary": directory / f"market_context_v{version}.json",
@@ -505,6 +527,8 @@ def archive_context(
     details = {
         "objective_mode": context.get("objective_mode"),
         "training_window_days": context.get("training_window_days"),
+        "regression_loss": context.get("regression_loss"),
+        "label_winsor_upper_quantile": context.get("label_winsor_upper_quantile"),
         "pool_mode": source_meta.get("pool_mode"),
         "universe_size": len(context.get("universe_codes") or []),
         "neutralization_status": (context.get("neutralization") or {}).get("status"),
@@ -582,12 +606,12 @@ def registry_versions(repository: QuantRepository, limit: int = 50) -> list[dict
         # 登记的路径可能已经不存在（手工清理、磁盘迁移）。回滚按钮必须据此禁用，
         # 而不是等点了以后再报错。校验的三个文件与 rollback_to 一致，否则会出现
         # 「按钮点得动、点了报错」。
-        available = bool(path and all(
+        available = bool(path and row["model_version"] == settings.MODEL_VERSION and all(
             (path / name).exists()
             for name in (f"market_context_v{row['model_version']}.joblib",
                          f"market_context_v{row['model_version']}.json",
                          f"ml_panel_v{row['model_version']}.parquet")
-        ))
+        ) and _archive_summary_matches(path, row["model_version"], row["context_id"]))
         result.append({**row, "rollbackable": bool(row["passed"] and not row["is_active"] and available)})
     return result
 
@@ -609,6 +633,8 @@ def rollback_to(repository: QuantRepository, context_id: str, operator: str) -> 
     if target["is_active"]:
         raise FinalHoldoutError("该版本已经是当前活动模型，无需回滚。")
     version = target["model_version"]
+    if version != settings.MODEL_VERSION:
+        raise FinalHoldoutError("该归档的训练版本与当前程序不兼容，不能作为当前活动模型回滚。")
     directory = Path(target["archive_path"]) if target["archive_path"] else None
     if directory is None or not directory.exists():
         raise FinalHoldoutError("该版本的归档目录已不存在，无法回滚。")
@@ -617,6 +643,8 @@ def rollback_to(repository: QuantRepository, context_id: str, operator: str) -> 
     archived_summary = directory / f"market_context_v{version}.json"
     if not archived_model.exists() or not archived_panel.exists() or not archived_summary.exists():
         raise FinalHoldoutError("该版本的归档文件不完整（模型、面板或摘要缺失），无法回滚。")
+    if not _archive_summary_matches(directory, version, context_id):
+        raise FinalHoldoutError("该归档摘要与模型批次或版本不一致，请先修复摘要。")
 
     context, panel = load_context(include_panel=True)
     if context and panel is not None:
@@ -807,7 +835,7 @@ class ScanGovernance:
         try:
             records = model_monitor.validation_records(context, trigger=self.trigger)
             summary["validation_rows"] = model_monitor.log_validation(self.repository, records)
-            summary["pass_rate"] = model_monitor.get_pass_rate(self.repository)
+            summary["pass_rate"] = model_monitor.get_pass_rate(self.repository, model_version=context.get("model_version"))
         except DatabaseError as exc:
             self.errors.append(f"通过率记录写入失败：{exc}")
 

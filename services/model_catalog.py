@@ -71,6 +71,14 @@ def _archive_entry(context_id: str) -> dict[str, Any] | None:
         return None
     if not all((directory / name.format(version=version)).exists() for name in _ARCHIVE_FILES):
         return None
+    try:
+        summary = json.loads((directory / f"market_context_v{version}.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        LOGGER.warning("归档摘要损坏，已跳过：%s", context_id)
+        return None
+    if not isinstance(summary, dict) or summary.get("context_id") != context_id or summary.get("model_version") != version:
+        LOGGER.warning("归档摘要与登记批次不一致，已跳过：%s", context_id)
+        return None
     return {
         "context_id": context_id,
         "model_version": version,

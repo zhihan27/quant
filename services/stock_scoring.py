@@ -60,10 +60,20 @@ def _factor_score(features: pd.DataFrame) -> tuple[float | None, list[dict[str, 
 
 
 def _make_model(name: str) -> Any:
+    """按配置构造回归器，默认以与 MAE 验收一致的 L1 损失训练。"""
+    objectives = {
+        "l1": ("regression_l1", "reg:absoluteerror"),
+        "l2": ("regression", "reg:squarederror"),
+        "huber": ("huber", "reg:pseudohubererror"),
+    }
+    if settings.REGRESSION_LOSS not in objectives:
+        raise ValueError("回归损失仅支持 l1、l2、huber。")
+    lgb_objective, xgb_objective = objectives[settings.REGRESSION_LOSS]
     if name == "LightGBM":
         from lightgbm import LGBMRegressor
 
         return LGBMRegressor(
+            objective=lgb_objective,
             n_estimators=120,
             learning_rate=0.04,
             max_depth=4,
@@ -83,7 +93,7 @@ def _make_model(name: str) -> Any:
         subsample=0.8,
         colsample_bytree=0.8,
         reg_lambda=1.0,
-        objective="reg:squarederror",
+        objective=xgb_objective,
         random_state=42,
         n_jobs=settings.TRAINING_N_JOBS,
         verbosity=0,
@@ -101,7 +111,7 @@ def walk_forward_predictions(
     """在每个历史区间重新训练截面模型，只使用当时已成熟的超额标签。"""
     from services.ml_pipeline import fit_panel_model, load_context, predict_panel, relative_signal
 
-    if retrain_every < 1 or horizon not in (5, 20, 60):
+    if retrain_every < 1 or horizon not in settings.MODEL_HORIZONS:
         raise ValueError("重新训练间隔或预测周期无效。")
     predictions = pd.Series(np.nan, index=features.index, dtype=float)
     if market_panel is None:
@@ -145,7 +155,7 @@ def analyze_stock(
     history: pd.DataFrame,
     current_price: float | None,
     benchmark: pd.DataFrame | None = None,
-    horizons: tuple[int, ...] = (5, 20, 60),
+    horizons: tuple[int, ...] = settings.MODEL_HORIZONS,
     code: str | None = None,
     as_of: str | None = None,
     quote_status: str | None = None,
@@ -160,8 +170,8 @@ def analyze_stock(
     每次都查一次降级状态没有意义；况且上一轮扫描之后才被降级这种情形，
     本来就该由调用方在扫描开始前统一读一次。
     """
-    if any(horizon not in (5, 20, 60) for horizon in horizons):
-        raise ValueError("预测周期仅支持5、20、60个交易日。")
+    if any(horizon not in settings.MODEL_HORIZONS for horizon in horizons):
+        raise ValueError("预测周期仅支持5、20、30、60个交易日。")
     features = build_features(history, benchmark)
     factor_score, factor_details = _factor_score(features)
     latest = features.iloc[-1] if not features.empty else pd.Series(dtype=float)

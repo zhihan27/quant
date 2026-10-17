@@ -116,6 +116,8 @@ def validation_record(context: dict[str, Any], model: dict[str, Any], horizon: i
         target_type = "rank" if model.get("objective") == "lambdarank" else "reg"
     else:
         target_type = "unknown"
+    ready = bool(model.get("validated", gates["passed"]))
+    mae, baseline_mae = _finite(metrics.get("mae")), _finite(metrics.get("baseline_mae"))
     return {
         "model_version": str(context.get("model_version") or settings.MODEL_VERSION),
         "model_type": MODEL_TYPE_CODES.get(model.get("model"), "unknown"),
@@ -131,8 +133,8 @@ def validation_record(context: dict[str, Any], model: dict[str, Any], horizon: i
         "mae": _finite(metrics.get("mae")),
         "training_dates": finite_or_none(model.get("training_dates")),
         "passed_gates": finite_or_none(gates["gates"]),
-        "failed_gate": gates["failed_gate"],
-        "pass": bool(gates["passed"]),
+        "failed_gate": gates["failed_gate"] or (None if ready else "模型训练或最新截面预测不可用"),
+        "pass": bool(gates["passed"] and ready),
         "details": finite_or_none({
             "context_id": context.get("context_id"),
             "horizon": horizon,
@@ -151,6 +153,10 @@ def validation_record(context: dict[str, Any], model: dict[str, Any], horizon: i
             "reference_date": context.get("reference_date"),
             "training_window_days": context.get("training_window_days"),
             "objective_mode": context.get("objective_mode"),
+            "objective_selection": model.get("objective_selection"),
+            "regression_loss": model.get("regression_loss"),
+            "label_processing": model.get("label_processing"),
+            "mae_relative_change": mae / baseline_mae - 1 if mae is not None and baseline_mae is not None and baseline_mae > 0 else None,
         }),
     }
 
@@ -160,7 +166,7 @@ def validation_records(
 ) -> list[dict[str, Any]]:
     """把一个模型上下文展开成本轮要落库的全部检验记录。
 
-    一次全量扫描在默认配置下产生 2 个模型 × 3 个周期 = 6 行。
+    一次全量扫描产生每个模型、每个周期各一行；候选明细随 details 保存。
     """
     stamp = scan_time or datetime.now(SHANGHAI)
     records = []
@@ -221,6 +227,37 @@ def _group_summary(rows: Sequence[dict[str, Any]], key: str) -> dict[str, dict[s
     return dict(sorted(groups.items()))
 
 
+def candidate_validation_rows(rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """从入选日志展开全部目标候选，不把择优后的分组当成完整实验结果。
+
+    输入为数据库检验记录；旧记录缺少候选明细时不猜测未保存的实验结果。
+    """
+    candidates = []
+    for row in rows:
+        details = row.get("details") or {}
+        attempts = details.get("objective_selection")
+        if not attempts:
+            if details.get("objective_mode") == "auto":
+                continue
+            if row.get("target_type") in ("rank", "reg"):
+                candidates.append(dict(row))
+            continue
+        for attempt in attempts:
+            objective = attempt.get("objective")
+            if objective not in ("regression", "lambdarank"):
+                continue
+            metrics = attempt.get("oos_metrics") or {}
+            gates = evaluation_gates(metrics) if metrics else None
+            candidates.append({
+                **row, "target_type": "rank" if objective == "lambdarank" else "reg",
+                "pass": bool(attempt.get("validated")),
+                "passed_gates": gates["gates"] if gates else {},
+                "failed_gate": gates["failed_gate"] if gates else None,
+                "details": {**details, "objective": objective, "candidate": attempt},
+            })
+    return candidates
+
+
 def summarize_pass_rate(
     rows: Sequence[dict[str, Any]], days: int = settings.PASS_RATE_WINDOW_DAYS
 ) -> dict[str, Any]:
@@ -231,6 +268,15 @@ def summarize_pass_rate(
     """
     total = len(rows)
     passed = sum(1 for row in rows if row.get("pass"))
+    evaluated = [row for row in rows if row.get("passed_gates")]
+    candidates = candidate_validation_rows(rows)
+    candidate_passed = sum(1 for row in candidates if row.get("pass"))
+    batch_keys = [
+        (str(row.get("model_version")), str((row.get("details") or {}).get("context_id") or row.get("scan_time")))
+        for row in rows
+    ]
+    latest_rows = [row for row, key in zip(rows, batch_keys) if key == batch_keys[0]] if rows else []
+    latest_passed = sum(1 for row in latest_rows if row.get("pass"))
     gate_total: dict[str, int] = {}
     gate_failures: dict[str, int] = {}
     for row in rows:
@@ -256,6 +302,19 @@ def summarize_pass_rate(
         "passed": passed,
         "failed": total - passed,
         "pass_rate": _rate(passed, total),
+        "evaluated_records": len(evaluated),
+        "unavailable_records": total - len(evaluated),
+        "availability_rate": _rate(len(evaluated), total),
+        "evaluated_pass_rate": _rate(sum(1 for row in evaluated if row.get("pass")), len(evaluated)),
+        "batch_count": len(set(batch_keys)),
+        "latest_batch": {"records": len(latest_rows), "passed": latest_passed,
+                         "pass_rate": _rate(latest_passed, len(latest_rows))},
+        "candidate_records": len(candidates),
+        "candidate_passed": candidate_passed,
+        "candidate_pass_rate": _rate(candidate_passed, len(candidates)),
+        "candidate_metrics_records": sum(1 for row in candidates if row.get("passed_gates")),
+        "by_candidate_target_type": _group_summary(candidates, "target_type"),
+        "candidate_detail_records": sum(1 for row in rows if (row.get("details") or {}).get("objective_selection")),
         "minimum_records": int(settings.PASS_RATE_MINIMUM_RECORDS),
         "sample_sufficient": sufficient,
         "sample_note": (
@@ -278,6 +337,7 @@ def summarize_pass_rate(
 def fetch_validation_rows(
     repository: QuantRepository, days: int = settings.PASS_RATE_WINDOW_DAYS,
     model_type: str | None = None, target_type: str | None = None,
+    model_version: str | None = None,
 ) -> list[dict[str, Any]]:
     """读取窗口内的检验记录，按时间倒序。"""
     with repository.connect() as connection:
@@ -289,28 +349,31 @@ def fetch_validation_rows(
             "WHERE scan_time >= now() - make_interval(days => %s) "
             "AND (%s::text IS NULL OR model_type = %s::text) "
             "AND (%s::text IS NULL OR target_type = %s::text) "
+            "AND (%s::text IS NULL OR model_version = %s::text) "
             "ORDER BY scan_time DESC, id DESC",
-            (int(days), model_type, model_type, target_type, target_type),
+            (int(days), model_type, model_type, target_type, target_type, model_version, model_version),
         ).fetchall()
 
 
 def get_pass_rate(
     repository: QuantRepository, days: int = settings.PASS_RATE_WINDOW_DAYS,
     model_type: str | None = None, target_type: str | None = None,
+    model_version: str | None = None,
 ) -> dict[str, Any]:
     """通过率报表：总通过率、分模型、分目标、分门槛失败率。"""
-    return summarize_pass_rate(fetch_validation_rows(repository, days, model_type, target_type), days=days)
+    return summarize_pass_rate(fetch_validation_rows(repository, days, model_type, target_type, model_version), days=days)
 
 
-def get_recent_failures(repository: QuantRepository, limit: int = 20) -> list[dict[str, Any]]:
+def get_recent_failures(repository: QuantRepository, limit: int = 20, model_version: str | None = None) -> list[dict[str, Any]]:
     """最近的失败记录及原因，供管理员页与告警引用。"""
     with repository.connect() as connection:
         rows = connection.execute(
             "SELECT scan_time, model_version, model_type, target_type, rank_ic, hac_t, ndcg_ratio, "
             "top_excess, top_bottom, mae, failed_gate, passed_gates, details "
             "FROM public.quant_model_validation_log WHERE NOT pass "
+            "AND (%s::text IS NULL OR model_version = %s::text) "
             "ORDER BY scan_time DESC, id DESC LIMIT %s",
-            (min(max(int(limit), 1), 500),),
+            (model_version, model_version, min(max(int(limit), 1), 500)),
         ).fetchall()
     return [
         {
@@ -400,7 +463,7 @@ def evaluate_pass_rate_alerts(rows: Sequence[dict[str, Any]], streaks: Sequence[
             "details": {"pass_rate": summary["pass_rate"], "records": summary["records"], "days": summary["days"]},
         })
     for gate, item in summary["by_gate"].items():
-        if item["failure_rate"] is not None and item["failure_rate"] > settings.GATE_FAILURE_RATE_ALERT:
+        if item["evaluated"] >= settings.PASS_RATE_MINIMUM_RECORDS and item["failure_rate"] is not None and item["failure_rate"] > settings.GATE_FAILURE_RATE_ALERT:
             alerts.append({
                 "level": "warning",
                 "category": "pass_rate",
@@ -408,7 +471,7 @@ def evaluate_pass_rate_alerts(rows: Sequence[dict[str, Any]], streaks: Sequence[
                 "message": (
                     f"近 {summary['days']} 天里「{item['label']}」被检验 {item['evaluated']} 次，"
                     f"未通过 {item['failures']} 次，失败率 {item['failure_rate']:.1%}，"
-                    "说明这条门槛正在系统性地拦下模型。"
+                    "该门槛在窗口内频繁未通过，请结合误差幅度与独立训练批次数复核。"
                 ),
                 "details": {"gate": gate, "failure_rate": item["failure_rate"], "evaluated": item["evaluated"]},
             })
@@ -417,6 +480,7 @@ def evaluate_pass_rate_alerts(rows: Sequence[dict[str, Any]], streaks: Sequence[
 
 def check_pass_rate_alerts(repository: QuantRepository, days: int = settings.PASS_RATE_WINDOW_DAYS) -> list[dict[str, Any]]:
     """读取窗口数据并返回通过率相关的全部告警。"""
-    rows = fetch_validation_rows(repository, days=days)
+    rows = fetch_validation_rows(repository, days=days, model_version=settings.MODEL_VERSION)
     streaks = fetch_failure_streaks(repository, limit=int(settings.CONSECUTIVE_FAILURE_ALERT))
+    streaks = [row for row in streaks if row.get("model_version") == settings.MODEL_VERSION]
     return evaluate_pass_rate_alerts(rows, streaks)

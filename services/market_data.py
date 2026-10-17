@@ -1472,7 +1472,7 @@ finally:
 
     def _fetch_sina_universe(self) -> list[dict[str, Any]]:
         """按源端总数完整分页读取沪深京行情，逐页超时，不使用35秒子进程总限时。"""
-        cache_key = "universe:sina_full:v1"
+        cache_key = "universe:sina_full:v2"
         cached = self._cache_result(cache_key, settings.UNIVERSE_CACHE_SECONDS, allow_stale=False)
         if cached is not None:
             return cached[0]["rows"]
@@ -1499,6 +1499,9 @@ finally:
                 if not isinstance(item, dict) or not item.get("code") or not item.get("name"):
                     raise MarketDataError(f"新浪股票池第{page}页存在缺少代码或名称的记录。")
                 volume = _number(item.get("volume"))
+                # 新浪 mktcap / nmc 的单位为万元，统一换算成元供市值暴露使用。
+                market_cap_total = _number(item.get("mktcap"))
+                market_cap_float = _number(item.get("nmc"))
                 rows.append({
                     "code": item["code"], "name": item["name"], "price": _number(item.get("trade")),
                     "change_pct": _number(item.get("changepercent")), "change": _number(item.get("pricechange")),
@@ -1506,6 +1509,8 @@ finally:
                     "turnover_rate": _number(item.get("turnoverratio")), "high": _number(item.get("high")),
                     "low": _number(item.get("low")), "open": _number(item.get("open")),
                     "previous_close": _number(item.get("settlement")),
+                    "market_cap_total": market_cap_total * 10000 if market_cap_total is not None else None,
+                    "market_cap_float": market_cap_float * 10000 if market_cap_float is not None else None,
                 })
             self.logger.info("新浪股票池分页 page=%s rows=%s total=%s", page, len(page_rows), total)
         unique = {str(row["code"]).zfill(6) for row in rows}

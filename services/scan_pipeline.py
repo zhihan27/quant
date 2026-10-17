@@ -528,7 +528,7 @@ def _finish_pipeline(
         code, history, quote = item["code"], item["history"], item["quote"]
         item["analysis"] = analyze_stock(
             history, current_price=quote.get("price"), benchmark=benchmark,
-            horizons=(5, 20, 60), code=code,
+            horizons=settings.MODEL_HORIZONS, code=code,
             as_of=quote.get("quote_time") or quote.get("fetched_at"),
             quote_status=quote.get("data_status"), market_context=context,
             scoring_paused=scoring_paused,

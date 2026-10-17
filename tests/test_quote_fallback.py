@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -76,6 +76,22 @@ class QuoteFallbackTests(unittest.TestCase):
         self.assertEqual(quote["price"], 14.9)
         self.assertEqual(quote["source"], "新浪完整股票池")
         refresh.assert_called_once_with(scope="all")
+
+    def test_sina_universe_preserves_market_cap_in_yuan(self):
+        rows = [
+            {"code": "920000", "name": "测试北交所", "trade": "13.1",
+             "mktcap": 120100.8, "nmc": 75448.04175},
+            {"code": "000001", "name": "测试主板", "trade": "10"},
+        ]
+        with patch("services.market_data.settings.MINIMUM_EXPECTED_A_SHARE_UNIVERSE", 2), patch.object(
+            self.service, "_cache_result", return_value=None,
+        ), patch.object(self.service, "_request_response", side_effect=[Mock(json=lambda: 2), Mock(json=lambda: rows)]), patch.object(
+            self.service, "_write_cache",
+        ):
+            result = self.service._fetch_sina_universe()
+        self.assertAlmostEqual(result[0]["market_cap_total"], 1201008000.0)
+        self.assertAlmostEqual(result[0]["market_cap_float"], 754480417.5)
+        self.assertIsNone(result[1]["market_cap_float"])
 
 
 if __name__ == "__main__":

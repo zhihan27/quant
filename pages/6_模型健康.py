@@ -87,8 +87,16 @@ with tabs[0]:
         f"按 `scan_time` 倒序。门槛与训练时完全同源（`services/ml_pipeline.py::evaluation_gates`）。"
     )
     try:
-        summary = model_monitor.get_pass_rate(repository)
-        failures = model_monitor.get_recent_failures(repository, limit=20)
+        history_rows = model_monitor.fetch_validation_rows(repository)
+        versions = sorted({row["model_version"] for row in history_rows}, reverse=True)
+        selected_version = st.selectbox("检验模型版本", [settings.MODEL_VERSION, *[version for version in versions if version != settings.MODEL_VERSION], "全部版本"])
+        trend_rows = [row for row in history_rows if selected_version == "全部版本" or row["model_version"] == selected_version]
+        summary = model_monitor.summarize_pass_rate(trend_rows)
+        failures = model_monitor.get_recent_failures(
+            repository, limit=20, model_version=None if selected_version == "全部版本" else selected_version,
+        )
+        if selected_version == "全部版本":
+            st.caption("不同版本的标签处理和损失函数可能不同；累计结果不能替代同口径对照实验。")
     except DatabaseError as exc:
         st.error(str(exc))
         summary, failures = None, []
@@ -104,7 +112,7 @@ with tabs[0]:
         columns = st.columns(4)
         columns[0].metric("窗口内记录", f"{summary['records']} 条")
         columns[1].metric(
-            "总通过率",
+            "累计流程通过率",
             NO_DATA if summary["pass_rate"] is None else f"{summary['pass_rate']:.1%}",
             help=f"低于 {settings.PASS_RATE_MINIMUM:.0%} 触发告警（需窗口内至少 {summary['minimum_records']} 条记录）",
         )
@@ -115,6 +123,13 @@ with tabs[0]:
         )
         if not summary["sample_sufficient"]:
             st.warning(summary["sample_note"], icon=":material/info:")
+        availability = st.columns(4)
+        availability[0].metric("已评估 / 无指标", f"{summary['evaluated_records']} / {summary['unavailable_records']}")
+        availability[1].metric("指标生成率", NO_DATA if summary["availability_rate"] is None else f"{summary['availability_rate']:.1%}")
+        availability[2].metric("已评估记录通过率", NO_DATA if summary["evaluated_pass_rate"] is None else f"{summary['evaluated_pass_rate']:.1%}")
+        latest = summary["latest_batch"]
+        availability[3].metric("最新批次通过率", NO_DATA if latest["pass_rate"] is None else f"{latest['pass_rate']:.1%}")
+        st.caption(f"窗口内共 {summary['batch_count']} 个训练批次。同批模型与预测周期并非独立重复实验；无指标记录表示流程不可用，不能解释为预测误差过大。")
 
         left, right = st.columns(2)
         with left:
@@ -128,7 +143,8 @@ with tabs[0]:
                 ]),
                 hide_index=True, width="stretch",
             )
-            st.markdown("**分训练目标**")
+            st.markdown("**入选模型分训练目标**")
+            st.caption("自动择优后仅记录入选目标，不能据此推断排序或回归候选的总体通过率。")
             st.dataframe(
                 pd.DataFrame([
                     {"目标": key, "记录": row["records"], "通过": row["passed"],
@@ -152,10 +168,15 @@ with tabs[0]:
                 hide_index=True, width="stretch",
             )
 
-        try:
-            trend_rows = model_monitor.fetch_validation_rows(repository)
-        except DatabaseError:
-            trend_rows = []
+        st.markdown("**全部目标候选通过率**")
+        if summary["candidate_records"]:
+            st.dataframe(pd.DataFrame([
+                {"目标": key, "候选数": value["records"], "通过": value["passed"], "通过率": f"{value['pass_rate']:.1%}"}
+                for key, value in summary["by_candidate_target_type"].items()
+            ]), hide_index=True, width="stretch")
+        else:
+            st.caption("没有保存完整候选记录，无法计算全部候选通过率。")
+        st.caption(f"保存候选目标与通过结论的入选记录：{summary['candidate_detail_records']}/{summary['records']}；具有门槛指标的候选：{summary['candidate_metrics_records']}/{summary['candidate_records']}。历史缺失指标不作推断，小样本比例仅供参考。")
         if trend_rows:
             trend = pd.DataFrame([
                 {"时间": stamp(row["scan_time"]),
@@ -177,7 +198,11 @@ with tabs[0]:
                     {"扫描时间": stamp(row["scan_time"]), "模型": row["model_label"],
                      "目标": row["target_type"], "卡在": row["failed_gate_label"],
                      "Rank IC": number(row["rank_ic"]), "HAC t": number(row["hac_t"], 2),
-                     "NDCG比": number(row["ndcg_ratio"], 2)}
+                     "NDCG比": number(row["ndcg_ratio"], 2),
+                     "MAE": number(row.get("mae")),
+                     "基线MAE": number((row.get("details") or {}).get("baseline_mae")),
+                     "MAE相对基线变化": NO_DATA if (row.get("details") or {}).get("mae_relative_change") is None
+                     else f"{row['details']['mae_relative_change']:+.2%}"}
                     for row in failures
                 ]),
                 hide_index=True, width="stretch",
@@ -319,6 +344,7 @@ with tabs[1]:
 # 最终留出集
 # ---------------------------------------------------------------------------
 with tabs[2]:
+    st.caption("当前评估采用训练截止日隔离的冻结模型跨期回放。历史区间可能已用于生产训练或调参，不能据此声称它是从未见过的独立留出集；研究参数应先冻结，再在未使用的新区间验证。")
     st.caption(
         "数据来源：`public.quant_model_final_holdout` 与 "
         f"`{settings.MODEL_DIR / settings.FINAL_HOLDOUT_REPORT_NAME}`。"

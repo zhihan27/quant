@@ -17,6 +17,8 @@ from services.ml_pipeline import HORIZONS, historical_models_for_stock, load_con
 
 
 class ModelCatalogTests(unittest.TestCase):
+    """验证模型目录列表与归档摘要的批次、版本一致性。"""
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
@@ -42,6 +44,9 @@ class ModelCatalogTests(unittest.TestCase):
         (directory / "registry.json").write_text(json.dumps(registry, ensure_ascii=False), encoding="utf-8")
         for name in ("market_context_v{}.joblib", "market_context_v{}.json", "ml_panel_v{}.parquet"):
             (directory / name.format(self.version)).write_bytes(b"")
+        (directory / f"market_context_v{self.version}.json").write_text(
+            json.dumps({"context_id": context_id, "model_version": registry["model_version"]}), encoding="utf-8",
+        )
         return directory
 
     def _active(self, context_id: str, archived: bool = False):
@@ -97,6 +102,13 @@ class ModelCatalogTests(unittest.TestCase):
         with patch("services.model_governance.registry_versions", return_value=rows):
             models = model_catalog.saved_models(repository=object())
         self.assertEqual([item["context_id"] for item in models], ["a" * 32])
+
+    def test_catalog_rejects_summary_overwritten_by_another_batch(self):
+        directory = self._archive("a" * 32)
+        (directory / f"market_context_v{self.version}.json").write_text(
+            json.dumps({"context_id": "b" * 32, "model_version": self.version}), encoding="utf-8",
+        )
+        self.assertEqual(model_catalog.saved_models(None), [])
 
 
 class ContextByIdTests(unittest.TestCase):

@@ -5,6 +5,8 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from config import settings
+
 FEATURE_COLUMNS = [
     "momentum_5",
     "momentum_20",
@@ -120,14 +122,14 @@ def build_features(
 
 def add_forward_returns(
     features: pd.DataFrame,
-    horizons: tuple[int, ...] = (5, 20, 60),
+    horizons: tuple[int, ...] = settings.MODEL_HORIZONS,
     benchmark: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """以基准交易日历生成未来超额收益标签，缺失端点不填充。"""
     frame = features.copy()
     frame["date"] = pd.to_datetime(frame["date"])
-    if any(horizon not in (5, 20, 60) for horizon in horizons):
-        raise ValueError("标签周期仅支持5、20、60个交易日。")
+    if any(horizon not in settings.MODEL_HORIZONS for horizon in horizons):
+        raise ValueError("标签周期仅支持5、20、30、60个交易日。")
     if benchmark is None or benchmark.empty:
         for horizon in horizons:
             frame[f"target_{horizon}"] = np.nan
