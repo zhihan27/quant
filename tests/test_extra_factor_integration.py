@@ -83,6 +83,22 @@ class ExtraFactorIntegrationTests(unittest.TestCase):
         self.assertEqual(panel.attrs["model_feature_columns"], [f"xs_{column}" for column in FEATURE_COLUMNS])
         self.assertEqual(panel.attrs["extra_factors"]["status"], "未提供新增因子")
 
+    def test_build_market_panel_reports_per_stock_progress(self) -> None:
+        """面板构造的两段逐股循环都要上报，否则页面会停在上一条字幕上像卡死。
+
+        全市场扫描下这一段（构造因子 + 并入筹码）要跑好几分钟，
+        不接进度回调的话，「正在汇总分钟线」之后就是一段无输出的黑洞。
+        """
+        messages: list[str] = []
+        build_market_panel(
+            self.histories, self.benchmark, extra_factors={"chip": self.histories},
+            progress=messages.append,
+        )
+        features = [text for text in messages if text.startswith("正在构造截面因子")]
+        chips = [text for text in messages if "的筹码分布" in text]
+        self.assertEqual(features[-1], f"正在构造截面因子（{STOCKS}/{STOCKS}）")
+        self.assertTrue(chips[-1].endswith(f"（{STOCKS}/{STOCKS}）"))
+
     def test_chip_factors_are_added_to_model_features(self) -> None:
         panel = build_market_panel(self.histories, self.benchmark, extra_factors={"chip": self.histories})
         features = panel.attrs["model_feature_columns"]

@@ -266,6 +266,14 @@ class AttachTests(unittest.TestCase):
         _, report = attach_chip_factors(pd.DataFrame(columns=["date", "code"]), {"600519": _flat()})
         self.assertIn("面板为空", report["status"])
 
+    def test_progress_is_throttled_and_reaches_the_last_stock(self) -> None:
+        """逐只上报会在页面上写上千次元素，必须节流；但末条要报到最后一只。"""
+        histories = {f"{600000 + offset:06d}": _flat(bars=30) for offset in range(120)}
+        messages: list[str] = []
+        attach_chip_factors(self._panel(), histories, progress=messages.append)
+        self.assertLess(len(messages), len(histories))
+        self.assertTrue(messages[-1].endswith(f"（{len(histories)}/{len(histories)}）"))
+
     def test_columns_exist_even_without_histories(self) -> None:
         panel, _ = attach_chip_factors(self._panel(), {})
         for column in CHIP_FACTOR_COLUMNS:

@@ -21,6 +21,7 @@ import numpy as np
 import pandas as pd
 
 from config import settings
+from services.progress import throttled
 
 LOGGER = logging.getLogger("quant.chip")
 
@@ -228,8 +229,10 @@ def attach_chip_factors(
     buffers = {column: result[column].to_numpy(dtype=float, copy=True) for column in CHIP_FACTOR_COLUMNS}
     computed = 0
     failures: list[str] = []
+    should_report = throttled(len(histories))
     for index, (code, history) in enumerate(histories.items()):
-        if progress:
+        # 逐只上报会在页面上写 5000 多次元素，这里按固定间隔上报、末条必报。
+        if progress and should_report(index):
             progress(f"正在计算 {code} 的筹码分布（{index + 1}/{len(histories)}）")
         try:
             factors, _, _ = chip_distribution(history)

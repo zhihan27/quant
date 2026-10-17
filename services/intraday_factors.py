@@ -23,6 +23,7 @@ import pandas as pd
 
 from config import settings
 from services.panel_store import PanelStore
+from services.progress import throttled
 
 LOGGER = logging.getLogger("quant.intraday_factors")
 
@@ -245,9 +246,10 @@ def load_intraday_factors(
     """
     frames: list[pd.DataFrame] = []
     empty: list[str] = []
+    should_report = throttled(len(codes))
     for index, code in enumerate(codes):
         code = str(code).zfill(6)
-        if progress and index % 50 == 0:
+        if progress and should_report(index):
             progress(f"正在汇总分钟线（{index + 1}/{len(codes)}）")
         bars = store.read_partition("intraday_bars", code)
         if bars is None or bars.empty:

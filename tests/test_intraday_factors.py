@@ -18,6 +18,9 @@ from services.intraday_factors import (
 from services.panel_store import PanelStore
 
 BARS_PER_BUCKET = 30
+# 事故当轮页面上的池子规模：5174 以内最后一个 50 的整倍数是 5150，
+# 只按整倍数上报时字幕会停在「5151/5174」。回归用例必须用这个规模才有鉴别力。
+POOL_SIZE = 5174
 
 
 def _bucket_times(day: str) -> list[pd.Timestamp]:
@@ -243,6 +246,20 @@ class PersistedBarsTests(unittest.TestCase):
         for column in ["date", "code", *INTRADAY_FACTOR_COLUMNS]:
             self.assertIn(column, factors.columns)
         self.assertIn("本地暂无分钟线", report["status"])
+
+    def test_progress_reaches_the_last_code(self) -> None:
+        """钉住「卡在 5151/5174」：节流不能把最后几只吞掉，末条必须是 N/N。
+
+        规模必须用事故当轮的真实池子：只按整倍数上报时，5174 以内最后一个整倍数是 5150，
+        末条停在 5151/5174，剩下 23 只被无声吞掉。若把池子取成 51 这种「末尾恰好是整倍数」
+        的规模，旧写法会凑巧打到最后一只，这条用例就废了。
+        """
+        codes = [f"{600000 + offset:06d}" for offset in range(POOL_SIZE)]
+        messages: list[str] = []
+        load_intraday_factors(self.store, codes, progress=messages.append)
+        self.assertEqual(messages[0], f"正在汇总分钟线（1/{POOL_SIZE}）")
+        self.assertEqual(messages[-1], f"正在汇总分钟线（{POOL_SIZE}/{POOL_SIZE}）")
+        self.assertLess(len(messages), len(codes))
 
     def test_reloaded_bars_keep_all_buckets(self) -> None:
         """落盘再读回后仍能算出 8 个区间，说明时间戳没有在存储环节丢失精度。"""
