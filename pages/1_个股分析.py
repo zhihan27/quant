@@ -12,6 +12,12 @@ from config import settings
 from services.backtest import run_backtest, save_backtest_run
 from services.database import DatabaseError
 from services.market_data import MarketDataError, completed_daily_history, history_is_current
+from services.ml_pipeline import (
+    historical_models_for_stock,
+    load_context,
+    load_context_by_id,
+)
+from services.model_catalog import saved_models
 from services.model_governance import current_model_status
 from services.rank_model import SCORE_KIND_RANK, objective_label
 from services.stock_scoring import analyze_stock
@@ -70,6 +76,32 @@ elif model_health["error"]:
     st.warning(f"{model_health['error']}；本次按未降级处理，模型评分正常输出。", icon=":material/warning:")
 
 service = get_market_data()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _model_catalog() -> list[dict[str, Any]]:
+    """模型目录 60 秒缓存：下拉框每次重跑都查库既慢又没必要。"""
+    return saved_models(get_repository())
+
+
+@st.cache_resource(max_entries=2, show_spinner=False)
+def _model_context(context_id: str) -> dict[str, Any] | None:
+    """只缓存最近选择的 2 个模型，避免切换选择时把几十兆上下文全留在内存。"""
+    context, _ = load_context_by_id(context_id, include_panel=False)
+    return context
+
+
+def _model_label(item: dict[str, Any]) -> str:
+    active = "【当前活动】" if item.get("is_active") else ""
+    reference = item.get("reference_date") or "截面未知"
+    objective = objective_label(item.get("objective_mode")) if item.get("objective_mode") else "目标未知"
+    window = item.get("training_window_days")
+    window_text = f"窗口 {window} 日" if window else "窗口不限"
+    passed = item.get("passed")
+    passed_text = "通过验证" if passed else ("未通过验证" if passed is False else "验证状态未知")
+    return f"{active}{reference} · {objective} · {window_text} · {passed_text}"
+
+
 if st.query_params.get("code") and st.session_state.get("query_code") != st.query_params.get("code"):
     st.session_state["stock_query"] = st.query_params.get("code", "")
     st.session_state["query_code"] = st.query_params.get("code")
@@ -130,6 +162,44 @@ else:
     selected_code = None
 
 if selected_code:
+    catalog: list[dict[str, Any]] = []
+    catalog_error = None
+    try:
+        catalog = _model_catalog()
+    except Exception as exc:  # 目录读不到不妨碍用活动模型继续分析
+        catalog_error = f"{type(exc).__name__}: {exc}"
+    catalog_by_id = {item["context_id"]: item for item in catalog}
+    option_ids = list(catalog_by_id) or [""]
+    default_id = next(
+        (item["context_id"] for item in catalog if item.get("is_active")), option_ids[0]
+    )
+    selected_model_id = st.selectbox(
+        "分析使用的模型",
+        option_ids,
+        index=option_ids.index(default_id),
+        format_func=lambda identifier: _model_label(catalog_by_id[identifier])
+        if identifier in catalog_by_id else "当前活动模型（目录中尚未登记）",
+        help="可以选择已保存的历史模型回看它在自己截面日期上的判断；旧模型不会给新数据打分。",
+    )
+    if catalog_error:
+        st.warning(f"模型目录暂不可用（{catalog_error}），本次只能使用当前活动模型。")
+
+    model_context = _model_context(selected_model_id) if selected_model_id else None
+    if selected_model_id and model_context is None:
+        st.warning("该模型文件已被清理或不完整，请重新选择；本次改用当前活动模型。")
+    if model_context is None:
+        model_context, _ = load_context(include_panel=False)
+        selected_model_id = (model_context or {}).get("context_id") or ""
+    selected_model = catalog_by_id.get(selected_model_id) or {}
+    if model_context:
+        st.caption(
+            f"本次分析使用模型 {(model_context.get('context_id') or '')[:12]} · "
+            f"训练截面 {model_context.get('reference_date') or '未知'} · "
+            f"{objective_label(model_context.get('objective_mode'))}"
+        )
+    else:
+        st.caption("当前没有可用模型；本次只展示传统因子观察。")
+
     action_columns = st.columns([2, 2, 6], vertical_alignment="center")
     run_analysis = action_columns[0].button("运行分析", type="primary", key="run_analysis", use_container_width=True)
     add_watch = action_columns[1].button("加入自选", key="analysis_add_watch", use_container_width=True)
@@ -137,6 +207,8 @@ if selected_code:
 else:
     run_analysis = False
     add_watch = False
+    model_context = None
+    selected_model = {}
     show_empty_state("从一只股票开始研究", "搜索股票 → 选择匹配结果 → 运行分析。分析完成后可查看图表、交易参考与回测。")
 
 if add_watch:
@@ -189,8 +261,14 @@ if run_analysis:
                 as_of=quote.get("quote_time") or quote.get("fetched_at"),
                 quote_status=quote.get("data_status"),
                 history_ready=history_is_current(completed, quote, daily_meta),
+                market_context=model_context,
                 scoring_paused=scoring_paused,
             )
+            data_date = (
+                pd.to_datetime(completed["date"]).max().strftime("%Y-%m-%d")
+                if not completed.empty and "date" in completed else None
+            )
+            used_model = model_context or {}
             st.session_state["stock_analysis"] = {
                 "code": selected_code,
                 "quote": quote,
@@ -201,6 +279,16 @@ if run_analysis:
                 "benchmark": benchmark,
                 "benchmark_status": benchmark_status,
                 "analysis": analysis,
+                "data_date": data_date,
+                "model": {
+                    "context_id": used_model.get("context_id"),
+                    "reference_date": used_model.get("reference_date"),
+                    "objective_mode": used_model.get("objective_mode"),
+                    "training_window_days": used_model.get("training_window_days"),
+                    "source": selected_model.get("source") or "active",
+                    "created_at": selected_model.get("created_at") or used_model.get("created_at"),
+                },
+                "historical_rows": historical_models_for_stock(model_context, selected_code),
             }
             task.step("分析结果已生成", 5, 5)
     except (MarketDataError, ValueError) as exc:
@@ -291,6 +379,38 @@ if state and state.get("code") == selected_code:
         )
         st.caption(analysis.get("fundamental_status", ""))
     with model_tab:
+        used_model = state.get("model") or {}
+        model_reference = used_model.get("reference_date")
+        data_date = state.get("data_date")
+        if used_model.get("context_id"):
+            st.caption(
+                f"本次使用模型 {str(used_model.get('context_id'))[:12]} · "
+                f"训练截面 {model_reference or '未知'} · "
+                f"{objective_label(used_model.get('objective_mode')) if used_model.get('objective_mode') else '目标未知'} · "
+                f"{'当前活动模型' if used_model.get('source') == 'active' else '已保存的历史模型'}"
+            )
+        if model_reference and data_date and model_reference != data_date:
+            st.warning(
+                f"该模型训练于 {model_reference} 日，不能为 {data_date} 日的数据打分；"
+                "下方“模型判断”不会给出当前日期的有效评分，"
+                "回看表展示的是它在训练截面日期对该股的原始判断。需要当前日期评分请先运行最新一轮采集与训练。",
+            )
+            historical_rows = state.get("historical_rows") or []
+            if historical_rows:
+                back_frame = pd.DataFrame(historical_rows).rename(columns={
+                    "model": "模型", "horizon": "预测周期（交易日）",
+                    "predicted_excess_return": "当时的预测值", "prediction_percentile": "当时同日百分位",
+                    "validated": "当时通过验证", "status": "当时状态",
+                })
+                st.caption("以下是该模型在训练截面日期对该股的判断，不是对当前日期的预测。")
+                st.dataframe(
+                    back_frame[["模型", "预测周期（交易日）", "当时的预测值", "当时同日百分位", "当时通过验证", "当时状态"]],
+                    hide_index=True, use_container_width=True,
+                )
+            else:
+                st.caption("该模型训练时的股票池不包含这只股票，因此没有可回看的判断。")
+        elif model_reference and data_date:
+            st.caption(f"模型截面日期与个股最新完整日线一致（{data_date}），下面是当日判断。")
         model_rows = []
         importance_rows = []
         for horizon, models in analysis["models"].items():

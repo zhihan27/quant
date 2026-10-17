@@ -29,6 +29,7 @@ from config import settings
 from services.data_cleaning import clean_daily_history
 from services.finance_network import FinanceNetwork, brief_network_error
 from services.panel_store import PanelStore
+from services.source_health import SourceHealth, is_network_failure
 
 
 class MarketDataError(RuntimeError):
@@ -113,10 +114,16 @@ class MarketDataService:
         self.session.mount("https://", HTTPAdapter(max_retries=Retry(total=0)))
         self.session.mount("http://", HTTPAdapter(max_retries=Retry(total=0)))
         self._request_gate = threading.BoundedSemaphore(settings.MAX_CONCURRENT_REQUESTS)
-        self._rate_lock = threading.Lock()
-        self._last_request_at = 0.0
+        # 节流状态按线程隔离：4 路采集时每个线程各自维持最小请求间隔，互不串行。
+        self._pace = threading.local()
         self._last_retries: dict[tuple[str, str], int] = {}
         self._history_tencent_until = 0.0
+        self._db_write_lock = threading.Lock()
+        self._health = SourceHealth()
+        self._universe_memory: dict[str, tuple[pd.DataFrame, dict[str, Any], float]] = {}
+        self._universe_retry_after: dict[str, float] = {}
+        self._universe_locks: dict[str, threading.Lock] = {}
+        self._universe_meta_lock = threading.Lock()
         self.session.headers.update(
             {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
@@ -126,6 +133,65 @@ class MarketDataService:
         self.network = FinanceNetwork(self.session, self.logger)
         self._init_db()
         self.logger.info("market_data service started proxy=%s", self.proxy_configuration())
+
+    def _thread_pacer(self) -> threading.local:
+        """惰性创建线程本地节流状态，兼容测试里 `__new__` 构造的实例。"""
+        pacer = getattr(self, "_pace", None)
+        if pacer is None:
+            pacer = threading.local()
+            self._pace = pacer
+        return pacer
+
+    def _write_lock(self) -> threading.Lock:
+        lock = getattr(self, "_db_write_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._db_write_lock = lock
+        return lock
+
+    def _source_health(self) -> SourceHealth:
+        health = getattr(self, "_health", None)
+        if health is None:
+            health = SourceHealth()
+            self._health = health
+        return health
+
+    @staticmethod
+    def _source_key(url: str) -> str:
+        """熔断按接口而不是供应商聚合：日线故障不该连累报价接口。"""
+        for prefix, key in (
+            (settings.EASTMONEY_QUOTE_URL, "eastmoney.quote"),
+            (settings.EASTMONEY_KLINE_URL, "eastmoney.kline"),
+            (settings.EASTMONEY_LIST_URL, "eastmoney.list"),
+            (settings.TENCENT_KLINE_URL, "tencent.kline"),
+        ):
+            if url.startswith(prefix):
+                return key
+        if url.startswith("https://hq.sinajs.cn/"):
+            return "sina.quote"
+        if "vip.stock.finance.sina.com.cn" in url:
+            return "sina.universe"
+        return MarketDataService._interface_name(url)
+
+    def _pace_request(self) -> None:
+        """同一线程两次请求起点至少间隔 REQUEST_INTERVAL_SECONDS。
+
+        多线程采集时这是每线程的节流：聚合速率上限约为线程数 / 间隔。
+        间隔每次实时读取 settings，测试把它 patch 成 0 时立即返回。
+        """
+        interval = float(settings.REQUEST_INTERVAL_SECONDS)
+        pacer = self._thread_pacer()
+        last = getattr(pacer, "last_request_at", 0.0)
+        now = time.monotonic()
+        wait = interval - (now - last)
+        if wait > 0:
+            time.sleep(wait)
+            now = time.monotonic()
+        pacer.last_request_at = now
+
+    def source_health_snapshot(self) -> dict[str, dict[str, Any]]:
+        """各行情接口的熔断状态，供页面诊断与日志使用（不含请求参数）。"""
+        return self._source_health().snapshot()
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -182,13 +248,16 @@ class MarketDataService:
     def _write_cache(self, key: str, payload: Any) -> str:
         fetched_at = _now_text()
         encoded = json.dumps(payload, ensure_ascii=False, allow_nan=False)
-        with self._connect() as connection:
-            connection.execute(
-                "INSERT INTO cache_items(cache_key, payload, fetched_at) VALUES (?, ?, ?) "
-                "ON CONFLICT(cache_key) DO UPDATE SET payload=excluded.payload, "
-                "fetched_at=excluded.fetched_at",
-                (key, encoded, fetched_at),
-            )
+        # 并发采集会同时刷新多只股票的历史缓存；JSON 编码放在锁外，
+        # 只把 SQLite 写入串行化，避免 4 个写者同时写大 payload 时撞 database is locked。
+        with self._write_lock():
+            with self._connect() as connection:
+                connection.execute(
+                    "INSERT INTO cache_items(cache_key, payload, fetched_at) VALUES (?, ?, ?) "
+                    "ON CONFLICT(cache_key) DO UPDATE SET payload=excluded.payload, "
+                    "fetched_at=excluded.fetched_at",
+                    (key, encoded, fetched_at),
+                )
         return fetched_at
 
     @staticmethod
@@ -331,50 +400,57 @@ class MarketDataService:
     ) -> requests.Response:
         interface = self._interface_name(url)
         stock_code = str(code or params.get("secid") or params.get("symbol") or "股票池")
-        last_error: Exception | None = None
-        for attempt in range(1, settings.REQUEST_RETRIES + 2):
-            with self._request_gate:
-                with self._rate_lock:
-                    wait = settings.REQUEST_INTERVAL_SECONDS - (time.monotonic() - self._last_request_at)
-                    if wait > 0:
-                        time.sleep(wait)
-                    self._last_request_at = time.monotonic()
-                started = time.perf_counter()
-                try:
-                    response = self.network.get(
-                        url, params=params,
-                        timeout=(settings.REQUEST_CONNECT_TIMEOUT_SECONDS, settings.REQUEST_READ_TIMEOUT_SECONDS),
-                        headers=headers,
-                    )
-                    response.raise_for_status()
-                    elapsed_ms = (time.perf_counter() - started) * 1000
-                    self._last_retries[(interface, stock_code)] = attempt - 1
-                    self._record_request_event(interface, stock_code, elapsed_ms, None, attempt - 1, True, None)
-                    self.logger.info(
-                        "request success interface=%s code=%s elapsed_ms=%.1f retries=%s",
-                        interface, stock_code, elapsed_ms, attempt - 1,
-                    )
-                    return response
-                except requests.RequestException as exc:
-                    last_error = exc
-                    elapsed_ms = (time.perf_counter() - started) * 1000
-                    status_code = getattr(getattr(exc, "response", None), "status_code", None)
-                    retryable = status_code is None or status_code == 429 or status_code >= 500
-                    # 历史源主动断开且直连也未恢复时立即换源，避免重复等待同一故障。
-                    if url == settings.EASTMONEY_KLINE_URL and "RemoteDisconnected" in str(exc):
-                        retryable = False
-                    self._last_retries[(interface, stock_code)] = attempt - 1
-                    self._record_request_event(
-                        interface, stock_code, elapsed_ms, type(exc).__name__, attempt - 1, False, str(exc)
-                    )
-                    self.logger.warning(
-                        "request failure interface=%s code=%s elapsed_ms=%.1f exception=%s retries=%s detail=%s",
-                        interface, stock_code, elapsed_ms, type(exc).__name__, attempt - 1, str(exc)[:300],
-                    )
-            if not retryable or attempt > settings.REQUEST_RETRIES:
-                raise last_error
-            time.sleep(settings.RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1)))
-        raise MarketDataError(f"请求失败：{last_error}") from last_error
+        source_key = self._source_key(url)
+        health = self._source_health()
+        if not health.allow(source_key):
+            raise MarketDataError(f"数据源暂时熔断（{source_key}），本轮直接改用备用源。")
+        try:
+            last_error: Exception | None = None
+            for attempt in range(1, settings.REQUEST_RETRIES + 2):
+                with self._request_gate:
+                    self._pace_request()
+                    started = time.perf_counter()
+                    try:
+                        response = self.network.get(
+                            url, params=params,
+                            timeout=(settings.REQUEST_CONNECT_TIMEOUT_SECONDS, settings.REQUEST_READ_TIMEOUT_SECONDS),
+                            headers=headers,
+                        )
+                        response.raise_for_status()
+                        elapsed_ms = (time.perf_counter() - started) * 1000
+                        self._last_retries[(interface, stock_code)] = attempt - 1
+                        health.record_success(source_key)
+                        self._record_request_event(interface, stock_code, elapsed_ms, None, attempt - 1, True, None)
+                        self.logger.info(
+                            "request success interface=%s code=%s elapsed_ms=%.1f retries=%s",
+                            interface, stock_code, elapsed_ms, attempt - 1,
+                        )
+                        return response
+                    except requests.RequestException as exc:
+                        last_error = exc
+                        elapsed_ms = (time.perf_counter() - started) * 1000
+                        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+                        retryable = status_code is None or status_code == 429 or status_code >= 500
+                        # 历史源主动断开且直连也未恢复时立即换源，避免重复等待同一故障。
+                        if url == settings.EASTMONEY_KLINE_URL and "RemoteDisconnected" in str(exc):
+                            retryable = False
+                        self._last_retries[(interface, stock_code)] = attempt - 1
+                        self._record_request_event(
+                            interface, stock_code, elapsed_ms, type(exc).__name__, attempt - 1, False, str(exc)
+                        )
+                        self.logger.warning(
+                            "request failure interface=%s code=%s elapsed_ms=%.1f exception=%s retries=%s detail=%s",
+                            interface, stock_code, elapsed_ms, type(exc).__name__, attempt - 1, str(exc)[:300],
+                        )
+                if not retryable or attempt > settings.REQUEST_RETRIES:
+                    # 一次逻辑请求只记一次熔断结果：重试三次不等于三次故障。
+                    if is_network_failure(last_error):
+                        health.record_failure(source_key)
+                    raise last_error
+                time.sleep(settings.RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1)))
+            raise MarketDataError(f"请求失败：{last_error}") from last_error
+        finally:
+            health.release_probe(source_key)
 
     def _get_json(self, url: str, params: dict[str, Any], code: str | None = None) -> dict[str, Any]:
         response = self._request_response(url, params, code)
@@ -672,6 +748,7 @@ class MarketDataService:
         adjusted: bool = True,
         market_id: int | None = None,
         force_refresh: bool = False,
+        expected_latest_trading_date: str | None = None,
     ) -> tuple[pd.DataFrame, dict[str, Any]]:
         code = _clean_code(code)
         if period not in ("daily", "weekly"):
@@ -807,6 +884,29 @@ class MarketDataService:
                 ttl = -1
         if force_refresh:
             ttl = -1
+        # 没有新交易日、且缓存抓取已晚于该交易日收盘时，直接复用前复权历史。
+        # 一旦缓存最新 K 线早于预期交易日（出现新交易日），保持原有整段替换逻辑。
+        if (
+            ttl < 0 and not force_refresh and cached is not None and expected_latest_trading_date
+            and settings.HISTORY_CACHE_REUSE_AFTER_CLOSE
+        ):
+            payload, fetched = cached
+            rows_for_reuse = payload.get("rows", []) if isinstance(payload, dict) else payload
+            latest_text = max(
+                (str(row.get("date", ""))[:10] for row in rows_for_reuse if isinstance(row, dict)),
+                default="",
+            )
+            try:
+                expected_day = pd.Timestamp(str(expected_latest_trading_date)[:10]).date()
+            except (TypeError, ValueError):
+                expected_day = None
+            fetched_local = fetched.astimezone(ZoneInfo("Asia/Shanghai"))
+            expected_close = datetime.combine(
+                expected_day, datetime_time(15, 0), tzinfo=ZoneInfo("Asia/Shanghai")
+            ) if expected_day else None
+            if latest_text and expected_day is not None and expected_close is not None:
+                if latest_text >= expected_day.isoformat() and fetched_local >= expected_close:
+                    ttl = 10 ** 9
         try:
             payload, meta = self._request_with_cache(cache_key, ttl, load_rows)
         except (MarketDataError, requests.RequestException, ValueError, KeyError, TypeError) as exc:
@@ -852,7 +952,7 @@ class MarketDataService:
         )
         # 列式面板作为派生产物写穿保存；写入失败不影响已取得的行情，但必须显式记录。
         try:
-            self.panels.write_history(code, frame, "qfq" if adjusted else "raw", meta)
+            self.panels.write_history(code, frame, "qfq" if adjusted else "raw", meta, period=period)
             meta["panel_store"] = "已写入 Parquet 列式面板"
         except (OSError, ValueError, ImportError) as exc:
             meta["panel_store"] = f"Parquet 写入失败：{type(exc).__name__}"
@@ -975,78 +1075,175 @@ finally:
     session.close()
 """
         interface = "Sina.stock_zh_a_daily"
-        last_error: Exception | None = None
-        for attempt in range(1, settings.REQUEST_RETRIES + 2):
-            with self._request_gate:
-                with self._rate_lock:
-                    wait = settings.REQUEST_INTERVAL_SECONDS - (time.monotonic() - self._last_request_at)
-                    if wait > 0:
-                        time.sleep(wait)
-                    self._last_request_at = time.monotonic()
-                started = time.perf_counter()
-                try:
-                    completed = subprocess.run(
-                        [sys.executable, "-X", "utf8", "-c", script], capture_output=True, check=True,
-                        encoding="utf-8", text=True, timeout=settings.SINA_HISTORY_TIMEOUT_SECONDS,
-                        cwd=settings.PROJECT_ROOT,
-                    )
-                    output_lines = [line for line in completed.stdout.splitlines() if line.strip()]
-                    records = json.loads(output_lines[-1]) if output_lines else []
-                    frame = pd.DataFrame(records)
-                    if frame.empty:
-                        raise MarketDataError("新浪财经未返回日线记录。")
-                    frame = frame.rename(columns={"turnover": "turnover_rate"})
-                    for column in ("open", "high", "low", "close", "volume", "amount", "turnover_rate"):
-                        if column in frame:
-                            frame[column] = pd.to_numeric(frame[column], errors="coerce")
-                    if "volume" in frame:
-                        frame["volume"] = frame["volume"] / 100
-                    if "turnover_rate" in frame:
-                        frame["turnover_rate"] = frame["turnover_rate"] * 100
-                    frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
-                    frame = frame.dropna(subset=["date", "close"]).sort_values("date")
-                    if period == "weekly":
-                        frame = frame.set_index("date").resample("W-FRI").agg(
-                            {"open": "first", "high": "max", "low": "min",
-                             "close": "last", "volume": "sum", "amount": "sum",
-                             "turnover_rate": "mean"}
-                        ).dropna(subset=["close"]).reset_index()
-                    frame["change"] = frame["close"].diff()
-                    frame["pct_change"] = frame["close"].pct_change() * 100
-                    frame["amplitude"] = (frame["high"] - frame["low"]) / frame["close"] * 100
-                    result = frame.dropna(subset=["date", "close"]).tail(1500)
-                    result["date"] = result["date"].dt.strftime("%Y-%m-%d")
-                    rows = result.astype(object).where(pd.notna(result), None).to_dict("records")
-                    elapsed_ms = (time.perf_counter() - started) * 1000
-                    self._record_request_event(interface, code, elapsed_ms, None, attempt - 1, True, None)
-                    self.logger.info(
-                        "request success interface=%s code=%s elapsed_ms=%.1f retries=%s",
-                        interface, code, elapsed_ms, attempt - 1,
-                    )
-                    return rows
-                except (
-                    subprocess.TimeoutExpired, subprocess.CalledProcessError, json.JSONDecodeError,
-                    MarketDataError, ValueError, KeyError, TypeError,
-                ) as exc:
-                    last_error = exc
-                    elapsed_ms = (time.perf_counter() - started) * 1000
-                    detail = self._exception_detail(exc, "新浪财经备用日线失败")
-                    self._record_request_event(
-                        interface, code, elapsed_ms, type(exc).__name__, attempt - 1, False, str(detail)
-                    )
-                    self.logger.warning(
-                        "request failure interface=%s code=%s elapsed_ms=%.1f exception=%s retries=%s detail=%s",
-                        interface, code, elapsed_ms, type(exc).__name__, attempt - 1, str(detail)[:300],
-                    )
-            if attempt <= settings.REQUEST_RETRIES:
-                time.sleep(settings.RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1)))
-        raise MarketDataError(f"{interface} 获取失败：{brief_network_error(last_error)}") from last_error
+        source_key = "sina.history"
+        health = self._source_health()
+        if not health.allow(source_key):
+            raise MarketDataError("新浪备用日线源暂时熔断，本轮直接跳过。")
+        try:
+            last_error: Exception | None = None
+            for attempt in range(1, settings.REQUEST_RETRIES + 2):
+                with self._request_gate:
+                    self._pace_request()
+                    started = time.perf_counter()
+                    try:
+                        completed = subprocess.run(
+                            [sys.executable, "-X", "utf8", "-c", script], capture_output=True, check=True,
+                            encoding="utf-8", text=True, timeout=settings.SINA_HISTORY_TIMEOUT_SECONDS,
+                            cwd=settings.PROJECT_ROOT,
+                        )
+                        output_lines = [line for line in completed.stdout.splitlines() if line.strip()]
+                        records = json.loads(output_lines[-1]) if output_lines else []
+                        frame = pd.DataFrame(records)
+                        if frame.empty:
+                            raise MarketDataError("新浪财经未返回日线记录。")
+                        frame = frame.rename(columns={"turnover": "turnover_rate"})
+                        for column in ("open", "high", "low", "close", "volume", "amount", "turnover_rate"):
+                            if column in frame:
+                                frame[column] = pd.to_numeric(frame[column], errors="coerce")
+                        if "volume" in frame:
+                            frame["volume"] = frame["volume"] / 100
+                        if "turnover_rate" in frame:
+                            frame["turnover_rate"] = frame["turnover_rate"] * 100
+                        frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+                        frame = frame.dropna(subset=["date", "close"]).sort_values("date")
+                        if period == "weekly":
+                            frame = frame.set_index("date").resample("W-FRI").agg(
+                                {"open": "first", "high": "max", "low": "min",
+                                 "close": "last", "volume": "sum", "amount": "sum",
+                                 "turnover_rate": "mean"}
+                            ).dropna(subset=["close"]).reset_index()
+                        frame["change"] = frame["close"].diff()
+                        frame["pct_change"] = frame["close"].pct_change() * 100
+                        frame["amplitude"] = (frame["high"] - frame["low"]) / frame["close"] * 100
+                        result = frame.dropna(subset=["date", "close"]).tail(1500)
+                        result["date"] = result["date"].dt.strftime("%Y-%m-%d")
+                        rows = result.astype(object).where(pd.notna(result), None).to_dict("records")
+                        elapsed_ms = (time.perf_counter() - started) * 1000
+                        health.record_success(source_key)
+                        self._record_request_event(interface, code, elapsed_ms, None, attempt - 1, True, None)
+                        self.logger.info(
+                            "request success interface=%s code=%s elapsed_ms=%.1f retries=%s",
+                            interface, code, elapsed_ms, attempt - 1,
+                        )
+                        return rows
+                    except (
+                        subprocess.TimeoutExpired, subprocess.CalledProcessError, json.JSONDecodeError,
+                        MarketDataError, ValueError, KeyError, TypeError,
+                    ) as exc:
+                        last_error = exc
+                        elapsed_ms = (time.perf_counter() - started) * 1000
+                        detail = self._exception_detail(exc, "新浪财经备用日线失败")
+                        self._record_request_event(
+                            interface, code, elapsed_ms, type(exc).__name__, attempt - 1, False, str(detail)
+                        )
+                        self.logger.warning(
+                            "request failure interface=%s code=%s elapsed_ms=%.1f exception=%s retries=%s detail=%s",
+                            interface, code, elapsed_ms, type(exc).__name__, attempt - 1, str(detail)[:300],
+                        )
+                if attempt <= settings.REQUEST_RETRIES:
+                    time.sleep(settings.RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1)))
+            if isinstance(last_error, (subprocess.TimeoutExpired, subprocess.CalledProcessError)):
+                health.record_failure(source_key)
+            raise MarketDataError(f"{interface} 获取失败：{brief_network_error(last_error)}") from last_error
+        finally:
+            health.release_probe(source_key)
+
+    def _universe_state(
+        self,
+    ) -> tuple[
+        dict[str, tuple[pd.DataFrame, dict[str, Any], float]],
+        dict[str, float],
+        dict[str, threading.Lock],
+        threading.Lock,
+    ]:
+        """惰性初始化股票池快照状态，兼容测试里 `__new__` 构造的实例。"""
+        memory = getattr(self, "_universe_memory", None)
+        if memory is None:
+            memory = {}
+            self._universe_memory = memory
+        retry_after = getattr(self, "_universe_retry_after", None)
+        if retry_after is None:
+            retry_after = {}
+            self._universe_retry_after = retry_after
+        locks = getattr(self, "_universe_locks", None)
+        if locks is None:
+            locks = {}
+            self._universe_locks = locks
+        meta_lock = getattr(self, "_universe_meta_lock", None)
+        if meta_lock is None:
+            meta_lock = threading.Lock()
+            self._universe_meta_lock = meta_lock
+        return memory, retry_after, locks, meta_lock
+
+    def _universe_snapshot(self, scope: str) -> tuple[pd.DataFrame, dict[str, Any]] | None:
+        memory, _, _, _ = self._universe_state()
+        entry = memory.get(scope)
+        if entry is None:
+            return None
+        frame, meta, stored_at = entry
+        if time.monotonic() - stored_at >= settings.UNIVERSE_CACHE_SECONDS:
+            memory.pop(scope, None)
+            return None
+        return frame, meta
+
+    def _remember_universe(self, scope: str, frame: pd.DataFrame, meta: dict[str, Any]) -> None:
+        """按来源抓取时间记快照，避免内存缓存把已过半的磁盘 TTL 再续一整轮。"""
+        age = 0.0
+        try:
+            fetched = datetime.fromisoformat(str(meta.get("fetched_at")))
+            age = max(0.0, (datetime.now(fetched.tzinfo) - fetched).total_seconds())
+        except (TypeError, ValueError):
+            pass
+        memory, _, _, _ = self._universe_state()
+        memory[scope] = (frame.copy(), dict(meta), time.monotonic() - age)
+
+    def _universe_lock_for(self, scope: str) -> threading.Lock:
+        _, _, locks, meta_lock = self._universe_state()
+        with meta_lock:
+            lock = locks.get(scope)
+            if lock is None:
+                lock = threading.Lock()
+                locks[scope] = lock
+            return lock
 
     def get_universe(
         self, scope: str = "all", force_refresh: bool = False
     ) -> tuple[pd.DataFrame, dict[str, Any]]:
+        """股票池单飞读取：同一轮扫描的并发线程共用一份快照，且只真正刷新一次。
+
+        返回副本：`services/scanning.py::candidate_codes` 会原地加列并过滤，共享同一个
+        DataFrame 会让后一个调用方看到前一个调用方的中间状态。
+        """
         if scope not in ("all", "main", "chinext", "star", "bj"):
             raise ValueError("scope 必须是 all、main、chinext、star 或 bj。")
+        _, retry_after, _, _ = self._universe_state()
+        if not force_refresh:
+            snapshot = self._universe_snapshot(scope)
+            if snapshot is not None:
+                frame, meta = snapshot
+                return frame.copy(), dict(meta)
+            blocked_until = retry_after.get(scope, 0.0)
+            if blocked_until > time.monotonic():
+                wait = max(1, int(blocked_until - time.monotonic()))
+                raise MarketDataError(f"股票池刷新连续失败，{wait} 秒内不重复请求；请稍后重试。")
+        with self._universe_lock_for(scope):
+            if not force_refresh:
+                snapshot = self._universe_snapshot(scope)
+                if snapshot is not None:
+                    frame, meta = snapshot
+                    return frame.copy(), dict(meta)
+            try:
+                frame, meta = self._load_universe(scope, force_refresh)
+            except MarketDataError:
+                retry_after[scope] = time.monotonic() + 30
+                raise
+            retry_after.pop(scope, None)
+            self._remember_universe(scope, frame, meta)
+            return frame.copy(), dict(meta)
+
+    def _load_universe(
+        self, scope: str, force_refresh: bool
+    ) -> tuple[pd.DataFrame, dict[str, Any]]:
         cache_key = f"universe:{scope}"
         cached = None if force_refresh else self._cache_result(
             cache_key, settings.UNIVERSE_CACHE_SECONDS, allow_stale=False

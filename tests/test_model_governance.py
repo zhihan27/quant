@@ -727,6 +727,62 @@ class ModelGovernanceDatabaseTests(unittest.TestCase):
         self.assertEqual(summary["validation_rows"], 0)
         self.assertEqual(summary["feature_rows"], 0)
 
+    def test_staged_scan_validates_before_publish_and_registers_snapshot_lineage(self):
+        """真实落盘与落库：日期错配保留旧版本，通过后归档并能从模型目录加载。"""
+        from services.ml_pipeline import load_context_by_id
+        from services.model_catalog import saved_models
+        from services.panel_store import PanelStore
+        from services.scan_pipeline import FULL_MARKET_POOL_MODE, ScanOptions, collect_scan_snapshot, train_scan_snapshot
+        from tests.test_staged_scan import _FakeService
+
+        self._archive("ctx-old")
+        service = _FakeService(PanelStore(self.data_dir / "panel"), reference="2026-10-16")
+        candidates = [{"code": f"{600000 + index:06d}", "name": "样本"} for index in range(6)]
+        options = ScanOptions(pool_mode=FULL_MARKET_POOL_MODE, enable_neutralization=False, use_extra_factors=False)
+        panel = self._panel()
+        context = self._scan_context(panel)
+        context.update(
+            context_id="a" * 32, reference_date="2026-10-15",
+            created_at="2026-10-17T10:00:00+08:00", neutralization={"status": "未启用"},
+            extra_factors={}, limitation="隔离测试", universe_codes=[item["code"] for item in candidates],
+            reference_closes={item["code"]: 13.99 for item in candidates},
+        )
+        panel.attrs["context_id"] = context["context_id"]
+        persisted = []
+
+        def train(histories, benchmark, **kwargs):
+            persisted.append(kwargs["persist"])
+            kwargs["panel_out"]["panel"] = panel
+            context["source"] = kwargs["metadata"]
+            return context
+
+        def analyze(history, **kwargs):
+            return {"latest_features": {}, "models": {20: []}, "trade_plan": {}, "factor_score": 50.0}
+
+        with mock.patch.object(settings, "ACQUISITION_DIR", self.data_dir / "acquisitions"), mock.patch(
+            "services.scan_pipeline.collect_candidates", return_value=(candidates, {}),
+        ), mock.patch("services.scan_pipeline.train_market_context", side_effect=train), mock.patch(
+            "services.scan_pipeline.analyze_stock", side_effect=analyze,
+        ):
+            snapshot = collect_scan_snapshot(service, options)
+            with self.assertRaisesRegex(ValueError, "不一致"):
+                train_scan_snapshot(service, options, snapshot.snapshot_id, governance=ScanGovernance(self.repository))
+            self.assertEqual(self._active_context_id(), "ctx-old")
+            self.assertEqual(set(self._registry()), {"ctx-old"})
+
+            context["reference_date"] = snapshot.reference_date
+            train_scan_snapshot(service, options, snapshot.snapshot_id, governance=ScanGovernance(self.repository))
+            self.assertEqual(persisted, [False, False])
+            self.assertEqual(self._active_context_id(), context["context_id"])
+            row = self._registry()[context["context_id"]]
+            self.assertEqual(row["details"]["source_snapshot_id"], snapshot.snapshot_id)
+            self.assertTrue(row["is_active"])
+            catalog = {item["context_id"]: item for item in saved_models(self.repository)}
+            self.assertEqual(catalog[context["context_id"]]["source_snapshot_id"], snapshot.snapshot_id)
+            archived, archived_panel = load_context_by_id(context["context_id"], include_panel=True)
+            self.assertEqual(archived["reference_date"], snapshot.reference_date)
+            self.assertEqual(archived_panel.attrs["context_id"], context["context_id"])
+
 
 if __name__ == "__main__":
     unittest.main()

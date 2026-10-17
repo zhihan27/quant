@@ -233,7 +233,9 @@ class AuthDatabaseTests(unittest.TestCase):
             app.run()
             app.switch_page(selection_page).run()
             self.assertFalse(app.exception)
-            self.assertNotIn("开始扫描", [button.label for button in app.button])
+            buttons = [button.label for button in app.button]
+            self.assertNotIn("① 采集股票池数据", buttons)
+            self.assertNotIn("② 训练模型并生成排名", buttons)
             # 收走扫描权不等于收走结果：只读视图必须看得到最近一次排名。
             self.assertTrue(any("最近一次扫描" in item.value for item in app.info))
 
@@ -241,7 +243,9 @@ class AuthDatabaseTests(unittest.TestCase):
             app.run()
             app.switch_page(selection_page).run()
             self.assertFalse(app.exception)
-            self.assertIn("开始扫描", [button.label for button in app.button])
+            buttons = [button.label for button in app.button]
+            self.assertIn("① 采集股票池数据", buttons)
+            self.assertIn("② 训练模型并生成排名", buttons)
 
     def test_read_only_view_renders_the_persisted_result_for_everyone(self):
         """收走扫描权不等于收走结果：只读账号必须真能把落盘的那一版排名渲染出来。"""
@@ -296,9 +300,9 @@ class AuthDatabaseTests(unittest.TestCase):
                 self.assertTrue(any("每日定时任务" in text for text in captions), captions[:3])
                 self.assertTrue(any("截面日期 2026-10-15" in text for text in captions), captions[:3])
                 self.assertIn("600000", list(app.dataframe[0].value["代码"]))
-                # 组合汇总也必须渲染得出来：明细被落盘剔除了，页面不能因此整块消失。
-                self.assertTrue(any("每个交易日按评分买前" in text for text in captions))
-                self.assertTrue(any("跑赢 13.00 个百分点" in item.value for item in app.info))
+                # 只读页面应保留落盘结果的失败统计和血缘说明。
+                self.assertTrue(any("失败或排除 302 只" in text for text in captions))
+                self.assertTrue(any("测试血缘说明" in text for text in captions))
                 self.assertFalse(any("KeyError" in str(item.value) for item in app.warning))
 
     def test_pending_account_cannot_log_in_before_activation(self):

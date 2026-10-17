@@ -71,6 +71,18 @@ class PanelStoreTests(unittest.TestCase):
         self.assertIn("engine", summary)
         self.assertTrue(summary["engine"])
 
+    def test_weekly_history_does_not_replace_daily_history(self):
+        daily = _history(days=400)
+        weekly = daily.copy()
+        weekly["date"] = pd.date_range(end=daily["date"].max(), periods=400, freq="W-FRI")
+        self.store.write_history("600000", daily)
+        self.store.write_history("600000", weekly, period="weekly")
+        pd.testing.assert_series_equal(self.store.read_history("600000")["date"], daily["date"])
+        restored = self.store.read_history("600000", period="weekly")
+        self.assertEqual(restored.attrs["history_period"], "weekly")
+        self.assertEqual(restored["date"].diff().dt.days.median(), 7)
+        self.assertNotEqual(self.store.history_path("600000"), self.store.history_path("600000", period="weekly"))
+
     def test_cross_section_zscore_matches_pandas_implementation(self):
         panel = _panel(day_count=6, stock_count=10)
         columns = ["momentum_5", "momentum_20", "volatility_20"]

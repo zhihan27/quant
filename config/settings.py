@@ -1,4 +1,23 @@
+import os
+import warnings
 from pathlib import Path
+
+
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    """读取整数环境变量；非法值回落默认值，不因配置手误阻塞整个应用启动。"""
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        warnings.warn(f"环境变量 {name}={raw!r} 不是整数，已使用默认值 {default}。", RuntimeWarning)
+        return default
+    if value < minimum:
+        warnings.warn(f"环境变量 {name}={value} 小于下限 {minimum}，已使用下限。", RuntimeWarning)
+        return minimum
+    return value
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = PROJECT_ROOT / "data"
@@ -19,7 +38,11 @@ REQUEST_CONNECT_TIMEOUT_SECONDS = 5
 REQUEST_READ_TIMEOUT_SECONDS = 10
 REQUEST_RETRIES = 2
 RETRY_BACKOFF_SECONDS = 0.5
-MAX_CONCURRENT_REQUESTS = 1
+# 同时在途的行情请求数，也是扫描采集的默认线程数。4 路起步：若接口失败率上升，
+# 先调小本值或调大 REQUEST_INTERVAL_SECONDS，不得以减少样本或放宽验证换取速度。
+MAX_CONCURRENT_REQUESTS = _env_int("QUANT_MAX_CONCURRENT_REQUESTS", 4)
+# 采集工作线程数；运行时还会钳到 MAX_CONCURRENT_REQUESTS 以内，防止排队线程放大尝试速率。
+SCAN_COLLECTION_WORKERS = _env_int("QUANT_SCAN_COLLECTION_WORKERS", MAX_CONCURRENT_REQUESTS)
 LIST_PAGE_SIZE = 100
 AKSHARE_SPOT_TIMEOUT_SECONDS = 35
 SINA_HISTORY_TIMEOUT_SECONDS = 20
@@ -30,7 +53,14 @@ UNIVERSE_CACHE_SECONDS = 900
 # 仅用于代码和名称检索，过期目录不会被当作实时行情使用。
 STOCK_DIRECTORY_STALE_SECONDS = 7 * 24 * 60 * 60
 HISTORY_CACHE_SECONDS = 21600
+# 同一交易日、且缓存抓取时间已晚于该日收盘（15:00）时复用前复权历史，
+# 不再整段重取；一旦出现新交易日仍整段替换，保证除权除息改写能被捕获。
+HISTORY_CACHE_REUSE_AFTER_CLOSE = True
+# 每个工作线程两次请求起点的最小间隔；4 线程聚合上限约 16 次/秒。
 REQUEST_INTERVAL_SECONDS = 0.25
+# 数据源熔断：一次逻辑请求重试耗尽后计 1 次网络失败，连续到达阈值即暂停该接口。
+SOURCE_FAILURE_THRESHOLD = 3
+SOURCE_COOLDOWN_SECONDS = 300
 MINIMUM_SCAN_HISTORY_BARS = 320
 MINIMUM_EXPECTED_A_SHARE_UNIVERSE = 4000
 # 交易所号段。2026 年创业板启用 302 号段，新股发行还会继续扩充号段，
@@ -68,6 +98,9 @@ DEFAULT_OBJECTIVE_MODE = "lambdarank"
 RANK_GRADE_COUNT = 5
 # 滚动窗口：每次重训只用最近 N 个交易日，自适应风格切换；0 表示不限制。
 TRAINING_WINDOW_DAYS = 750
+# 单个估计器的训练线程数。两个模型仍顺序训练、不同时占满 CPU；
+# 内存吃紧或需要与网页进程错峰时，用环境变量调小。
+TRAINING_N_JOBS = _env_int("QUANT_TRAINING_N_JOBS", max(1, min(8, os.cpu_count() or 1)))
 # 前向滚动验证的最短训练期，低于该值不产生该折模型。
 WALK_FORWARD_RETRAIN_DAYS = 20
 # NDCG 诊断的截断比例（前 20% 截面）。
@@ -107,6 +140,13 @@ DAILY_SCAN = {
 # 落盘保留的展示行数：只存页面要渲染的表格，不存全池逐股分析结果。
 DAILY_SCAN_TOP_ROWS = 100
 DAILY_SCAN_LOG_MAX_BYTES = 5_000_000
+
+# 分阶段采集：每次采集写一个可续跑的快照目录（清单 + 冻结基准/暴露/因子），
+# 训练只消费快照，不再重复下载行情。快照不复制逐股历史，历史仍引用 PanelStore。
+ACQUISITION_DIR = DATA_DIR / "acquisitions"
+ACQUISITION_SNAPSHOT_LIMIT = _env_int("QUANT_ACQUISITION_SNAPSHOT_LIMIT", 3)
+# 个股分析页模型下拉最多列出多少条已保存模型。
+MODEL_CATALOG_LIMIT = 20
 
 # 股票池状态：退市与 ST 名单来自交易所公开接口，缓存一天，避免每次扫描重复拉取。
 UNIVERSE_REFERENCE_TIMEOUT_SECONDS = 180

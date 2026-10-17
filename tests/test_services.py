@@ -1,11 +1,16 @@
 """验证因子、信号、回测约束及统计模块的基础行为。"""
 
+import json
+import threading
+import time
 import unittest
 import sqlite3
 import tempfile
 from contextlib import closing
+from datetime import datetime, time as datetime_time, timedelta
 from pathlib import Path
 from unittest.mock import Mock, patch
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -43,6 +48,33 @@ def _history(count: int = 420) -> pd.DataFrame:
             "turnover_rate": 1.0,
         }
     )
+
+
+SHANGHAI = ZoneInfo("Asia/Shanghai")
+
+
+def _daily_rows(dates: list[str]) -> list[dict[str, object]]:
+    return [
+        {
+            "date": date, "open": 10.0, "close": 10.1, "high": 10.2, "low": 9.9,
+            "volume": 1000.0, "amount": 10000.0,
+        }
+        for date in dates
+    ]
+
+
+def _seed_history_cache(
+    service: MarketDataService, code: str, rows: list[dict[str, object]], fetched_at: str, count: int = 5
+) -> None:
+    """直接写入带指定抓取时间的历史缓存，用于验证交易日复用与收盘前后边界。"""
+    key = f"history:v2:{code}:daily:{count}:1:1"
+    payload = {"rows": rows, "source": "测试源", "last_full_refresh_at": fetched_at}
+    with service._connect() as connection:
+        connection.execute(
+            "INSERT INTO cache_items(cache_key, payload, fetched_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(cache_key) DO UPDATE SET payload=excluded.payload, fetched_at=excluded.fetched_at",
+            (key, json.dumps(payload, ensure_ascii=False), fetched_at),
+        )
 
 
 class QuantServiceTests(unittest.TestCase):
@@ -283,6 +315,168 @@ class QuantServiceTests(unittest.TestCase):
             self.assertEqual(len(history), 5)
             self.assertIn("beg", request_params[1])
             self.assertEqual(meta["latest_bar_date"], next_dates[-1].strftime("%Y-%m-%d"))
+
+    def test_history_cache_is_reused_when_no_new_trading_day(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            service = MarketDataService(db_path=Path(temporary_directory) / "reuse.db")
+            day = (datetime.now(SHANGHAI) - timedelta(days=1)).date()
+            rows = _daily_rows([(day - timedelta(days=1)).isoformat(), day.isoformat()])
+            fetched_at = datetime.combine(day, datetime_time(16, 0), tzinfo=SHANGHAI).isoformat(timespec="seconds")
+            _seed_history_cache(service, "600000", rows, fetched_at)
+            with patch("services.market_data.settings.REQUEST_INTERVAL_SECONDS", 0), patch.object(
+                service, "_get_json", side_effect=AssertionError("没有新交易日时不应重新请求前复权历史")
+            ):
+                history, meta = service.get_history(
+                    "600000", count=5, adjusted=True, expected_latest_trading_date=day.isoformat()
+                )
+            self.assertEqual(meta["status"], "本地缓存")
+            self.assertEqual(meta["latest_bar_date"], day.isoformat())
+            self.assertEqual(len(history), 2)
+
+    def test_history_cache_is_refetched_when_a_new_trading_day_appears(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            service = MarketDataService(db_path=Path(temporary_directory) / "new_day.db")
+            day = (datetime.now(SHANGHAI) - timedelta(days=2)).date()
+            rows = _daily_rows([(day - timedelta(days=1)).isoformat(), day.isoformat()])
+            fetched_at = datetime.combine(day, datetime_time(16, 0), tzinfo=SHANGHAI).isoformat(timespec="seconds")
+            _seed_history_cache(service, "600000", rows, fetched_at)
+            next_day = day + timedelta(days=1)
+            response = {
+                "rc": 0,
+                "data": {
+                    "code": "600000",
+                    "klines": [
+                        f"{stamp.strftime('%Y-%m-%d')},10,10.1,10.2,9.9,1000,10000,3,1,0.1,1"
+                        for stamp in pd.bdate_range(day.isoformat(), next_day.isoformat())
+                    ],
+                },
+            }
+            with patch("services.market_data.settings.REQUEST_INTERVAL_SECONDS", 0), patch.object(
+                service, "_get_json", return_value=response
+            ) as request:
+                history, meta = service.get_history(
+                    "600000", count=5, adjusted=True, expected_latest_trading_date=next_day.isoformat()
+                )
+            self.assertTrue(request.called, "出现新交易日必须整段重取前复权历史")
+            self.assertEqual(meta["latest_bar_date"], next_day.isoformat())
+
+    def test_history_cache_fetched_before_close_is_not_reused(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            service = MarketDataService(db_path=Path(temporary_directory) / "before_close.db")
+            day = (datetime.now(SHANGHAI) - timedelta(days=1)).date()
+            rows = _daily_rows([(day - timedelta(days=1)).isoformat(), day.isoformat()])
+            fetched_at = datetime.combine(day, datetime_time(10, 0), tzinfo=SHANGHAI).isoformat(timespec="seconds")
+            _seed_history_cache(service, "600000", rows, fetched_at)
+            response = {
+                "rc": 0,
+                "data": {
+                    "code": "600000",
+                    "klines": [
+                        f"{stamp.strftime('%Y-%m-%d')},10,10.1,10.2,9.9,1000,10000,3,1,0.1,1"
+                        for stamp in pd.bdate_range(day.isoformat(), day.isoformat())
+                    ],
+                },
+            }
+            with patch("services.market_data.settings.REQUEST_INTERVAL_SECONDS", 0), patch.object(
+                service, "_get_json", return_value=response
+            ) as request:
+                service.get_history(
+                    "600000", count=5, adjusted=True, expected_latest_trading_date=day.isoformat()
+                )
+            self.assertTrue(request.called, "盘中抓取的缓存可能含半根 K 线，收盘后必须重取")
+
+    def test_force_refresh_bypasses_trading_day_reuse(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            service = MarketDataService(db_path=Path(temporary_directory) / "force.db")
+            day = (datetime.now(SHANGHAI) - timedelta(days=1)).date()
+            rows = _daily_rows([(day - timedelta(days=1)).isoformat(), day.isoformat()])
+            fetched_at = datetime.combine(day, datetime_time(16, 0), tzinfo=SHANGHAI).isoformat(timespec="seconds")
+            _seed_history_cache(service, "600000", rows, fetched_at)
+            response = {
+                "rc": 0,
+                "data": {
+                    "code": "600000",
+                    "klines": [
+                        f"{stamp.strftime('%Y-%m-%d')},10,10.1,10.2,9.9,1000,10000,3,1,0.1,1"
+                        for stamp in pd.bdate_range(day.isoformat(), day.isoformat())
+                    ],
+                },
+            }
+            with patch("services.market_data.settings.REQUEST_INTERVAL_SECONDS", 0), patch.object(
+                service, "_get_json", return_value=response
+            ) as request:
+                service.get_history(
+                    "600000", count=5, adjusted=True,
+                    expected_latest_trading_date=day.isoformat(), force_refresh=True,
+                )
+            self.assertTrue(request.called, "force_refresh 永远不能被缓存复用绕过")
+
+    def test_source_breaker_skips_network_after_repeated_network_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            service = MarketDataService(db_path=Path(temporary_directory) / "breaker.db")
+            with patch("services.market_data.settings.REQUEST_INTERVAL_SECONDS", 0), patch(
+                "services.market_data.settings.REQUEST_RETRIES", 0
+            ), patch.object(
+                service.session, "get", side_effect=requests.ConnectionError("连接失败")
+            ) as request:
+                for _ in range(3):
+                    with self.assertRaises(requests.ConnectionError):
+                        service._request_response(settings.EASTMONEY_KLINE_URL, {}, code="600000")
+                with self.assertRaises(MarketDataError):
+                    service._request_response(settings.EASTMONEY_KLINE_URL, {}, code="600000")
+            self.assertEqual(request.call_count, 3, "熔断打开后不应再发网络请求")
+            snapshot = service.source_health_snapshot()
+            self.assertEqual(snapshot["eastmoney.kline"]["status"], "open")
+
+    def test_universe_snapshot_is_shared_copied_and_single_flight(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            service = MarketDataService(db_path=Path(temporary_directory) / "universe.db")
+            frame = pd.DataFrame({"code": ["600000", "000001"], "name": ["浦发银行", "平安银行"]})
+            meta = {
+                "status": "完整股票池获取成功", "complete": True,
+                "fetched_at": datetime.now(SHANGHAI).isoformat(timespec="seconds"),
+            }
+            calls: list[str] = []
+
+            def slow_load(scope: str, force_refresh: bool):
+                calls.append(scope)
+                time.sleep(0.05)
+                return frame.copy(), dict(meta)
+
+            with patch.object(service, "_load_universe", side_effect=slow_load):
+                first, first_meta = service.get_universe("all")
+                first["code"] = "999999"
+                first["extra"] = True
+                second, second_meta = service.get_universe("all")
+                results: list[pd.DataFrame] = []
+
+                def read() -> None:
+                    results.append(service.get_universe("all")[0])
+
+                threads = [threading.Thread(target=read) for _ in range(4)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join()
+
+            self.assertEqual(calls, ["all"], "同一轮扫描应复用内存快照，只真正刷新一次")
+            self.assertEqual(list(second["code"]), ["600000", "000001"])
+            self.assertNotIn("extra", second.columns, "调用方对返回值的修改不能污染共享快照")
+            self.assertIsNot(first_meta, second_meta)
+            self.assertTrue(all(list(item["code"]) == ["600000", "000001"] for item in results))
+
+    def test_universe_failure_uses_short_negative_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            service = MarketDataService(db_path=Path(temporary_directory) / "universe_fail.db")
+            with patch.object(
+                service, "_load_universe", side_effect=MarketDataError("股票池源不可用")
+            ) as load:
+                with self.assertRaises(MarketDataError):
+                    service.get_universe("all")
+                with self.assertRaises(MarketDataError) as blocked:
+                    service.get_universe("all")
+            self.assertEqual(load.call_count, 1, "失败后的短时间内不应重复拉取整份股票池")
+            self.assertIn("不重复请求", str(blocked.exception))
 
     def test_history_summary_reports_per_stock_request_success_rate(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

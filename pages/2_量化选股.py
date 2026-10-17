@@ -12,7 +12,13 @@ from config import settings
 from services.auth_ui import require_session
 from services.model_governance import ScanGovernance, current_model_status
 from services.rank_model import objective_label
-from services.scan_pipeline import FULL_MARKET_POOL_MODE, ScanOptions, collect_candidates, run_scan_pipeline
+from services import acquisition_store
+from services.scan_pipeline import (
+    FULL_MARKET_POOL_MODE,
+    ScanOptions,
+    collect_scan_snapshot,
+    train_scan_snapshot,
+)
 from services.scan_store import build_payload, load_scan_result, save_scan_result
 from services.ui_helpers import (
     loading_task,
@@ -69,7 +75,7 @@ if is_admin:
         )
         include_backtest = st.checkbox(
             "同时看每只股票的历史模拟回测（全市场会很慢）", value=False,
-            help="对每只候选股票单独回放一遍历史买卖，用来判断它的规则在过去是否有效，会明显拉长扫描时间。",
+            help="采集时同时冻结逐股回测所需的不复权日线，训练时离线回放历史买卖；会明显拉长采集和计算时间。旧快照未准备回测数据时需要重新采集。",
         )
         training_columns = st.columns([2, 1, 2], vertical_alignment="bottom")
         objective_mode = training_columns[0].selectbox(
@@ -105,38 +111,84 @@ if is_admin:
     # 试跑范围与正式范围二选一：留空就扫全市场，这也是唯一会落盘、给所有人看的口径。
     pool_mode = "用户自定义" if custom_codes.strip() else FULL_MARKET_POOL_MODE
 
-    if st.button("开始扫描", type="primary"):
-        options = ScanOptions(
-            pool_mode=pool_mode, custom_codes=custom_codes, scan_limit=int(scan_limit),
-            objective_mode=objective_mode, training_window=int(training_window),
-            enable_neutralization=enable_neutralization, use_extra_factors=use_extra_factors,
-            include_backtest=include_backtest, trigger="manual",
+    options = ScanOptions(
+        pool_mode=pool_mode, custom_codes=custom_codes, scan_limit=int(scan_limit),
+        objective_mode=objective_mode, training_window=int(training_window),
+        enable_neutralization=enable_neutralization, use_extra_factors=use_extra_factors,
+        include_backtest=include_backtest, trigger="manual",
+    )
+
+    # 采集与训练拆成两步：采集冻结一份截面快照（可中断续跑），训练只消费快照。
+    # 同一份快照可以换训练目标和窗口反复训练；逐股回测日线须在采集时一并准备。
+    ready_snapshot = acquisition_store.latest_snapshot(ready_only=True)
+    latest_snapshot = acquisition_store.latest_snapshot()
+    action_columns = st.columns(2)
+    collect_clicked = action_columns[0].button(
+        "① 采集股票池数据", type="primary",
+        help="下载股票池的报价与历史行情并冻结成快照；中途关闭页面后再次点击会从断点续跑。",
+    )
+    if ready_snapshot is None:
+        st.caption("还没有可训练的快照，请先点击「① 采集股票池数据」。")
+    else:
+        st.caption(
+            f"可训练快照 {ready_snapshot.snapshot_id} · 截面日期 {ready_snapshot.reference_date}，"
+            "训练只使用该快照，不会重新下载行情。"
         )
-        with loading_task("获取完整股票池", "首次获取或启用备用数据源时会逐页核对完整股票池，通常需要一至两分钟。") as task:
-            candidates, source_meta = collect_candidates(service, options, task.step)
-            if not candidates:
-                task.fail("股票池获取失败，请查看下方错误信息。")
-        if not candidates:
-            # 股票池没取到就不动上一次的结果：一次失败的取数不该把界面上已有的排名擦掉。
-            st.error(source_meta.get("error", "当前股票列表为空；可在「更多（可选）」里用自定义代码试跑。"))
+    if latest_snapshot is not None and latest_snapshot.status == "failed":
+        st.warning(f"最近一次采集未完成：{latest_snapshot.meta.get('error') or '未知原因'}，可重试采集或换用上面的可训练快照。")
+
+    if collect_clicked:
+        with loading_task("采集股票池数据", "先取沪深 300 基准确定截面日期，再逐股下载报价与历史。中断后再次点击会跳过已完成股票。", exclusive=True) as task:
+            snapshot = collect_scan_snapshot(service, options, task.step)
+            if snapshot is None or snapshot.status != "ready":
+                task.fail((snapshot.meta.get("error") if snapshot else None) or "采集未完成，请查看下方信息。")
+        if snapshot is None:
+            st.error("采集失败：未能建立快照。")
         else:
+            source_meta = snapshot.meta.get("source_meta") or {}
+            counts = snapshot.meta.get("counts") or {}
+            if snapshot.status != "ready":
+                st.error(snapshot.meta.get("error") or "采集未完成。")
+            else:
+                st.success(
+                    f"快照 {snapshot.snapshot_id} 已就绪：截面 {snapshot.reference_date}，"
+                    f"有效 {counts.get('success', 0):,} 只、失败 {counts.get('failed', 0):,} 只、"
+                    f"续跑跳过 {counts.get('skipped', 0):,} 只。"
+                )
+            if source_meta:
+                st.info(
+                    f"源端总数 {source_meta.get('source_total_symbols', counts.get('total', 0)):,}；"
+                    f"返回行数 {source_meta.get('source_rows', counts.get('total', 0)):,}；"
+                    f"去重股票池 {source_meta.get('source_unique_symbols', counts.get('total', 0)):,}；"
+                    f"有效股票 {source_meta.get('valid_symbols', counts.get('total', 0)):,}；"
+                    f"排除 {source_meta.get('excluded_symbols', 0):,}；失败 {source_meta.get('failed_symbols', 0):,}；"
+                    f"失败页 {source_meta.get('failed_pages', 0):,}；本次采集 {counts.get('total', 0):,}；"
+                    f"来源 {source_meta.get('source', source_meta.get('status'))}；"
+                    f"更新时间 {source_meta.get('fetched_at', '用户输入')}。"
+                )
             if source_meta.get("warning") or source_meta.get("is_stale"):
                 st.warning(source_meta.get("warning", "当前使用完整过期股票池缓存，行情非实时。"))
-            st.info(
-                f"源端总数 {source_meta.get('source_total_symbols', len(candidates)):,}；"
-                f"返回行数 {source_meta.get('source_rows', len(candidates)):,}；"
-                f"去重股票池 {source_meta.get('source_unique_symbols', len(candidates)):,}；"
-                f"有效股票 {source_meta.get('valid_symbols', len(candidates)):,}；"
-                f"排除 {source_meta.get('excluded_symbols', 0):,}；失败 {source_meta.get('failed_symbols', 0):,}；"
-                f"失败页 {source_meta.get('failed_pages', 0):,}；本次扫描 {len(candidates):,}；"
-                f"来源 {source_meta.get('source', source_meta.get('status'))}；"
-                f"更新时间 {source_meta.get('fetched_at', '用户输入')}。"
-            )
-            with loading_task("扫描与模型分析", f"本次共 {len(candidates):,} 只股票。进度按已处理数量计算，单只股票训练耗时可能不同。", exclusive=True) as task:
-                result = run_scan_pipeline(
-                    service, options, candidates, source_meta, task.step,
+            for note in snapshot.meta.get("notes") or []:
+                NOTE_RENDERERS.get(note.get("level", "caption"), st.caption)(note["text"])
+            if snapshot.status == "ready":
+                ready_snapshot = snapshot
+
+    train_clicked = action_columns[1].button(
+        "② 训练模型并生成排名", disabled=ready_snapshot is None,
+        help="只使用已冻结的快照训练，不会重新下载行情；需要最新数据请先重新采集。",
+    )
+    if train_clicked and ready_snapshot is not None:
+        result = None
+        with loading_task("训练模型并生成排名", f"只使用采集快照 {ready_snapshot.snapshot_id}（截面 {ready_snapshot.reference_date}），不会重新下载行情。", exclusive=True) as task:
+            try:
+                result = train_scan_snapshot(
+                    service, options, ready_snapshot.snapshot_id, task.step,
                     governance=ScanGovernance(get_repository(), trigger="manual", operator=account["username"]),
                 )
+            except (ValueError, OSError) as exc:
+                task.fail(str(exc))
+                st.error(f"训练未开始：{exc}")
+        if result is not None:
             if options.pool_mode == "用户自定义":
                 # 试跑只留在本次会话里：落盘文件是所有账号共用的那份全市场结论，一次试跑不该把它换掉。
                 st.session_state["scan_result"] = build_payload(result)

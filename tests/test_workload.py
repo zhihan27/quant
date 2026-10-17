@@ -139,7 +139,7 @@ class ExplicitExclusivityTests(unittest.TestCase):
         """页面里真正会重算模型的环节必须显式声明；漏声明就是漏保护。"""
         expected = {
             "1_个股分析.py": {"滚动样本外回测", "配对统计分析"},
-            "2_量化选股.py": {"扫描与模型分析"},
+            "2_量化选股.py": {"采集股票池数据", "训练模型并生成排名"},
         }
         for name, titles in expected.items():
             source = (settings.PROJECT_ROOT / "pages" / name).read_text(encoding="utf-8")

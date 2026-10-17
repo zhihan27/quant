@@ -87,7 +87,7 @@ class CrossSectionRanker:
                 min_child_samples=20,
                 reg_lambda=1.0,
                 random_state=self.seed,
-                n_jobs=1,
+                n_jobs=settings.TRAINING_N_JOBS,
                 verbosity=-1,
                 label_gain=[float(2**index - 1) for index in range(self.grade_count)],
             )
@@ -102,7 +102,7 @@ class CrossSectionRanker:
             colsample_bytree=0.8,
             reg_lambda=1.0,
             random_state=self.seed,
-            n_jobs=1,
+            n_jobs=settings.TRAINING_N_JOBS,
             verbosity=0,
         )
 

@@ -1,6 +1,7 @@
 """验证排序目标、NDCG 检验与滚动训练窗口。"""
 
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -11,6 +12,7 @@ from services.ml_pipeline import evaluate_oos, fit_panel_model, predict_panel, r
 from services.rank_model import (
     SCORE_KIND_RANK, SCORE_KIND_RETURN, CrossSectionRanker, ndcg_at_k, random_ndcg_baseline, relevance_grades,
 )
+from services.stock_scoring import _make_model
 
 
 def _panel(days=1200, stocks=20, drift=0.0):
@@ -144,6 +146,21 @@ class RankEvaluationTests(unittest.TestCase):
         result = evaluate_oos(frame, 20, 10)
         self.assertIsNotNone(result["mae"])
         self.assertFalse(result["validated"])
+
+
+class TrainingParallelismTests(unittest.TestCase):
+    """训练线程数必须来自统一配置，避免排序器与回归器各写一份 n_jobs。"""
+
+    def test_all_training_models_use_configured_n_jobs(self):
+        with patch.object(settings, "TRAINING_N_JOBS", 3):
+            estimators = {
+                "ranker.LightGBM": CrossSectionRanker("LightGBM")._build(),
+                "ranker.XGBoost": CrossSectionRanker("XGBoost")._build(),
+                "regressor.LightGBM": _make_model("LightGBM"),
+                "regressor.XGBoost": _make_model("XGBoost"),
+            }
+        for name, estimator in estimators.items():
+            self.assertEqual(estimator.get_params()["n_jobs"], 3, f"{name} 未使用 TRAINING_N_JOBS")
 
 
 class CrossSectionRankerTests(unittest.TestCase):

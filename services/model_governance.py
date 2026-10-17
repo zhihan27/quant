@@ -499,11 +499,24 @@ def archive_context(
     }
     for name, source in sources.items():
         _link_or_copy(source, targets[name])
+    # 模型目录与个股分析页靠这些字段展示「这份模型是什么口径训练出来的」，
+    # 不读 joblib：反序列化几十兆的上下文只为拿几个标量没有意义。
+    source_meta = context.get("source") or {}
+    details = {
+        "objective_mode": context.get("objective_mode"),
+        "training_window_days": context.get("training_window_days"),
+        "pool_mode": source_meta.get("pool_mode"),
+        "universe_size": len(context.get("universe_codes") or []),
+        "neutralization_status": (context.get("neutralization") or {}).get("status"),
+        "extra_factors_status": (context.get("extra_factors") or {}).get("status"),
+        "source_snapshot_id": source_meta.get("snapshot_id"),
+        "limitation": context.get("limitation"),
+    }
     (directory / "registry.json").write_text(
         json.dumps(finite_or_none({
             "context_id": context_id, "model_version": version,
             "created_at": context.get("created_at"), "reference_date": context.get("reference_date"),
-            "passed": bool(passed), "base_rate": base_rate,
+            "passed": bool(passed), "base_rate": base_rate, **details,
         }), ensure_ascii=False, indent=2, allow_nan=False),
         encoding="utf-8",
     )
@@ -513,12 +526,10 @@ def archive_context(
             "(context_id,model_version,reference_date,passed,base_rate,archive_path,panel_path,is_active,details) "
             "VALUES (%s,%s,%s,%s,%s,%s,%s,TRUE,%s) "
             "ON CONFLICT (context_id) DO UPDATE SET passed=EXCLUDED.passed, base_rate=EXCLUDED.base_rate, "
-            "archive_path=EXCLUDED.archive_path, panel_path=EXCLUDED.panel_path, is_active=TRUE",
+            "archive_path=EXCLUDED.archive_path, panel_path=EXCLUDED.panel_path, details=EXCLUDED.details, "
+            "is_active=TRUE",
             (context_id, version, context.get("reference_date"), bool(passed), base_rate,
-             str(directory), str(sources["panel"]),
-             _jsonb({"objective_mode": context.get("objective_mode"),
-                     "training_window_days": context.get("training_window_days"),
-                     "limitation": context.get("limitation")})),
+             str(directory), str(sources["panel"]), _jsonb(details)),
         )
         connection.execute(
             "UPDATE public.quant_model_registry SET is_active=FALSE, retired_at=now() "

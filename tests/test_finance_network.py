@@ -1,6 +1,7 @@
 """复核行情代理故障恢复及限定域名、限定错误类型的回退边界。"""
 
 import os
+import threading
 import unittest
 from unittest.mock import Mock, patch
 
@@ -73,6 +74,66 @@ class FinanceNetworkTests(unittest.TestCase):
             with self.assertRaises(requests.exceptions.ConnectTimeout):
                 self.network.get("https://82.push2.eastmoney.com/data")
         self.assertEqual(self.network.status()["direct_fallback_hosts"], [])
+
+    def test_worker_threads_use_isolated_sessions_and_close_releases_them(self):
+        snapshots = {}
+        barrier = threading.Barrier(3)
+        release = threading.Event()
+
+        def worker(index):
+            barrier.wait(5)
+            snapshots[index] = self.network._sessions()
+            for session in snapshots[index]:
+                session.close = Mock()
+            barrier.wait(5)
+            release.wait(5)
+
+        threads = [threading.Thread(target=worker, args=(index,)) for index in range(2)]
+        for thread in threads:
+            thread.start()
+        # 两个线程仍在运行时先检查隔离性，再让它们退出并检查自动释放。
+        barrier.wait(5)
+        barrier.wait(5)
+
+        self.assertEqual(len(snapshots), 2, "工作线程必须各拿到一套 Session")
+        self.assertIs(self.network._sessions()[0], self.session, "主线程继续沿用构造时传入的 Session")
+        proxies = [proxy for proxy, _ in snapshots.values()]
+        self.assertEqual(len({id(proxy) for proxy in proxies}), 2, "不同线程不能共享同一个 Session")
+        self.assertNotIn(self.session, proxies)
+        for proxy, direct in snapshots.values():
+            self.assertIsNot(direct, self.network.direct_session)
+        release.set()
+        for thread in threads:
+            thread.join(5)
+        self.assertEqual(len(self.network._worker_sessions), 0, "退出线程不能遗留连接池强引用")
+        self.network.close()
+        for proxy, direct in snapshots.values():
+            proxy.close.assert_called_once()
+            direct.close.assert_called_once()
+
+    def test_close_releases_live_worker_sessions_only_once(self):
+        ready = threading.Event()
+        release = threading.Event()
+        sessions = []
+
+        def worker():
+            pair = self.network._sessions()
+            for session in pair:
+                session.close = Mock()
+            sessions.extend(pair)
+            ready.set()
+            release.wait(5)
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        self.assertTrue(ready.wait(5))
+        try:
+            self.network.close()
+        finally:
+            release.set()
+            thread.join(5)
+        for session in sessions:
+            session.close.assert_called_once()
 
     def test_traceback_is_not_used_as_page_message(self):
         detail = "Traceback (most recent call last):\n" + "调用栈\n" * 100 + "requests.exceptions.ProxyError: Unable to connect to proxy"

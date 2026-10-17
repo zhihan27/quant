@@ -7,8 +7,10 @@ import logging
 import math
 import os
 import pickle
+import re
 import uuid
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
@@ -452,11 +454,19 @@ def train_market_context(
     progress: Callable[[str], None] | None = None, persist: bool = True,
     exposures: pd.DataFrame | None = None, objective: str | None = None, window: int | None = None,
     extra_factors: dict[str, Any] | None = None, store: PanelStore | None = None,
+    panel_out: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """一次扫描汇总历史后按滚动窗口训练共享模型，供个股页和扫描页读取相同结果。"""
+    """一次扫描汇总历史后按滚动窗口训练共享模型，供个股页和扫描页读取相同结果。
+
+    ``panel_out`` 是可选的可变容器：训练用的截面面板放回 ``panel_out["panel"]``，
+    供组合回测与治理直接复用。这样自定义池（persist=False）也不会误读活动模型的旧面板，
+    同时省掉一次几十兆 Parquet 的重读。
+    """
     panel = build_market_panel(
         histories, benchmark, exposures=exposures, extra_factors=extra_factors, store=store, progress=progress,
     )
+    if panel_out is not None:
+        panel_out["panel"] = panel
     latest_date = panel["date"].max()
     live = panel.loc[panel["date"].eq(latest_date)]
     window = int(settings.TRAINING_WINDOW_DAYS if window is None else window)
@@ -532,6 +542,97 @@ def load_context(include_panel: bool = False) -> tuple[dict[str, Any] | None, pd
     except (OSError, ValueError, KeyError, EOFError, ImportError, pickle.UnpicklingError):
         LOGGER.exception("读取截面模型上下文失败")
         return None, None
+
+
+CONTEXT_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
+
+
+def _archive_directory(context_id: Any) -> Path | None:
+    """把 context_id 映射到归档目录；只接受 32 位十六进制并强制留在 archive 根内。"""
+    if not isinstance(context_id, str) or not CONTEXT_ID_PATTERN.fullmatch(context_id):
+        return None
+    root = (settings.MODEL_DIR / settings.MODEL_ARCHIVE_DIRNAME).resolve()
+    directory = (root / context_id).resolve()
+    try:
+        directory.relative_to(root)
+    except ValueError:  # 理论上不可达，防的是未来有人放宽 id 校验
+        return None
+    return directory
+
+
+def load_context_by_id(
+    context_id: str, include_panel: bool = False
+) -> tuple[dict[str, Any] | None, pd.DataFrame | None]:
+    """按归档 id 读取已保存模型；任何不一致都返回 ``(None, None)``，不让页面读到错配数据。"""
+    import joblib
+
+    directory = _archive_directory(context_id)
+    if directory is None:
+        LOGGER.warning("拒绝加载非法模型 id：%r", context_id)
+        return None, None
+    version = settings.MODEL_VERSION
+    model_path = directory / f"market_context_v{version}.joblib"
+    if not directory.is_dir() or not model_path.exists():
+        LOGGER.info("模型归档不存在或已被清理：%s", context_id)
+        return None, None
+    try:
+        registry_path = directory / "registry.json"
+        if registry_path.exists():
+            registry = json.loads(registry_path.read_text(encoding="utf-8"))
+            if registry.get("context_id") != context_id or registry.get("model_version") != version:
+                LOGGER.warning("模型归档登记与目标不一致：%s", context_id)
+                return None, None
+        context = joblib.load(model_path)
+        if (
+            context.get("context_id") != context_id
+            or context.get("model_version") != version
+            or context.get("target_kind") != TARGET_KIND
+        ):
+            LOGGER.warning("模型归档内容与 id/版本不一致：%s", context_id)
+            return None, None
+        panel = None
+        if include_panel:
+            panel = pd.read_parquet(directory / f"ml_panel_v{version}.parquet")
+            if panel.attrs.get("context_id") != context_id:
+                LOGGER.warning("模型归档面板与上下文不一致：%s", context_id)
+                return None, None
+        return context, panel
+    except (OSError, ValueError, KeyError, EOFError, ImportError, pickle.UnpicklingError):
+        LOGGER.exception("读取归档模型失败：%s", context_id)
+        return None, None
+
+
+def historical_models_for_stock(
+    context: dict[str, Any] | None, code: str | None
+) -> list[dict[str, Any]]:
+    """某份模型在它自己的截面日期上对该股的判断，用于旧模型回看。
+
+    刻意复用 ``models_for_stock``：日期与收盘价必须与该模型的
+    ``reference_date`` / ``reference_closes`` 完全一致。旧模型不能给新数据打分，
+    这里也不伪造「当前结论」。
+    """
+    if not context or not code:
+        return []
+    date = context.get("reference_date")
+    close = (context.get("reference_closes") or {}).get(str(code))
+    if not date or close is None:
+        return []
+    rows: list[dict[str, Any]] = []
+    for horizon in HORIZONS:
+        for item in models_for_stock(context, code, date, close, horizon):
+            rows.append({
+                "model": item.get("model"),
+                "horizon": horizon,
+                "predicted_excess_return": item.get("predicted_excess_return"),
+                "prediction_percentile": item.get("prediction_percentile"),
+                "prediction_zscore": item.get("prediction_zscore"),
+                "validated": item.get("validated"),
+                "status": item.get("status"),
+                "score_kind": item.get("score_kind"),
+                "reference_date": date,
+                "context_id": context.get("context_id"),
+            })
+    return rows
 
 
 def models_for_stock(context: dict[str, Any] | None, code: str | None, date: str, close: float | None, horizon: int) -> list[dict[str, Any]]:

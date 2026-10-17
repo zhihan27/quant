@@ -71,7 +71,7 @@ def _make_model(name: str) -> Any:
             min_child_samples=20,
             reg_lambda=1.0,
             random_state=42,
-            n_jobs=1,
+            n_jobs=settings.TRAINING_N_JOBS,
             verbosity=-1,
         )
     from xgboost import XGBRegressor
@@ -85,7 +85,7 @@ def _make_model(name: str) -> Any:
         reg_lambda=1.0,
         objective="reg:squarederror",
         random_state=42,
-        n_jobs=1,
+        n_jobs=settings.TRAINING_N_JOBS,
         verbosity=0,
     )
 

@@ -13,6 +13,7 @@ import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -39,7 +40,7 @@ def _duckdb_literal(value: str) -> str:
 def _atomic_write(frame: pd.DataFrame, path: Path) -> Path:
     """先写临时文件再替换，避免中断留下半个面板。"""
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + f".{os.getpid()}.tmp")
+    temporary = path.with_name(path.name + f".{os.getpid()}.{uuid4().hex}.tmp")
     frame.to_parquet(temporary, index=False, compression=settings.PARQUET_COMPRESSION)
     os.replace(temporary, path)
     return path
@@ -57,20 +58,29 @@ class PanelStore:
         self.partition_dirs = {name: self.root / name for name in PARTITION_DIRECTORIES}
 
     # ---------------------------------------------------------------- 历史行情
-    def history_path(self, code: str, adjustment: str = "qfq") -> Path:
+    def history_path(self, code: str, adjustment: str = "qfq", period: str = "daily") -> Path:
+        """返回指定周期的历史路径；日线沿用原路径，周线单独分区。"""
+        if period not in ("daily", "weekly"):
+            raise ValueError("历史周期仅支持 daily 或 weekly。")
         adjustment = ADJUSTMENT_LABELS.get(str(adjustment), "raw")
-        return self.history_dir / f"adjustment={adjustment}" / f"code={str(code).zfill(6)}.parquet"
+        directory = self.history_dir if period == "daily" else self.history_dir / f"period={period}"
+        return directory / f"adjustment={adjustment}" / f"code={str(code).zfill(6)}.parquet"
 
-    def write_history(self, code: str, frame: pd.DataFrame, adjustment: str = "qfq", meta: dict[str, Any] | None = None) -> Path:
-        """保存单只股票的清洗后日线；同一代码重复写入整体覆盖，不做增量拼接。"""
+    def write_history(
+        self, code: str, frame: pd.DataFrame, adjustment: str = "qfq",
+        meta: dict[str, Any] | None = None, period: str = "daily",
+    ) -> Path:
+        """按周期保存清洗后的行情；同一代码同周期整体覆盖。"""
         stored = frame.copy()
+        stored.attrs["history_period"] = period
         stored["code"] = str(code).zfill(6)
         stored["stored_at"] = _now_text()
         stored["history_source"] = str((meta or {}).get("source", ""))
-        return _atomic_write(stored, self.history_path(code, adjustment))
+        return _atomic_write(stored, self.history_path(code, adjustment, period))
 
-    def read_history(self, code: str, adjustment: str = "qfq") -> pd.DataFrame | None:
-        path = self.history_path(code, adjustment)
+    def read_history(self, code: str, adjustment: str = "qfq", period: str = "daily") -> pd.DataFrame | None:
+        """读取指定周期的历史，默认仅返回日线。"""
+        path = self.history_path(code, adjustment, period)
         if not path.exists():
             return None
         try:
@@ -79,8 +89,9 @@ class PanelStore:
             LOGGER.warning("读取 Parquet 历史失败 code=%s detail=%s", code, exc)
             return None
 
-    def history_codes(self, adjustment: str = "qfq") -> list[str]:
-        directory = self.history_dir / f"adjustment={ADJUSTMENT_LABELS.get(adjustment, 'raw')}"
+    def history_codes(self, adjustment: str = "qfq", period: str = "daily") -> list[str]:
+        """列出指定周期和复权口径的已保存代码。"""
+        directory = self.history_path("000000", adjustment, period).parent
         if not directory.exists():
             return []
         return sorted(path.stem.split("=", 1)[-1] for path in directory.glob("code=*.parquet"))
