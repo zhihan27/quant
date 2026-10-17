@@ -316,6 +316,7 @@ def run_scan_pipeline(
             metadata={**source_meta, "pool_mode": options.pool_mode}, progress=_message_only(progress),
             exposures=exposures, objective=options.objective_mode, window=int(options.training_window),
             extra_factors=extra_factors or None, store=extra_store,
+            persist=options.pool_mode == FULL_MARKET_POOL_MODE,
         )
         result.context_id = context.get("context_id")
         result.reference_date = context.get("reference_date")

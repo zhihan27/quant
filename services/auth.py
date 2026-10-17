@@ -21,6 +21,8 @@ LOGIN_FAILURE = "用户名或密码错误。"
 MINIMUM_PASSWORD_LENGTH = 8
 INITIAL_ADMIN_USERNAME = "admin"
 INITIAL_ADMIN_PASSWORD = "admin123"
+SESSION_ABSOLUTE_DAYS = 30
+SESSION_IDLE_HOURS = 24
 # 待激活账号同样保存摘要，只是这个摘要的原文从不落盘、也不下发给任何人。
 PENDING_PASSWORD = secrets.token_urlsafe(32)
 
@@ -295,15 +297,20 @@ class AuthService:
                 ).fetchone()
                 if not current or not current["enabled"] or current["password_hash"] != row["password_hash"]:
                     raise AuthenticationError(LOGIN_FAILURE)
-                connection.execute("DELETE FROM public.quant_auth_sessions WHERE expires_at <= now() OR last_seen_at <= now()-interval '30 minutes'")
+                connection.execute(
+                    "DELETE FROM public.quant_auth_sessions WHERE created_at <= now()-(%s * interval '1 day') "
+                    "OR last_seen_at <= now()-(%s * interval '1 hour')",
+                    (SESSION_ABSOLUTE_DAYS, SESSION_IDLE_HOURS),
+                )
                 # 每个账号最多保留5个会话，避免持续登录堆积令牌。
                 connection.execute(
                     "DELETE FROM public.quant_auth_sessions WHERE token_hash IN (SELECT token_hash FROM public.quant_auth_sessions "
                     "WHERE user_id=%s ORDER BY created_at DESC OFFSET 4)", (row["id"],),
                 )
                 connection.execute(
-                    "INSERT INTO public.quant_auth_sessions(token_hash,user_id,expires_at) VALUES (%s,%s,now()+interval '12 hours')",
-                    (token_digest(token), row["id"]),
+                    "INSERT INTO public.quant_auth_sessions(token_hash,user_id,expires_at) "
+                    "VALUES (%s,%s,now()+(%s * interval '1 day'))",
+                    (token_digest(token), row["id"], SESSION_ABSOLUTE_DAYS),
                 )
                 connection.execute("UPDATE public.quant_users SET last_login_at=now() WHERE id=%s", (row["id"],))
                 connection.execute("DELETE FROM public.quant_login_limits WHERE bucket=%s", ("user:" + token_digest(username),))
@@ -312,15 +319,19 @@ class AuthService:
             HASH_SLOTS.release()
 
     def session(self, token: str) -> dict[str, Any] | None:
-        """验证账号状态、12小时绝对期限和30分钟空闲期限。"""
+        """验证账号状态、30天绝对期限和24小时空闲期限。"""
         if not isinstance(token, str) or not 20 <= len(token) <= 100:
             return None
         with self.repository.connect() as connection:
             return connection.execute(
-                "UPDATE public.quant_auth_sessions AS session SET last_seen_at=now() FROM public.quant_users AS account "
+                "UPDATE public.quant_auth_sessions AS session SET last_seen_at=now(), "
+                "expires_at=GREATEST(session.expires_at,session.created_at+(%s * interval '1 day')) "
+                "FROM public.quant_users AS account "
                 "WHERE session.token_hash=%s AND session.user_id=account.id AND account.enabled AND account.activated "
-                "AND session.expires_at>now() AND session.last_seen_at>now()-interval '30 minutes' "
-                "RETURNING account.id,account.username,account.is_admin,account.must_change_password", (token_digest(token),),
+                "AND session.created_at+(%s * interval '1 day')>now() "
+                "AND session.last_seen_at>now()-(%s * interval '1 hour') "
+                "RETURNING account.id,account.username,account.is_admin,account.must_change_password",
+                (SESSION_ABSOLUTE_DAYS, token_digest(token), SESSION_ABSOLUTE_DAYS, SESSION_IDLE_HOURS),
             ).fetchone()
 
     def logout(self, token: str) -> None:
@@ -344,8 +355,8 @@ class AuthService:
                 row = connection.execute("SELECT password_hash FROM public.quant_users WHERE id=%s FOR UPDATE", (account["id"],)).fetchone()
                 active = connection.execute(
                     "SELECT 1 FROM public.quant_auth_sessions WHERE token_hash=%s AND user_id=%s "
-                    "AND expires_at>now() AND last_seen_at>now()-interval '30 minutes'",
-                    (token_digest(token), account["id"]),
+                    "AND expires_at>now() AND last_seen_at>now()-(%s * interval '1 hour')",
+                    (token_digest(token), account["id"], SESSION_IDLE_HOURS),
                 ).fetchone()
                 if not active:
                     raise AuthenticationError("登录已失效，请重新登录。")

@@ -12,6 +12,8 @@ import numpy as np
 import pandas as pd
 
 from config import settings
+from services.alerting import degradation_reason
+from services.chip_factors import CHIP_FACTOR_COLUMNS
 from services.drift_monitor import (
     LEVEL_INSUFFICIENT,
     LEVEL_OK,
@@ -27,6 +29,7 @@ from services.drift_monitor import (
     population_stability_index,
     prediction_drift_row,
 )
+from services.intraday_factors import INTRADAY_FACTOR_COLUMNS
 
 
 def _normal(size: int, mean: float = 0.0, deviation: float = 1.0, seed: int = 7) -> np.ndarray:
@@ -178,16 +181,69 @@ class FeatureDriftTests(unittest.TestCase):
         self.assertIsNone(valuation["psi"])
         self.assertTrue(valuation["note"], "未接入必须写明原因")
 
-    def test_categorical_dimension_uses_concentration_not_psi(self):
+    def test_categorical_dimension_uses_category_psi_not_ks(self):
         rows = {row["feature_name"]: row for row in feature_drift_rows(_panel(), current_days=20, reference_days=400)}
         industry = rows["行业分布"]
-        self.assertIsNotNone(industry["psi"])
+        self.assertIsNotNone(industry["psi"], "类别列按占比分布算 PSI")
         self.assertIsNone(industry["ks_stat"], "行业是类别列，不做 KS")
 
     def test_industry_shift_is_detected(self):
         rows = {row["feature_name"]: row
                 for row in feature_drift_rows(_panel(industry_shift=True), current_days=20, reference_days=400)}
         self.assertNotEqual(rows["行业分布"]["threshold_exceeded"], LEVEL_OK)
+
+    def test_absent_extra_factor_families_are_not_counted_as_zero_coverage(self):
+        """面板上只有筹码因子时覆盖率是 100%，不是 33%。
+
+        本机没有分钟线分区、没有 PIT 财务面板，扩展因子实际只接入了筹码一族。
+        老实现把三族覆盖率取平均（缺席的族各按 0 算），算出来 33%，低于门控线就判严重，
+        于是每次扫描都写一条 critical 告警并自动降级——而真实原因只是另外两族没数据。
+        """
+        panel = _panel()
+        for column in CHIP_FACTOR_COLUMNS:
+            panel[column] = 1.0
+        rows = {row["feature_name"]: row for row in feature_drift_rows(panel, current_days=20, reference_days=400)}
+        coverage = rows["财务因子覆盖率"]
+        self.assertEqual(coverage["threshold_exceeded"], LEVEL_OK)
+        self.assertEqual(coverage["missing_rate"], 0.0)
+        self.assertEqual(coverage["mean_shift"], 0.0)
+        self.assertIn("日内", coverage["note"], "缺席的族必须写进说明，不能悄悄从分母里消失")
+        self.assertEqual(evaluate_drift_alerts([coverage], [], []), [])
+        self.assertIsNone(degradation_reason(evaluate_drift_alerts([coverage], [], [])))
+
+    def test_extra_factor_family_falling_below_the_gate_is_severe(self):
+        """真的掉出门控线要判严重：当前窗口筹码因子整列缺失，模型会整族丢弃它。"""
+        panel = _panel()
+        panel["chip_cost_range_width"] = 1.0
+        panel["chip_winner_rate"] = 1.0
+        recent = panel["date"].drop_duplicates().nlargest(20)
+        panel.loc[panel["date"].isin(recent), "chip_winner_rate"] = np.nan
+        rows = {row["feature_name"]: row for row in feature_drift_rows(panel, current_days=20, reference_days=400)}
+        coverage = rows["财务因子覆盖率"]
+        self.assertEqual(coverage["threshold_exceeded"], LEVEL_SEVERE)
+        self.assertEqual(coverage["missing_rate"], 1.0)
+        alerts = evaluate_drift_alerts([coverage], [], [])
+        self.assertEqual([alert["level"] for alert in alerts], ["critical"])
+        self.assertIn("财务因子覆盖率", degradation_reason(alerts))
+
+    def test_never_qualified_family_is_watch_not_severe(self):
+        """参考窗口同样没达标的族是数据深度问题，不是漂移：判关注，不触发自动降级。
+
+        本地分钟线只能累积最近若干天，刚起步时日内因子就是这一形态。若按「低于门控线即严重」
+        处理，系统会在数据攒够之前一直停分。
+        """
+        panel = _panel()
+        for column in CHIP_FACTOR_COLUMNS:
+            panel[column] = 1.0
+        for column in INTRADAY_FACTOR_COLUMNS:
+            panel[column] = np.nan
+        rows = {row["feature_name"]: row for row in feature_drift_rows(panel, current_days=20, reference_days=400)}
+        coverage = rows["财务因子覆盖率"]
+        self.assertEqual(coverage["threshold_exceeded"], LEVEL_WATCH)
+        self.assertIn("数据深度不足，非漂移", coverage["note"])
+        alerts = evaluate_drift_alerts([coverage], [], [])
+        self.assertEqual([alert["level"] for alert in alerts], ["warning"], "关注级只写告警，不降级")
+        self.assertIsNone(degradation_reason(alerts))
 
     def test_insufficient_samples_are_labelled_not_faked(self):
         rows = {row["feature_name"]: row

@@ -21,6 +21,7 @@ from services.neutralization import (
     NEUTRAL_PREFIX, attach_market_cap_exposure, neutralize_cross_section, neutralized_feature_columns,
 )
 from services.panel_store import PanelStore
+from services.progress import throttled
 from services.rank_model import (
     SCORE_KIND_RANK, SCORE_KIND_RETURN, evaluate_ndcg, make_ranker, summarize_importances,
 )
@@ -70,18 +71,25 @@ def relative_signal(item: dict[str, Any]) -> float | None:
 def build_market_panel(
     histories: dict[str, pd.DataFrame], benchmark: pd.DataFrame, exposures: pd.DataFrame | None = None,
     extra_factors: dict[str, Any] | None = None, store: PanelStore | None = None,
+    progress: Callable[[str], None] | None = None,
 ) -> pd.DataFrame:
     """构造可追溯的股票日截面，可选对市值与行业暴露中性化，保留标签结束日以便按日期清除重叠样本。
 
     传入 ``extra_factors`` 时，筹码分布、日内高频与 PIT 财务因子按覆盖率门控自动并入排序特征矩阵；
     不传时行为与既有版本完全一致。
+
+    ``progress`` 只用于上报本函数的逐股阶段：全市场扫描下这一段（构造因子 + 并入筹码）要跑好几分钟，
+    不接进度回调的话，页面会停在上一阶段的字幕上不动，看起来像卡死。
     """
     if benchmark is None or benchmark.empty:
         raise ValueError("沪深300历史不可用，不能训练超额收益模型。")
     if len(histories) < MINIMUM_STOCKS:
         raise ValueError(f"截面模型至少需要{MINIMUM_STOCKS}只股票的历史；当前{len(histories)}只。")
     frames = []
-    for code, history in histories.items():
+    should_report = throttled(len(histories))
+    for index, (code, history) in enumerate(histories.items()):
+        if progress and should_report(index):
+            progress(f"正在构造截面因子（{index + 1}/{len(histories)}）")
         features = build_features(history, benchmark)
         labelled = add_forward_returns(features, HORIZONS, benchmark)
         labelled["code"] = str(code)
@@ -93,7 +101,7 @@ def build_market_panel(
     # 均值与标准差，否则「打分校准的股票池」与「实际可交易的股票池」会不一致。
     extra_report: dict[str, Any] = {"status": "未提供新增因子", "families": {}}
     if extra_factors:
-        panel, extra_report = attach_extra_factors(panel, extra_factors, store=store)
+        panel, extra_report = attach_extra_factors(panel, extra_factors, store=store, progress=progress)
     panel, veto_report = apply_health_veto(panel)
     panel = normalize_cross_section(panel, FEATURE_COLUMNS, MINIMUM_STOCKS, MINIMUM_COVERAGE)
     model_features = [f"xs_{column}" for column in FEATURE_COLUMNS]
@@ -446,7 +454,9 @@ def train_market_context(
     extra_factors: dict[str, Any] | None = None, store: PanelStore | None = None,
 ) -> dict[str, Any]:
     """一次扫描汇总历史后按滚动窗口训练共享模型，供个股页和扫描页读取相同结果。"""
-    panel = build_market_panel(histories, benchmark, exposures=exposures, extra_factors=extra_factors, store=store)
+    panel = build_market_panel(
+        histories, benchmark, exposures=exposures, extra_factors=extra_factors, store=store, progress=progress,
+    )
     latest_date = panel["date"].max()
     live = panel.loc[panel["date"].eq(latest_date)]
     window = int(settings.TRAINING_WINDOW_DAYS if window is None else window)

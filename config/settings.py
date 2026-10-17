@@ -185,6 +185,9 @@ DRIFT_CURRENT_WINDOW_DAYS = 20
 DRIFT_PSI_BINS = 10
 # 参与漂移计算的最小有效样本数，低于该值判定为「样本不足」并如实标注，不给数。
 DRIFT_MINIMUM_SAMPLES = 200
+# 预测漂移里历史 HHI 95 分位基准所需的最少历史交易日（约一个月）。低于它时 percentile_cont
+# 退化成「历史最大值附近」，每天创出新高都会判关注；此时该维判「样本不足」而不是照常给阈值。
+DRIFT_HHI_MINIMUM_SAMPLES = 20
 
 # 漂移监控维度 → 面板列名。
 # 值为 None 表示该维度当前无法计算，drift_monitor 必须写一条带原因的「未接入」记录，
@@ -201,7 +204,8 @@ DRIFT_MONITORED_FEATURES = {
     "市值分布": "log_market_cap",
     "行业分布": "industry",
 }
-# 行业不是数值列，用集中度（HHI）衡量漂移，不做 PSI。
+# 行业不是数值列：特征漂移维度按类别占比算 PSI，不做 KS 与均值偏移（见 drift_monitor._categorical_row）；
+# Top-N 组合的行业集中度（HHI）是另一回事，在预测漂移维度单独计算。
 DRIFT_CATEGORICAL_FEATURES = ("industry",)
 # 预测漂移里的 Top-N 组合规模。与 PORTFOLIO_TOP_N 同口径。
 DRIFT_PREDICTION_TOP_N = PORTFOLIO_TOP_N

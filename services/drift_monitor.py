@@ -57,6 +57,9 @@ _EPSILON = 1e-6
 
 CONCEPT_HORIZON = 20
 
+# 因子族的中文名，只用于写给人看的 note。
+EXTRA_FACTOR_LABELS = {"chip": "筹码", "intraday": "日内", "financial": "财报"}
+
 
 def population_stability_index(
     reference: Any, current: Any, bins: int = settings.DRIFT_PSI_BINS
@@ -256,28 +259,51 @@ def _coverage_row(
     if not any(column in panel.columns for columns in EXTRA_FACTOR_FAMILIES.values() for column in columns):
         return {**base, "missing_rate": None, "mean_shift": None, "threshold_exceeded": LEVEL_UNAVAILABLE,
                 "sample_size": 0, "note": "本地面板中没有筹码/日内/财报因子列（本次扫描未启用扩展因子），该维不可计算"}
+    # 缺席的族同样不能计入：面板里只有筹码因子时分母写成三个族，覆盖率会被算成 33% 判严重，
+    # 而实际原因是另外两族没接入本地数据。只判定「面板里真有列」的族。
+    present = [
+        name for name, columns in EXTRA_FACTOR_FAMILIES.items()
+        if any(column in panel.columns for column in columns)
+    ]
+    absent = [name for name in EXTRA_FACTOR_FAMILIES if name not in present]
     current_report = summarize_extra_factors(panel.loc[panel["date"].isin(current_dates)])
     reference_report = summarize_extra_factors(panel.loc[panel["date"].isin(reference_dates)])
-    families = [item for item in current_report if item in EXTRA_FACTOR_FAMILIES]
-    current_coverage = float(np.mean([current_report[name]["coverage"] for name in families]))
-    reference_coverage = (
-        float(np.mean([reference_report[name]["coverage"] for name in families]))
-        if reference_report else current_coverage
+    current_coverages = {name: float(current_report[name]["coverage"]) for name in present}
+    reference_coverages = (
+        {name: float(reference_report[name]["coverage"]) for name in present}
+        if reference_report else dict(current_coverages)
     )
+    current_coverage = float(np.mean(list(current_coverages.values())))
+    reference_coverage = float(np.mean(list(reference_coverages.values())))
     sample_size = int(current_report["rows"])
+    gate = settings.EXTRA_FACTOR_MINIMUM_COVERAGE
     shift = current_coverage - reference_coverage
+    # 模型是按族整体门控的（accepted_extra_columns），因此逐族对照门控线，而不是拿各族均值糊过去。
+    # 再看参考窗口：本来达标、当前掉下去的才是漂移；参考窗口就不达标的属于数据深度不足
+    # （例如本地分钟线刚累积几天），判关注而不是严重——自动降级不该被这种常态触发。
+    regressed = [name for name, value in current_coverages.items()
+                 if value < gate and reference_coverages[name] >= gate]
+    shallow = [name for name, value in current_coverages.items()
+               if value < gate and name not in regressed]
     if sample_size < settings.DRIFT_MINIMUM_SAMPLES:
         level = LEVEL_INSUFFICIENT
-    elif current_coverage < settings.EXTRA_FACTOR_MINIMUM_COVERAGE:
+    elif regressed:
         level = LEVEL_SEVERE
-    elif shift < -settings.DRIFT_PSI_WATCH:
+    elif shallow or shift < -settings.DRIFT_PSI_WATCH:
         level = LEVEL_WATCH
     else:
         level = LEVEL_OK
+    detail = "、".join(f"{EXTRA_FACTOR_LABELS[name]} {value:.0%}" for name, value in current_coverages.items())
     note = (
-        f"覆盖率 {current_coverage:.1%}（参考窗口 {reference_coverage:.1%}）；"
-        f"低于 {settings.EXTRA_FACTOR_MINIMUM_COVERAGE:.0%} 时模型会整体丢弃这些因子"
+        f"覆盖率 {current_coverage:.1%}（参考窗口 {reference_coverage:.1%}）；逐族 {detail}；"
+        f"低于 {gate:.0%} 的族会被模型整体丢弃"
     )
+    if absent:
+        note = f"{note}；面板无列、不参与判定：{'、'.join(EXTRA_FACTOR_LABELS[name] for name in absent)}"
+    if regressed:
+        note = f"{note}；掉出门控线：{'、'.join(EXTRA_FACTOR_LABELS[name] for name in regressed)}"
+    elif shallow:
+        note = f"{note}；参考窗口同样未达标（数据深度不足，非漂移）：{'、'.join(EXTRA_FACTOR_LABELS[name] for name in shallow)}"
     if level == LEVEL_INSUFFICIENT:
         note = f"{note}；当前窗口仅 {sample_size} 行，低于 {settings.DRIFT_MINIMUM_SAMPLES} 的下限，不作等级判定"
     return {**base, "missing_rate": 1.0 - current_coverage, "mean_shift": shift,
@@ -613,11 +639,16 @@ def log_concept_drift(repository: QuantRepository, rows: Sequence[dict[str, Any]
 def history_hhi_percentile(repository: QuantRepository, report_date: str, percentile: float = settings.DRIFT_HHI_PERCENTILE) -> float | None:
     """历史 HHI 分位基准，排除当日自身。样本不足时返回 None，由调用方标注。"""
     with repository.connect() as connection:
-        return connection.execute(
+        row = connection.execute(
             "SELECT percentile_cont(%s) WITHIN GROUP (ORDER BY industry_hhi) AS threshold, count(*) AS samples "
             "FROM public.quant_prediction_drift WHERE industry_hhi IS NOT NULL AND date < %s",
             (float(percentile), report_date),
-        ).fetchone()["threshold"]
+        ).fetchone()
+    # 样本数必须真的用上：只有两三天历史时 percentile_cont 给的就是历史最大值附近，
+    # 于是每次集中度创出新高都判「关注」，而那不是漂移是没基准。低于下限时如实返回 None。
+    if row is None or int(row["samples"] or 0) < settings.DRIFT_HHI_MINIMUM_SAMPLES:
+        return None
+    return finite_or_none(row["threshold"])
 
 
 def log_prediction_drift(repository: QuantRepository, rows: Sequence[dict[str, Any]]) -> int:

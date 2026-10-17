@@ -88,7 +88,7 @@ class PipelineOrderTests(unittest.TestCase):
     原页面靠代码恰好写对才成立；搬进服务层后用这条用例把次序钉住。
     """
 
-    def _run(self):
+    def _run(self, pool_mode: str = "用户自定义"):
         service = _FakeService()
         calls: list[tuple] = []
 
@@ -111,16 +111,17 @@ class PipelineOrderTests(unittest.TestCase):
         }
         panel = pd.DataFrame({"date": ["2026-10-15"], "code": ["600000"]})
         options = ScanOptions(
-            pool_mode="用户自定义", custom_codes="600000,000001",
+            pool_mode=pool_mode, custom_codes="600000,000001" if pool_mode == "用户自定义" else "",
             enable_neutralization=False, use_extra_factors=False, run_portfolio=True,
         )
         candidates = [{"code": "600000", "name": "浦发银行"}, {"code": "000001", "name": "平安银行"}]
-        with patch("services.scan_pipeline.train_market_context", return_value=context), patch(
+        with patch("services.scan_pipeline.train_market_context", return_value=context) as train_context, patch(
             "services.scan_pipeline.load_context", return_value=(context, panel)
         ), patch("services.scan_pipeline.run_portfolio_strategy", side_effect=fake_portfolio), patch(
             "services.scan_pipeline.analyze_stock", side_effect=fake_analyze
         ), patch("services.scan_pipeline.rank_candidates", return_value=[]):
             result = run_scan_pipeline(service, options, candidates, {"status": "测试"}, None)
+        self.train_context_kwargs = train_context.call_args.kwargs
         return service, result, calls
 
     def test_portfolio_runs_before_scoring_and_history_survives_both(self):
@@ -138,6 +139,14 @@ class PipelineOrderTests(unittest.TestCase):
         _, result, _ = self._run()
         self.assertEqual(result.scan_stats, {"scanned": 2, "scored": 2, "failed": 0})
         self.assertTrue(result.finished_at)
+
+    def test_custom_pool_does_not_persist_shared_model(self):
+        self._run()
+        self.assertFalse(self.train_context_kwargs["persist"])
+
+    def test_full_market_pool_persists_shared_model(self):
+        self._run(FULL_MARKET_POOL_MODE)
+        self.assertTrue(self.train_context_kwargs["persist"])
 
 
 if __name__ == "__main__":

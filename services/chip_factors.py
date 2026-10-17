@@ -21,6 +21,7 @@ import numpy as np
 import pandas as pd
 
 from config import settings
+from services.progress import throttled
 
 LOGGER = logging.getLogger("quant.chip")
 
@@ -218,10 +219,20 @@ def attach_chip_factors(
         if column not in result:
             result[column] = np.nan
     histories = histories or {}
+    # 面板是「全市场 × 全历史」的长表（5000 只 × 1000 多天 ≈ 600 万行），而在循环里逐只做一次
+    # astype(str)/zfill/eq 就是全表字符串扫描：实测每只约 0.9 秒，全市场要一个半小时以上。
+    # 循环期间 result 的代码列与行序都不变，因此把「代码 → 行位置」一次性算好，循环内只做按位切片。
+    panel_codes = result["code"].astype(str).str.zfill(6).to_numpy()
+    positions_by_code = pd.Series(np.arange(len(result)), index=panel_codes).groupby(level=0).indices
+    panel_dates = pd.DatetimeIndex(pd.to_datetime(result["date"]))
+    # 同理，逐只对整列做 .iloc 赋值每次都会复制整块数据；先在 numpy 缓冲里按位写入，最后整体回填一次。
+    buffers = {column: result[column].to_numpy(dtype=float, copy=True) for column in CHIP_FACTOR_COLUMNS}
     computed = 0
     failures: list[str] = []
+    should_report = throttled(len(histories))
     for index, (code, history) in enumerate(histories.items()):
-        if progress:
+        # 逐只上报会在页面上写 5000 多次元素，这里按固定间隔上报、末条必报。
+        if progress and should_report(index):
             progress(f"正在计算 {code} 的筹码分布（{index + 1}/{len(histories)}）")
         try:
             factors, _, _ = chip_distribution(history)
@@ -230,15 +241,17 @@ def attach_chip_factors(
             continue
         if factors.empty:
             continue
+        slots = positions_by_code.get(str(code).zfill(6))
+        if slots is None or not len(slots):
+            continue
         keys = pd.to_datetime(factors["date"])
         values = factors.set_index(keys)[CHIP_FACTOR_COLUMNS]
-        mask = result["code"].astype(str).str.zfill(6).eq(str(code).zfill(6))
-        if not mask.any():
-            continue
-        aligned = values.reindex(pd.to_datetime(result.loc[mask, "date"]))
+        aligned = values.reindex(panel_dates[slots])
         for column in CHIP_FACTOR_COLUMNS:
-            result.loc[mask, column] = aligned[column].to_numpy()
+            buffers[column][slots] = aligned[column].to_numpy()
         computed += 1
+    for column in CHIP_FACTOR_COLUMNS:
+        result[column] = buffers[column]
     coverage = float(result[CHIP_FACTOR_COLUMNS].notna().all(axis=1).mean()) if len(result) else 0.0
     report = {
         "codes_requested": int(len(histories)),

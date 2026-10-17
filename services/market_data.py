@@ -423,12 +423,14 @@ class MarketDataService:
             raise MarketDataError(f"行情获取失败：{exc}") from exc
 
     def get_quote(self, code: str) -> dict[str, Any]:
+        """优先读取有效快照，主源仅有过期缓存时继续尝试备用源。"""
         code = _clean_code(code)
         cache_key = f"quote:{code}"
         params = {
             "secid": f"{_market_id(code)}.{code}",
             "fields": "f57,f58,f43,f44,f45,f46,f47,f48,f59,f60,f162,f168,f86",
         }
+        quote: dict[str, Any] | None = None
         try:
             payload, meta = self._request_with_cache(
                 cache_key,
@@ -497,16 +499,29 @@ class MarketDataService:
                 "quote_valid": "过期" not in data_status and "未知" not in data_status,
                 "warning": meta.get("warning"),
             }
-            if quote["price"] is None:
-                return self._close_quote_fallback(code, quote)
+            # 过期缓存只能兜底展示，不能阻止仍然可用的备用数据源。
+            if quote["price"] is None or not quote["quote_valid"]:
+                raise MarketDataError(quote.get("warning") or quote["data_status"])
             return quote
         except (MarketDataError, requests.RequestException, ValueError, KeyError, TypeError) as eastmoney_error:
             try:
-                return self._get_sina_quote(code, str(eastmoney_error))
-            except (MarketDataError, requests.RequestException, ValueError, KeyError, TypeError) as sina_error:
+                sina_quote = self._get_sina_quote(code, str(eastmoney_error))
+                if sina_quote["quote_valid"]:
+                    return sina_quote
+                sina_warning = sina_quote["data_status"]
+            except (MarketDataError, requests.RequestException, ValueError, KeyError, TypeError) as exc:
+                sina_warning = brief_network_error(exc)
+            warning = f"东方财富：{brief_network_error(eastmoney_error)}；新浪：{sina_warning}"
+            try:
                 return self._close_quote_fallback(
-                    code, {"code": code, "warning": f"东方财富: {eastmoney_error}; 新浪: {sina_error}"}
+                    code, {**(quote or {"code": code}), "warning": warning}
                 )
+            except MarketDataError:
+                # 全部源不可用时保留旧快照用于查看，仍明确标记不可参与模型。
+                if quote and quote["price"] is not None:
+                    quote["warning"] = warning
+                    return quote
+                raise
 
     def _get_sina_quote(self, code: str, primary_warning: str | None = None) -> dict[str, Any]:
         if code.startswith(("4", "8", "9")):
@@ -638,8 +653,9 @@ class MarketDataService:
     def get_scan_quote(self, candidate: dict[str, Any], meta: dict[str, Any]) -> dict[str, Any]:
         """扫描超出快照有效期时重新读取股票池；新缓存可供后续股票共同复用。"""
         if candidate.get("price") is None:
-            return self.get_quote(str(candidate["code"]))
-        quote = self.quote_from_universe_row(candidate, meta)
+            quote = self.get_quote(str(candidate["code"]))
+        else:
+            quote = self.quote_from_universe_row(candidate, meta)
         if quote["quote_valid"]:
             return quote
         universe, refreshed_meta = self.get_universe(scope=meta.get("scope", "all"))
