@@ -184,6 +184,22 @@ class StagedScanTests(unittest.TestCase):
         self.assertEqual(failed_benchmark.status, "failed")
         self.assertIn("沪深 300", failed_benchmark.meta["error"])
 
+    def test_weekend_collection_uses_benchmark_date_without_quote_source_time(self):
+        """股票池没有逐股源时间时，周六下载不能要求存在周六日线。"""
+        self.service.reference = "2026-10-16"
+        self.service.frame = _history(self.service.reference)
+        quote = {
+            "name": "普通公司", "price": 10.0, "volume_lots": 1000,
+            "change_pct": 1.0, "quote_valid": True, "quote_time": None,
+            "fetched_at": "2026-10-17T21:01:08+08:00",
+        }
+        with patch.object(self.service, "get_scan_quote", return_value=quote):
+            snapshot = self._collect()
+        self.assertEqual(snapshot.status, "ready")
+        self.assertEqual(snapshot.meta["counts"]["success"], 2)
+        loaded = acquisition_store.load_snapshot(snapshot.snapshot_id, self.panels)
+        self.assertEqual(set(loaded.histories), {"600000", "000001"})
+
     def test_training_rejects_changed_collection_options(self):
         snapshot = self._collect(self._options(pool_mode="用户自定义", custom_codes="600000"))
         captured, _ = self._train_patches()

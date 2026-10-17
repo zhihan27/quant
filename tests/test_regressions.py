@@ -321,3 +321,23 @@ class CacheRegressionTests(unittest.TestCase):
         quote = {"quote_valid": True, "quote_time": "2026-10-15T15:01:00+08:00"}
         history = pd.DataFrame({"date": [pd.Timestamp("2026-10-14")]})
         self.assertFalse(history_is_current(history, quote, {"status": "接口获取"}))
+
+    def test_history_without_source_time_requires_benchmark_date(self):
+        """下载时间不代表交易时间；缺少交易日锚点时不能放行历史。"""
+        quote = {
+            "quote_valid": True, "quote_time": None,
+            "fetched_at": "2026-10-17T21:01:08+08:00",
+        }
+        history = pd.DataFrame({"date": [pd.Timestamp("2026-10-16")]})
+        meta = {"status": "本地缓存"}
+        self.assertTrue(history_is_current(history, quote, meta, "2026-10-16"))
+        self.assertFalse(history_is_current(history, quote, meta))
+        self.assertFalse(history_is_current(history, quote, meta, "2026-10-19"))
+        self.assertFalse(history_is_current(history, quote, {"status": "过期缓存"}, "2026-10-16"))
+        self.assertFalse(history_is_current(history, {**quote, "quote_valid": False}, meta, "2026-10-16"))
+
+    def test_actual_quote_time_still_rejects_history_behind_quote(self):
+        """即使基准较旧，真实收盘报价已更新时也不能放行旧日线。"""
+        quote = {"quote_valid": True, "quote_time": "2026-10-19T15:01:00+08:00"}
+        history = pd.DataFrame({"date": [pd.Timestamp("2026-10-16")]})
+        self.assertFalse(history_is_current(history, quote, {"status": "接口获取"}, "2026-10-16"))

@@ -171,7 +171,7 @@ def _collect_one(
         expected_latest_trading_date=expected_latest_trading_date,
     )
     history = completed_daily_history(history)
-    if not history_is_current(history, quote, history_meta):
+    if not history_is_current(history, quote, history_meta, expected_latest_trading_date):
         return {"code": code, "name": name, "error": "历史行情未更新至报价对应的完整交易日，未生成模型预测"}
     if len(history) < settings.MINIMUM_SCAN_HISTORY_BARS:
         return {

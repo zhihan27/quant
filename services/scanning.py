@@ -44,9 +44,10 @@ def candidate_codes(
         codes = list(dict.fromkeys(re.findall(r"(?<!\d)\d{6}(?!\d)", raw_codes)))
         frame = pd.DataFrame({"code": codes, "name": codes})
         reference, reference_meta = load_universe_reference(data_service, progress)
-        # 名单状态放在前面展开，免得把「用户输入」这个来源说明覆盖掉；名单详情见 universe_filter。
+        # 名单信息单独保存，不参与报价来源、时间和有效状态的判断。
         frame, meta, report = _apply_universe_filter(frame, reference, {
-            **reference_meta, "status": "用户输入", "fetched_at": None, "complete": True,
+            "source": "用户输入", "status": "用户输入", "fetched_at": None, "complete": True,
+            "universe_reference": reference_meta,
         })
         if report.get("excluded"):
             meta["error"] = f"输入的代码中有 {report['excluded']} 只被股票池规则排除：{report['status']}"
@@ -74,7 +75,7 @@ def candidate_codes(
     elif mode == "北交所":
         universe = universe.loc[universe["code"].str.startswith(settings.BOARD_PREFIXES["bj"])]
     reference, reference_meta = load_universe_reference(data_service, progress)
-    universe, meta, _ = _apply_universe_filter(universe, reference, {**meta, **reference_meta})
+    universe, meta, _ = _apply_universe_filter(universe, reference, {**meta, "universe_reference": reference_meta})
     meta["scope_valid_symbols"] = int(len(universe))
     if universe.empty:
         meta["error"] = "股票池经退市与 ST 过滤后为空。"

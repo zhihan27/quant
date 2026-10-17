@@ -55,13 +55,27 @@ def completed_daily_history(history: pd.DataFrame) -> pd.DataFrame:
     return history.copy()
 
 
-def history_is_current(history: pd.DataFrame, quote: dict[str, Any], meta: dict[str, Any]) -> bool:
-    """核对历史源状态和报价日期，防止最新报价配上过期历史仍生成有效信号。"""
+def history_is_current(
+    history: pd.DataFrame, quote: dict[str, Any], meta: dict[str, Any],
+    expected_latest_trading_date: str | None = None,
+) -> bool:
+    """核对历史源状态、基准交易日和真实报价日期，不把下载时间当作交易时间。"""
     if history.empty or "过期" in meta.get("status", "") or not quote.get("quote_valid", False):
         return False
     try:
-        source = datetime.fromisoformat(quote.get("quote_time") or quote.get("fetched_at"))
         latest = pd.Timestamp(history["date"].iloc[-1]).date()
+        if pd.isna(latest):
+            return False
+        expected_day = pd.Timestamp(expected_latest_trading_date).date() if expected_latest_trading_date else None
+        if expected_day is not None and (pd.isna(expected_day) or latest < expected_day):
+            return False
+        # 全市场股票池通常没有逐股源时间，周末下载不能要求存在周末日线。
+        # 只有基准确认的交易日能作为缺失源时间时的校验锚点。
+        if not quote.get("quote_time"):
+            return expected_day is not None
+        source = datetime.fromisoformat(quote["quote_time"])
+        if source.tzinfo is not None:
+            source = source.astimezone(ZoneInfo("Asia/Shanghai"))
         if source.time() >= datetime_time(15, 0):
             return latest == source.date()
         return 0 <= (source.date() - latest).days <= 7

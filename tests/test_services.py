@@ -178,6 +178,27 @@ class QuantServiceTests(unittest.TestCase):
         kept, _ = MarketDataService._filter_universe_rows(frame)
         self.assertEqual(sorted(kept["code"]), sorted(row["code"] for row in rows))
 
+    def test_universe_reference_metadata_does_not_replace_quote_metadata(self) -> None:
+        """名单缓存时间和过期状态不得覆盖股票池行情的来源与时效。"""
+        service = Mock()
+        quote_meta = {
+            "complete": True, "source": "完整行情接口", "is_stale": False,
+            "fetched_at": "2026-10-17T21:01:08+08:00", "status": "接口获取",
+        }
+        service.get_universe.return_value = (pd.DataFrame([{
+            "code": "600000", "name": "普通公司", "price": 10.0,
+        }]), quote_meta)
+        reference_meta = {
+            "source": "状态名单", "fetched_at": "2026-10-17T16:08:06+08:00",
+            "status": "名单缓存", "is_stale": True,
+        }
+        with patch("services.scanning.load_reference", return_value=(_empty_reference(), reference_meta)):
+            _, meta = candidate_codes("沪深京全部 A 股", "", 20, service)
+        for key, value in quote_meta.items():
+            self.assertEqual(meta[key], value)
+        self.assertEqual(meta["universe_reference"], reference_meta)
+        self.assertEqual(service.quote_from_universe_row.call_args.args[1]["fetched_at"], quote_meta["fetched_at"])
+
     def test_chinext_scope_keeps_new_302_segment(self) -> None:
         """302 号段漏登记时，这批股票会从创业板扫描里静默消失而不报错。"""
         class FakeMarketData:
