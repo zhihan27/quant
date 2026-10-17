@@ -177,10 +177,10 @@ def evaluate_ndcg(frame: pd.DataFrame, k: int | None = None, score_column: str =
 def objective_label(objective: str) -> str:
     """把目标函数标识转换为页面可读名称。"""
     return {
-        SCORE_KIND_RANK: "排序目标（LambdaMART / NDCG）",
-        SCORE_KIND_RETURN: "回归目标（MSE / MAE）",
-        "lambdarank": "排序目标（LambdaMART / NDCG）",
-        "regression": "回归目标（MSE / MAE）",
+        SCORE_KIND_RANK: "排序目标（比较同日股票强弱）",
+        SCORE_KIND_RETURN: "回归目标（预测超额收益）",
+        "lambdarank": "排序目标（比较同日股票强弱）",
+        "regression": "回归目标（预测超额收益）",
         "auto": "自动择优（同时训练排序与回归目标）",
     }.get(str(objective), str(objective))
 

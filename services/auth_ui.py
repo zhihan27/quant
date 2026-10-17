@@ -122,14 +122,14 @@ def require_login() -> dict[str, Any]:
                 '<section class="quant-login-hero">'
                 '<div class="quant-login-brand"><span class="quant-login-mark">研</span>'
                 '<div><strong>量化研究</strong><small>行情 · 策略 · 持仓 · 监控</small></div></div>'
-                '<div><div class="quant-login-kicker">A SHARE RESEARCH WORKSPACE</div>'
+                '<div><div class="quant-login-kicker">股票量化研究工作台</div>'
                 '<h1>量化研究工作台</h1>'
                 '<p>行情、选股、策略与持仓，在统一工作台中完成。</p></div></section>',
                 unsafe_allow_html=True,
             )
         with right:
             st.markdown(
-                '<div class="quant-login-heading"><small>SECURE SIGN IN</small></div>',
+                '<div class="quant-login-heading"><small>安全登录</small></div>',
                 unsafe_allow_html=True,
             )
             st.title("量化研究登录")

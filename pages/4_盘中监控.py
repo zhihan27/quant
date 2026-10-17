@@ -35,8 +35,8 @@ with st.form("monitor_configuration"):
     columns = st.columns(4)
     poll = columns[0].number_input("快照轮询（秒）", min_value=3, max_value=60, value=int(configuration["poll_seconds"]))
     minute = columns[1].number_input("分钟线同步（秒）", min_value=30, max_value=300, value=int(configuration["minute_seconds"]), step=30)
-    entry = columns[2].number_input("入场偏离 Z", min_value=1.5, max_value=5.0, value=float(configuration["entry_z"]), step=0.1)
-    exit_z = columns[3].number_input("回归偏离 Z", min_value=0.0, max_value=4.9, value=float(configuration["exit_z"]), step=0.1)
+    entry = columns[2].number_input("入场偏离（标准分）", min_value=1.5, max_value=5.0, value=float(configuration["entry_z"]), step=0.1)
+    exit_z = columns[3].number_input("回归偏离（标准分）", min_value=0.0, max_value=4.9, value=float(configuration["exit_z"]), step=0.1)
     st.caption("监控范围只有开启监控的自选和全部持仓，其余代码一律不监控。最多50只，实际轮询速度受网络和行情源限制。非交易时段快照每60秒采集，分钟线每5分钟同步。")
     if st.form_submit_button("保存监控设置", type="primary"):
         try:
@@ -112,7 +112,10 @@ def show_live_status() -> None:
                 selected = st.selectbox("分钟图代码", codes)
                 frame = pd.DataFrame(repository.minute_history(selected, 240))
                 if not frame.empty:
-                    st.line_chart(frame.set_index("date")[["close"]])
+                    st.line_chart(
+                        frame.rename(columns={"date": "时间", "close": "收盘价"}).set_index("时间")[["收盘价"]],
+                        x_label="时间", y_label="价格", alt="所选股票的分钟收盘价走势",
+                    )
                 else:
                     st.info("尚无分钟线。")
     except (DatabaseError, ValueError) as exc:

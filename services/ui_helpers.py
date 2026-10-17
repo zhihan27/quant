@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager, nullcontext
 from html import escape
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator, Sequence
 
 import streamlit as st
@@ -20,7 +21,8 @@ def apply_page_style() -> None:
         :root { --quant-ink: #172b4d; --quant-accent: #087f8c; }
         [data-testid="stAppViewContainer"] { background: #f4f7fb; }
         [data-testid="stHeader"] { background: rgba(244,247,251,.94); }
-        .block-container { max-width: 1560px; padding: 1.6rem 2rem 5rem; }
+        /* 顶部间距由 Streamlit 预留，避免页面标题被工具栏遮挡。 */
+        .block-container { max-width: 1560px; padding-inline: 2rem; padding-bottom: 5rem; }
         [data-testid="stSidebar"] { background: #fff; border-right: 1px solid #e4ebf3; }
         [data-testid="stSidebarNav"] a { border-radius: 8px; margin: 3px 0; padding-left: 12px; }
         [data-testid="stSidebarNav"] a[aria-current="page"] {
@@ -77,7 +79,7 @@ def apply_page_style() -> None:
         @keyframes quant-spin { to { transform: rotate(360deg); } }
         @media (prefers-reduced-motion: reduce) { .quant-loading-ring { animation: none; } }
         @media (max-width: 768px) {
-            .block-container { padding: 1.3rem 1rem 7rem; }
+            .block-container { padding-inline: 1rem; padding-bottom: 7rem; }
             .quant-loading { bottom: 16px; right: 20px; padding: 16px 18px; }
             .quant-loading strong { font-size: 16px; }
             [data-testid="stTabs"] [role="tab"] { padding: 8px 12px; }
@@ -85,6 +87,12 @@ def apply_page_style() -> None:
         </style>
         """,
         unsafe_allow_html=True,
+    )
+    # 当前框架未提供中文语言配置，统一补齐其内置工具栏和弹出菜单的操作文案。
+    localization = Path(__file__).resolve().parents[1] / "assets" / "ui_zh_cn.js"
+    st.html(
+        f"<script>{localization.read_text(encoding='utf-8')}</script>",
+        unsafe_allow_javascript=True,
     )
 
 
@@ -217,7 +225,7 @@ def show_candles(frame: pd.DataFrame, title: str, count: int) -> None:
             high=chart_data["high"],
             low=chart_data["low"],
             close=chart_data["close"],
-            name="OHLC",
+            name="开高低收",
             increasing_line_color="#e45756",
             decreasing_line_color="#14967f",
         ),
@@ -242,7 +250,7 @@ def show_candles(frame: pd.DataFrame, title: str, count: int) -> None:
     )
     figure.update_yaxes(title_text="价格", row=1, col=1)
     figure.update_yaxes(title_text="成交量", row=2, col=1)
-    st.plotly_chart(figure, use_container_width=True)
+    st.plotly_chart(figure, width="stretch", alt=f"{title}的价格与成交量走势")
 
 
 def show_backtest_metrics(metrics: dict[str, Any], benchmark_return: float | None) -> None:

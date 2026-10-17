@@ -459,7 +459,7 @@ if state and state.get("code") == selected_code:
                 "排名靠前只说明相对更强，不等于这只股票一定会涨。"
             )
         st.warning("模型没通过检验时不会给出预测分数，只显示它为什么没通过——宁可说“这次不知道”，也不给一个看着像结论的数字。")
-        with st.expander("展开技术指标（Rank IC、NDCG、HAC t 值等）"):
+        with st.expander("展开模型检验指标与详细说明"):
             st.dataframe(pd.DataFrame(model_rows), hide_index=True, use_container_width=True)
             st.caption(
                 "Rank IC 衡量模型把当天该涨的股票排在前面的能力，0.02 以上才算有点用；"
@@ -590,14 +590,14 @@ if state and state.get("code") == selected_code:
 
     with st.expander("配对观察：找两只长期同涨同跌的股票"):
         left, right = st.columns(2)
-        code_a = left.text_input("股票 A 代码", max_chars=6, key="pair_a")
-        code_b = right.text_input("股票 B 代码", max_chars=6, key="pair_b")
+        code_a = left.text_input("第一只股票代码", max_chars=6, key="pair_a")
+        code_b = right.text_input("第二只股票代码", max_chars=6, key="pair_b")
         if st.button("检验配对关系", key="pair_test"):
             try:
                 with loading_task("配对统计分析", exclusive=True) as task:
-                    task.step("1 / 3 · 获取股票 A 历史", 0, 3)
+                    task.step("1 / 3 · 获取第一只股票历史", 0, 3)
                     history_a, meta_a = service.get_history(code_a, count=1000, adjusted=True)
-                    task.step("2 / 3 · 获取股票 B 历史", 1, 3)
+                    task.step("2 / 3 · 获取第二只股票历史", 1, 3)
                     history_b, meta_b = service.get_history(code_b, count=1000, adjusted=True)
                     if any("过期" in meta.get("status", "") for meta in (meta_a, meta_b)):
                         raise MarketDataError("配对历史已过期，不生成套利信号。")
@@ -622,7 +622,7 @@ if state and state.get("code") == selected_code:
                     ("现在怎么做", pair_result.get("signal") or "暂无",
                      "差距偏大就反过来做，偏小就正着做；回到 0 附近就平仓观察。"),
                 ])
-            with st.expander("展开原始检验数据（beta、协整 p 值等，给懂行的人看）"):
+            with st.expander("展开配对关系检验的原始数据"):
                 st.json(pair_result)
 
 
