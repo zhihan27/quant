@@ -227,7 +227,7 @@ class AuthDatabaseTests(unittest.TestCase):
             "services.runtime.get_repository", return_value=self.repository
         ), patch("services.runtime.get_market_data", return_value=object()), patch.dict(
             os.environ, {"QUANT_DISABLE_MONITOR": "1"}
-        ):
+        ), patch("services.scan_store.load_scan_result", return_value=None):
             app = AppTest.from_file(settings.PROJECT_ROOT / "app.py", default_timeout=20)
             app.session_state["auth_token"] = self.service.login("tester", self.password, "127.0.0.1")
             app.run()
@@ -304,6 +304,58 @@ class AuthDatabaseTests(unittest.TestCase):
                 self.assertTrue(any("失败或排除 302 只" in text for text in captions))
                 self.assertTrue(any("测试血缘说明" in text for text in captions))
                 self.assertFalse(any("KeyError" in str(item.value) for item in app.warning))
+
+    def test_result_board_filters_before_limit_for_readers_and_admins(self):
+        """页面先筛板块再截行数，技术明细与跳转列表使用相同板块，且切换不重训。"""
+        from unittest.mock import MagicMock
+
+        self.service.ensure_initial_admin()
+        codes_by_board = {
+            "沪深主板": [f"600{index:03d}" for index in range(22)],
+            "创业板": [f"300{index:03d}" for index in range(21)] + ["302001"],
+            "科创板": [f"688{index:03d}" for index in range(22)],
+            "北交所": [f"920{index:03d}" for index in range(22)],
+        }
+        rows = [{"代码": code, "名称": f"样本{index}", "综合评分": 90 - index / 10}
+                for index, code in enumerate(code for codes in codes_by_board.values() for code in codes)]
+        payload = {
+            "model_version": settings.MODEL_VERSION, "finished_at": "2026-10-17T22:00:00+08:00",
+            "reference_date": "2026-10-16", "pool_mode": "沪深京全部 A 股", "display_limit": 20,
+            "rows": rows, "detail_rows": rows, "failed_rows": [], "notes": [],
+            "scan_stats": {"scanned": 5, "scored": 5, "failed": 0},
+            "usable": [{"code": row["代码"], "name": row["名称"]} for row in rows],
+        }
+        market = MagicMock()
+        market.history_fetch_summary.return_value = {
+            "success_count": 0, "stale_count": 0, "failure_count": 0, "by_stock": [], "failures": [],
+        }
+        market.request_diagnostics.return_value = []
+        health = {"degraded": False, "error": None}
+        with patch("services.auth_ui.get_auth_service", return_value=self.service), patch(
+            "services.runtime.get_repository", return_value=self.repository
+        ), patch("services.runtime.get_market_data", return_value=market), patch(
+            "services.model_governance.current_model_status", return_value=health
+        ), patch("services.scan_store.load_scan_result", return_value=payload), patch(
+            "services.scan_pipeline.train_scan_snapshot"
+        ) as train, patch("services.scan_pipeline.collect_scan_snapshot") as collect, patch.dict(
+            os.environ, {"QUANT_DISABLE_MONITOR": "1"}
+        ):
+            for username, password in (("tester", self.password), ("admin", INITIAL_ADMIN_PASSWORD)):
+                app = AppTest.from_file(settings.PROJECT_ROOT / "app.py", default_timeout=20)
+                app.session_state["auth_token"] = self.service.login(username, password, "127.0.0.1")
+                app.run()
+                app.switch_page(str(settings.PROJECT_ROOT / "pages" / "2_量化选股.py")).run()
+                self.assertFalse(app.exception)
+                self.assertEqual([len(table.value) for table in app.dataframe[:4]], [20] * 4)
+                for board, codes in codes_by_board.items():
+                    app.segmented_control(key="scan_result_board").set_value(board).run()
+                    self.assertFalse(app.exception)
+                    self.assertEqual(list(app.dataframe[0].value["代码"]), codes[:20])
+                    self.assertEqual(list(app.dataframe[1].value["代码"]), codes[:20])
+                    links = next(item for item in app.selectbox if item.label == "查看完整个股分析")
+                    self.assertEqual([label.split()[0] for label in links.options], codes)
+            train.assert_not_called()
+            collect.assert_not_called()
 
     def test_pending_account_cannot_log_in_before_activation(self):
         self.service.create_pending_user("newcomer")

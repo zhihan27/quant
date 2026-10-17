@@ -173,6 +173,22 @@ class PassRateAlertTests(unittest.TestCase):
         alerts = evaluate_pass_rate_alerts(self._many(0, 20), self._streaks([False, False]))
         self.assertFalse([item for item in alerts if "连续" in item["title"]])
 
+    def test_three_horizons_in_one_scan_do_not_form_a_failure_streak(self):
+        streaks = [{**row, "horizon": horizon, "position": 1}
+                   for row, horizon in zip(self._streaks([False] * 3), (5, 20, 60))]
+        self.assertEqual(evaluate_pass_rate_alerts(self._many(0, 6), streaks), [])
+
+    def test_versions_do_not_share_a_failure_streak(self):
+        streaks = [{**row, "model_version": str(index), "horizon": 20, "position": 1}
+                   for index, row in enumerate(self._streaks([False] * 3))]
+        self.assertEqual(evaluate_pass_rate_alerts(self._many(0, 6), streaks), [])
+
+    def test_failure_alert_identifies_the_horizon(self):
+        streaks = [{**row, "horizon": 20} for row in self._streaks([False] * 3)]
+        alerts = evaluate_pass_rate_alerts(self._many(0, 6), streaks)
+        self.assertEqual(len(alerts), 1)
+        self.assertIn("20日", alerts[0]["title"])
+
     def test_a_pass_in_the_streak_resets_it(self):
         """连续要求的是「最近 N 次都不通过」，中间过了一次就不算连续。"""
         alerts = evaluate_pass_rate_alerts(
@@ -370,6 +386,37 @@ class ValidationLogDatabaseTests(unittest.TestCase):
         log_validation(self.repository, validation_records(context))
         log_validation(self.repository, validation_records(context))
         self.assertEqual(len(fetch_validation_rows(self.repository, days=1)), 2)
+
+    def test_streaks_separate_horizons_and_deduplicate_training_batches(self):
+        from services.model_monitor import fetch_failure_streaks, log_validation
+
+        context = {"context_id": "batch-1", "model_version": settings.MODEL_VERSION, "models": {
+            horizon: [{"model": "LightGBM", "objective": "lambdarank", "status": "样本不足"}]
+            for horizon in (5, 20, 60)
+        }}
+        log_validation(self.repository, validation_records(context))
+        log_validation(self.repository, validation_records(context))
+        streaks = fetch_failure_streaks(self.repository, 3)
+        self.assertEqual(len(streaks), 3)
+        self.assertTrue(all(row["position"] == 1 for row in streaks))
+        self.assertEqual(evaluate_pass_rate_alerts([], streaks), [])
+        for batch in ("batch-2", "batch-3"):
+            context["context_id"] = batch
+            log_validation(self.repository, validation_records(context))
+        streaks = fetch_failure_streaks(self.repository, 3)
+        self.assertEqual(len(streaks), 9)
+        self.assertEqual({row["details"]["horizon"] for row in evaluate_pass_rate_alerts([], streaks)}, {"5", "20", "60"})
+
+    def test_streaks_do_not_mix_model_versions(self):
+        from services.model_monitor import fetch_failure_streaks, log_validation
+
+        for version in ("old", settings.MODEL_VERSION):
+            for batch in range(2):
+                context = {"context_id": f"{version}-{batch}", "model_version": version, "models": {
+                    20: [{"model": "LightGBM", "objective": "lambdarank", "status": "样本不足"}]
+                }}
+                log_validation(self.repository, validation_records(context))
+        self.assertEqual(evaluate_pass_rate_alerts([], fetch_failure_streaks(self.repository, 3)), [])
 
 
 if __name__ == "__main__":

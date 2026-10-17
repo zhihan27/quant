@@ -192,6 +192,34 @@ class CrossSectionRankerTests(unittest.TestCase):
 class RollingTrainingWindowTests(unittest.TestCase):
     """滚动窗口必须只保留最近N个交易日，且窗口内的标签仍不跨越测试期。"""
 
+    def test_sparse_early_history_does_not_discard_later_features(self):
+        panel = _panel(days=440, stocks=10)
+        early = panel["date"].isin(panel["date"].drop_duplicates().iloc[:120])
+        panel = panel.loc[~early | panel["code"].eq("000000")].copy()
+        columns = [f"xs_{column}" for column in FEATURE_COLUMNS]
+        panel.loc[early.reindex(panel.index), columns] = np.nan
+        result = fit_panel_model(panel, "LightGBM", 20)
+        self.assertEqual(result["features_used"], columns)
+        self.assertGreater(result["samples"], 2000)
+        self.assertGreaterEqual(result["oos_metrics"]["dates"], 40)
+
+    def test_feature_warmup_is_excluded_from_calibration(self):
+        panel = _panel(days=440, stocks=10)
+        columns = [f"xs_{column}" for column in FEATURE_COLUMNS]
+        panel.loc[panel["date"].isin(panel["date"].drop_duplicates().iloc[:120]), columns] = np.nan
+        result = fit_panel_model(panel, "LightGBM", 20)
+        self.assertEqual(result["features_used"], columns)
+        self.assertGreaterEqual(result["oos_metrics"]["dates"], 40)
+
+    def test_features_available_only_after_calibration_are_not_selected(self):
+        panel = _panel(days=440, stocks=10)
+        panel["xs_late"] = np.nan
+        panel.loc[panel["date"].isin(panel["date"].drop_duplicates().iloc[300:]), "xs_late"] = 1.0
+        panel.attrs["model_feature_columns"] = [f"xs_{column}" for column in FEATURE_COLUMNS] + ["xs_late"]
+        result = fit_panel_model(panel, "LightGBM", 20)
+        self.assertTrue(result["validated"], result["status"])
+        self.assertNotIn("xs_late", result["features_used"])
+
     def test_window_truncates_training_history(self):
         panel = _panel(days=1200)
         result = fit_panel_model(panel, "LightGBM", 20, window=250, objective="lambdarank")

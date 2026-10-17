@@ -204,7 +204,7 @@ FINAL_HOLDOUT_REPORT_NAME = "final_holdout_report.json"
 # 通过率监控。每轮训练每个模型每个周期各写一行，一次全量扫描约产生 6 行。
 PASS_RATE_WINDOW_DAYS = 30
 PASS_RATE_MINIMUM = 0.60
-# 连续多少次不通过触发告警。按「同一次扫描里的同一个模型/周期」计连续，不跨周期混算。
+# 同一版本、模型、目标和预测周期连续多少个训练批次不通过时告警，不跨周期或重复批次计数。
 CONSECUTIVE_FAILURE_ALERT = 3
 GATE_FAILURE_RATE_ALERT = 0.50
 # 比例类告警的最小样本量：月内不足这么多条记录时不判通过率与门槛失败率，

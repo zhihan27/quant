@@ -323,25 +323,32 @@ def get_recent_failures(repository: QuantRepository, limit: int = 20) -> list[di
 
 
 def fetch_failure_streaks(repository: QuantRepository, limit: int) -> list[dict[str, Any]]:
-    """按「模型类型 + 目标」分组取最近 limit 次结果，用于判断连续失败。"""
+    """按版本、模型、目标和预测周期读取不同训练批次的最近结果。"""
     with repository.connect() as connection:
         return connection.execute(
-            # position 必须出现在外层 SELECT 里：判定函数按它取「最近 limit 次」，
-            # 漏掉这一列会让连续失败告警在有任何一条检验记录时直接 KeyError。
-            "SELECT model_type, target_type, pass, failed_gate, scan_time, position FROM ("
-            "  SELECT model_type, target_type, pass, failed_gate, scan_time,"
-            "         row_number() OVER (PARTITION BY model_type, target_type "
+            # 同一批次的重复写入只取最后一条，三个预测周期分别统计，不能合成三次失败。
+            "WITH batches AS ("
+            "  SELECT *, details->>'horizon' AS horizon,"
+            "         row_number() OVER ("
+            "           PARTITION BY model_version, model_type, target_type, details->>'horizon',"
+            "                        COALESCE(NULLIF(details->>'context_id', ''), scan_time::text)"
+            "           ORDER BY scan_time DESC, id DESC) AS batch_position"
+            "  FROM public.quant_model_validation_log WHERE model_version = %s"
+            "), ranked AS ("
+            "  SELECT model_version, model_type, target_type, horizon, pass, failed_gate, scan_time,"
+            "         row_number() OVER (PARTITION BY model_version, model_type, target_type, horizon "
             "                            ORDER BY scan_time DESC, id DESC) AS position"
-            "  FROM public.quant_model_validation_log"
-            ") ranked WHERE position <= %s ORDER BY model_type, target_type, position",
-            (int(limit),),
+            "  FROM batches WHERE batch_position = 1"
+            ") SELECT * FROM ranked WHERE position <= %s "
+            "ORDER BY model_version, model_type, target_type, horizon, position",
+            (settings.MODEL_VERSION, int(limit)),
         ).fetchall()
 
 
 def evaluate_pass_rate_alerts(rows: Sequence[dict[str, Any]], streaks: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
     """三条通过率告警的判定，纯函数。
 
-    1. 同一个「模型类型 + 目标」连续 N 次不通过；
+    1. 同一版本、模型、目标和预测周期连续 N 个训练批次不通过；
     2. 窗口内总通过率低于下限；
     3. 某道门槛的失败率高于上限。
 
@@ -351,25 +358,30 @@ def evaluate_pass_rate_alerts(rows: Sequence[dict[str, Any]], streaks: Sequence[
     """
     alerts: list[dict[str, Any]] = []
     required = int(settings.CONSECUTIVE_FAILURE_ALERT)
-    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    grouped: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
     for row in streaks:
-        grouped.setdefault((str(row["model_type"]), str(row["target_type"])), []).append(row)
-    for (model_type, target_type), series in sorted(grouped.items()):
+        key = (str(row.get("model_version") or settings.MODEL_VERSION), str(row["model_type"]),
+               str(row["target_type"]), str(row.get("horizon") or ""))
+        grouped.setdefault(key, []).append(row)
+    for (version, model_type, target_type, horizon), series in sorted(grouped.items()):
         ordered = sorted(series, key=lambda item: item["position"])
         if len(ordered) < required or any(row.get("pass") for row in ordered[:required]):
             continue
         latest = ordered[0]
         gate = latest.get("failed_gate")
+        period = f" · {horizon}日" if horizon else ""
         alerts.append({
             "level": "critical",
             "category": "pass_rate",
-            "title": f"{MODEL_TYPE_CODES_REVERSE.get(model_type, model_type)} 连续 {required} 次未通过验证",
+            "model_version": version,
+            "title": f"{MODEL_TYPE_CODES_REVERSE.get(model_type, model_type)}{period} 连续 {required} 次未通过验证",
             "message": (
-                f"模型 {MODEL_TYPE_CODES_REVERSE.get(model_type, model_type)}（目标 {target_type}）"
-                f"已连续 {required} 次未通过样本外验证，最近一次卡在「{GATE_LABELS.get(gate, gate)}」。"
+                f"模型 {MODEL_TYPE_CODES_REVERSE.get(model_type, model_type)}（目标 {target_type}{period}）"
+                f"已连续 {required} 个训练批次未通过验证，最近一次卡在「{GATE_LABELS.get(gate, gate)}」。"
             ),
             "details": {
-                "model_type": model_type, "target_type": target_type, "consecutive": required,
+                "model_type": model_type, "target_type": target_type, "horizon": horizon,
+                "consecutive": required,
                 "failed_gate": gate, "latest_scan_time": latest["scan_time"].isoformat(),
             },
         })

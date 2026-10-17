@@ -293,9 +293,14 @@ def fit_panel_model(
     window = int(settings.TRAINING_WINDOW_DAYS if window is None else window)
     frame = panel.loc[panel["date"] < cutoff].copy() if cutoff is not None else panel
     target, endpoint = f"target_{horizon}", f"label_end_{horizon}"
-    all_dates = frame["date"].drop_duplicates().sort_values()
     feature_pool = list(panel.attrs.get("model_feature_columns") or [f"xs_{column}" for column in FEATURE_COLUMNS])
-    calibration = frame.loc[frame["date"].isin(all_dates.iloc[:80])]
+    feature_pool = [column for column in feature_pool if column in frame]
+    # 个别股票的历史可能远早于全市场；仅从有足够有效特征的截面起算校准期，
+    # 避免最早的孤立日期把后续数百万行有效样本误判为没有特征。
+    required = max(MINIMUM_STOCKS, math.ceil(frame["code"].nunique() * MINIMUM_COVERAGE))
+    coverage = frame[feature_pool].notna().groupby(frame["date"], sort=True).sum()
+    calibration_dates = coverage.index[coverage.ge(required).any(axis=1)][:MINIMUM_TRAIN_DATES]
+    calibration = frame.loc[frame["date"].isin(calibration_dates)]
     features = [
         column for column in feature_pool
         if column in calibration and calibration[column].notna().sum() >= MINIMUM_STOCKS * 20

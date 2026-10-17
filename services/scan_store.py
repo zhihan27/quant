@@ -3,8 +3,7 @@
 扫描排名原先只写在 Streamlit 会话里，刷新即丢，因此除了点按钮的那个人，谁也不知道
 今天扫描选出了什么。定时任务跑完之后更需要在界面上留下痕迹，故把它落成一份 JSON。
 
-只存页面要渲染的表格，不存全池逐股分析结果：全市场五千多只股票连同各自的模型输出
-序列化后是几十兆，而只读视图最多也就看前若干行。
+只保存完整的轻量结果表，不存全池逐股分析对象，供页面先按板块筛选、再限制显示行数。
 """
 
 from __future__ import annotations
@@ -48,9 +47,10 @@ def build_payload(result: ScanResult) -> dict[str, Any]:
         "reference_date": result.reference_date,
         "context_id": result.context_id,
         "scan_stats": result.scan_stats,
-        "rows": result.rows[:limit],
-        "detail_rows": result.detail_rows[:limit],
-        "failed_rows": result.failed_rows[:limit],
+        "display_limit": limit,
+        "rows": result.rows,
+        "detail_rows": result.detail_rows,
+        "failed_rows": result.failed_rows,
         "usable": result.usable,
         "notes": result.notes,
         "portfolio": _compact_portfolio(result.portfolio_result),

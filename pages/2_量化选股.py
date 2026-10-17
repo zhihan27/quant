@@ -20,6 +20,7 @@ from services.scan_pipeline import (
     train_scan_snapshot,
 )
 from services.scan_store import build_payload, load_scan_result, save_scan_result
+from services.scanning import RESULT_BOARD_OPTIONS, filter_result_board
 from services.ui_helpers import (
     loading_task,
     show_conclusion,
@@ -64,15 +65,11 @@ if is_admin:
     service = get_market_data()
     with st.container(border=True):
         st.subheader("筛选条件")
-        display_columns = st.columns([3, 1], vertical_alignment="bottom")
-        display_columns[0].caption(
+        st.caption(
             f"扫描范围固定为「{FULL_MARKET_POOL_MODE}」：排名与评分是所有账号共用的，"
             "只扫某个板块会让其他人看不到其余板块的结论。"
         )
-        scan_limit = display_columns[1].number_input(
-            "表格最多显示几行", min_value=1, max_value=100, value=20, step=1,
-            help="只影响页面显示多少行，实际扫描的股票数量不受它限制。",
-        )
+        scan_limit = 20
         include_backtest = st.checkbox(
             "同时看每只股票的历史模拟回测（全市场会很慢）", value=False,
             help="采集时同时冻结逐股回测所需的不复权日线，训练时离线回放历史买卖；会明显拉长采集和计算时间。旧快照未准备回测数据时需要重新采集。",
@@ -245,6 +242,17 @@ if rows:
     )
     for note in payload.get("notes") or []:
         NOTE_RENDERERS.get(note.get("level", "caption"), st.caption)(note["text"])
+    result_board = st.segmented_control(
+        "结果板块", RESULT_BOARD_OPTIONS, default="全部板块", selection_mode="single",
+        key="scan_result_board", help="按板块查看全市场分析结果，评分与排名仍采用全市场口径。",
+    ) or "全部板块"
+    display_limit = 20
+    display_boards = RESULT_BOARD_OPTIONS[1:] if result_board == "全部板块" else (result_board,)
+    # 必须先筛板块再截取前几名，避免全市场前几名没有该板块时错误显示为空。
+    rows = filter_result_board(rows, result_board)
+    st.caption(f"当前范围「{result_board}」共 {len(rows):,} 只，各板块分别展示前 20 只；评分保留全市场口径。")
+    if not rows:
+        st.info("本次结果中没有该板块的股票，请切换板块。")
     scored_rows = [row for row in rows if row.get("综合评分") is not None]
     best = max(scored_rows, key=lambda row: row["综合评分"]) if scored_rows else None
     show_conclusion(
@@ -256,31 +264,37 @@ if rows:
         f"扫描明细：行情与因子分析完成 {scan_stats.get('scored', 0):,} 只；"
         f"具有综合评分 {len(scored_rows):,} 只；失败或排除 {scan_stats.get('failed', 0):,} 只。"
     )
-    st.dataframe(
-        pd.DataFrame(rows),
-        hide_index=True,
-        width="stretch",
-        column_config={
-            "综合评分": st.column_config.NumberColumn(
-                "综合评分",
-                format="%.1f",
-                help="把因子分和模型分加权后的总分（0~100）。只和同一天的其他股票比，分数高表示相对更值得看。",
-            ),
-            "涨跌幅": st.column_config.NumberColumn(
-                "涨跌幅", format="%.2f", help="最近一次行情相对上一收盘价的涨跌，单位是百分比。"
-            ),
-            "参考买入区间": st.column_config.TextColumn(
-                "参考买入区间",
-                help="按日常波动幅度算出的参考价，不是成交价。次日开盘不在这个区间内，就不假设买到了。",
-            ),
-            "止损参考": st.column_config.NumberColumn(
-                "止损参考", format="%.2f", help="跌破这个价格就按规则卖出，用来限制单只股票最多亏多少。"
-            ),
-            "推荐理由": st.column_config.TextColumn("推荐理由", width="large"),
-            "主要风险": st.column_config.TextColumn("主要风险", width="large"),
-        },
-    )
-    detail_rows = payload.get("detail_rows") or []
+    for board in display_boards:
+        board_rows = filter_result_board(rows, board)
+        st.subheader(f"{board} · 前 {min(len(board_rows), display_limit)} 只")
+        if not board_rows:
+            st.info(f"本次结果中没有{board}的股票。")
+            continue
+        st.dataframe(
+            pd.DataFrame(board_rows[:display_limit]),
+            hide_index=True,
+            width="stretch",
+            column_config={
+                "综合评分": st.column_config.NumberColumn(
+                    "综合评分",
+                    format="%.1f",
+                    help="把因子分和模型分加权后的总分（0~100）。只和同一天的其他股票比，分数高表示相对更值得看。",
+                ),
+                "涨跌幅": st.column_config.NumberColumn(
+                    "涨跌幅", format="%.2f", help="最近一次行情相对上一收盘价的涨跌，单位是百分比。"
+                ),
+                "参考买入区间": st.column_config.TextColumn(
+                    "参考买入区间",
+                    help="按日常波动幅度算出的参考价，不是成交价。次日开盘不在这个区间内，就不假设买到了。",
+                ),
+                "止损参考": st.column_config.NumberColumn(
+                    "止损参考", format="%.2f", help="跌破这个价格就按规则卖出，用来限制单只股票最多亏多少。"
+                ),
+                "推荐理由": st.column_config.TextColumn("推荐理由", width="large"),
+                "主要风险": st.column_config.TextColumn("主要风险", width="large"),
+            },
+        )
+    detail_rows = filter_result_board(payload.get("detail_rows") or [], result_board)
     with st.expander(f"展开技术指标明细（{len(detail_rows):,} 行，给懂行的人看）"):
         st.caption(
             "截面Z分数＝这只股票的模型分比当天全市场平均值高出多少（0 是平均，正数更看好）；"
@@ -288,11 +302,15 @@ if rows:
             "20日预测值在排序目标下只是同一天里的相对排名百分位，只有回归目标下才是预期超额收益；"
             "时序因子分只看这只股票自己的历史，和全市场比出来的综合评分不是一回事。"
         )
-        st.dataframe(pd.DataFrame(detail_rows), hide_index=True, width="stretch")
-    failed_rows = payload.get("failed_rows") or []
+        for board in display_boards:
+            board_details = filter_result_board(detail_rows, board)
+            if board_details:
+                st.caption(board)
+                st.dataframe(pd.DataFrame(board_details[:display_limit]), hide_index=True, width="stretch")
+    failed_rows = filter_result_board(payload.get("failed_rows") or [], result_board)
     if failed_rows:
         with st.expander(f"查看失败或排除股票（{len(failed_rows):,}）"):
-            st.dataframe(pd.DataFrame(failed_rows), hide_index=True, use_container_width=True)
+            st.dataframe(pd.DataFrame(failed_rows[:display_limit]), hide_index=True, width="stretch")
     if is_admin:
         # 行情接口的成功率与代理诊断是运维信息，只给管理员看，也只给管理员取。
         st.caption("以下为全局历史行情采集记录（含此前任务）；本轮股票的失败原因请以上方清单为准。")
@@ -303,7 +321,7 @@ if rows:
         )
         if history_summary["by_stock"]:
             with st.expander(f"查看逐股历史行情状态与接口成功率（{len(history_summary['by_stock']):,}）"):
-                st.dataframe(pd.DataFrame(history_summary["by_stock"]), hide_index=True, use_container_width=True)
+                st.dataframe(pd.DataFrame(history_summary["by_stock"]), hide_index=True, width="stretch")
         if history_summary["failures"]:
             with st.expander("查看全局历史行情失败记录（含此前任务）"):
                 st.dataframe(pd.DataFrame(history_summary["failures"]), hide_index=True, width="stretch")
@@ -312,8 +330,8 @@ if rows:
             st.caption(f"检测到系统代理：{proxy or '未设置'}；实际连接路由：{service.network.status()}。详细请求记录写入 logs/market_data.log。")
             request_rows = service.request_diagnostics()
             if request_rows:
-                st.dataframe(pd.DataFrame(request_rows), hide_index=True, use_container_width=True)
-    usable = payload.get("usable") or []
+                st.dataframe(pd.DataFrame(request_rows), hide_index=True, width="stretch")
+    usable = filter_result_board(payload.get("usable") or [], result_board, code_key="code")
     if usable:
         labels = [f"{item['code']}  {item['name']}" for item in usable]
         selected = st.selectbox("查看完整个股分析", labels)

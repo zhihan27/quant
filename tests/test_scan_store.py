@@ -1,4 +1,4 @@
-"""验证扫描结果的落盘与读回：原子写、行数截断、明细剔除、以及坏文件不抛异常。"""
+"""验证扫描结果的落盘、板块筛选、明细剔除与坏文件处理。"""
 
 import json
 import tempfile
@@ -8,6 +8,7 @@ from pathlib import Path
 from config import settings
 from services.scan_pipeline import ScanOptions, ScanResult
 from services.scan_store import build_payload, load_scan_result, save_scan_result
+from services.scanning import filter_result_board
 
 
 def _result(scan_limit: int = 2, trigger: str = "manual") -> ScanResult:
@@ -51,12 +52,29 @@ class ScanStoreTests(unittest.TestCase):
         self.assertEqual(payload["pool_mode"], "用户自定义")
         self.assertEqual(payload["notes"][0]["text"], "测试血缘说明")
 
-    def test_rows_are_truncated_to_the_display_limit(self):
-        """全池逐股结果序列化后是几十兆，落盘只留页面要渲染的那几行。"""
+    def test_lightweight_rows_are_kept_before_board_filtering(self):
+        """保存完整轻量表，避免截断全市场排名后丢失其他板块的候选。"""
         save_scan_result(_result(scan_limit=2), self.path)
         payload = load_scan_result(self.path)
-        self.assertEqual(len(payload["rows"]), 2)
-        self.assertEqual(len(payload["detail_rows"]), 2)
+        self.assertEqual(payload["display_limit"], 2)
+        self.assertEqual(len(payload["rows"]), 5)
+        self.assertEqual(len(payload["detail_rows"]), 5)
+
+    def test_board_filter_preserves_scores_and_covers_each_board(self):
+        rows = [{"代码": code, "综合评分": 90 - index} for index, code in enumerate(
+            ("600000", "000001", "300001", "301001", "302001", "688001", "689001", "920001", "830001")
+        )]
+        self.assertEqual(filter_result_board(rows, "沪深主板"), rows[:2])
+        self.assertEqual(filter_result_board(rows, "创业板"), rows[2:5])
+        self.assertEqual(filter_result_board(rows, "科创板"), rows[5:7])
+        self.assertEqual(filter_result_board(rows, "北交所"), rows[7:])
+        self.assertEqual(filter_result_board(rows, "全部板块"), rows)
+        self.assertEqual(filter_result_board(rows, "科创板")[:1], rows[5:6])
+
+    def test_board_filter_handles_stock_links_and_empty_results(self):
+        rows = [{"code": "000001"}, {"code": "688001"}]
+        self.assertEqual(filter_result_board(rows, "科创板", code_key="code"), rows[1:])
+        self.assertEqual(filter_result_board(rows, "创业板", code_key="code"), [])
 
     def test_portfolio_details_are_not_persisted(self):
         save_scan_result(_result(), self.path)

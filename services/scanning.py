@@ -17,6 +17,20 @@ from services.universe import filter_universe, load_reference
 LOGGER = logging.getLogger("quant.scanning")
 
 
+RESULT_BOARD_OPTIONS = ("全部板块", "沪深主板", "创业板", "科创板", "北交所")
+
+
+def filter_result_board(rows: list[dict[str, Any]], board: str, code_key: str = "代码") -> list[dict[str, Any]]:
+    """按证券代码筛选结果板块，保留全市场评分与原排序。"""
+    if board == "全部板块":
+        return list(rows)
+    scope = {"沪深主板": "main", "创业板": "chinext", "科创板": "star", "北交所": "bj"}.get(board)
+    if scope is None:
+        raise ValueError(f"未知板块：{board}")
+    prefixes = settings.BOARD_PREFIXES[scope]
+    return [row for row in rows if str(row.get(code_key) or "").zfill(6).startswith(prefixes)]
+
+
 def load_universe_reference(data_service: MarketDataService, progress: Any = None) -> tuple[Any, dict[str, Any]]:
     """读取退市与 ST 名单；接口不可用时降级为证券简称启发式，并如实说明降级原因。"""
     try:
