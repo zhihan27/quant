@@ -155,10 +155,34 @@ rows = (payload or {}).get("rows") or []
 scan_stats = (payload or {}).get("scan_stats") or {}
 
 if not rows:
-    if is_admin:
+    if payload and scan_stats.get("scanned"):
+        show_empty_state("本轮未生成候选结果", "扫描已经结束，但没有可展示的候选；下方提供有效数量、失败原因和数据源状态。")
+    elif is_admin:
         show_empty_state("配置范围，开始发现候选股票", "首次可使用少量自定义代码体验。全市场扫描包含逐股行情获取与模型训练，耗时取决于股票数量和网络。")
     else:
         show_empty_state("还没有可看的扫描结果", "管理员或收盘后的定时任务跑完第一轮全市场扫描后，这里会显示候选排名。")
+    if payload and scan_stats.get("scanned"):
+        st.warning(
+            f"最近一轮扫描已结束：处理 {scan_stats.get('scanned', 0):,} 只，"
+            f"有效 {scan_stats.get('scored', 0):,} 只，失败或排除 {scan_stats.get('failed', 0):,} 只；"
+            "本轮没有生成可展示的候选行。"
+        )
+        for note in payload.get("notes") or []:
+            NOTE_RENDERERS.get(note.get("level", "caption"), st.caption)(note["text"])
+        if is_admin:
+            failed_rows = payload.get("failed_rows") or []
+            if failed_rows:
+                with st.expander(f"查看失败或排除股票（{len(failed_rows):,}）", expanded=True):
+                    st.dataframe(pd.DataFrame(failed_rows), hide_index=True, width="stretch")
+            st.caption("以下为全局历史行情采集记录（含此前任务）；本轮股票的失败原因请以上方清单为准。")
+            history_summary = service.history_fetch_summary()
+            st.caption(
+                f"历史行情状态：已成功/缓存 {history_summary['success_count']:,}；"
+                f"过期缓存 {history_summary['stale_count']:,}；获取失败 {history_summary['failure_count']:,}。"
+            )
+            if history_summary["failures"]:
+                with st.expander("查看全局历史行情失败记录（含此前任务）", expanded=True):
+                    st.dataframe(pd.DataFrame(history_summary["failures"]), hide_index=True, width="stretch")
 
 if rows:
     st.caption(
@@ -177,7 +201,8 @@ if rows:
         + " 评分是“同一天里相对更值得看”的排名，不是涨跌预测，也不保证赚钱。"
     )
     st.caption(
-        f"扫描明细：有效评分 {scan_stats.get('scored', 0):,} 只；失败或排除 {scan_stats.get('failed', 0):,} 只。"
+        f"扫描明细：行情与因子分析完成 {scan_stats.get('scored', 0):,} 只；"
+        f"具有综合评分 {len(scored_rows):,} 只；失败或排除 {scan_stats.get('failed', 0):,} 只。"
     )
     st.dataframe(
         pd.DataFrame(rows),
@@ -218,6 +243,7 @@ if rows:
             st.dataframe(pd.DataFrame(failed_rows), hide_index=True, use_container_width=True)
     if is_admin:
         # 行情接口的成功率与代理诊断是运维信息，只给管理员看，也只给管理员取。
+        st.caption("以下为全局历史行情采集记录（含此前任务）；本轮股票的失败原因请以上方清单为准。")
         history_summary = service.history_fetch_summary()
         st.caption(
             f"历史行情状态：已成功/缓存 {history_summary['success_count']:,}；"
@@ -227,8 +253,8 @@ if rows:
             with st.expander(f"查看逐股历史行情状态与接口成功率（{len(history_summary['by_stock']):,}）"):
                 st.dataframe(pd.DataFrame(history_summary["by_stock"]), hide_index=True, use_container_width=True)
         if history_summary["failures"]:
-            with st.expander("查看逐股历史行情失败原因"):
-                st.dataframe(pd.DataFrame(history_summary["failures"]), hide_index=True, use_container_width=True)
+            with st.expander("查看全局历史行情失败记录（含此前任务）"):
+                st.dataframe(pd.DataFrame(history_summary["failures"]), hide_index=True, width="stretch")
         with st.expander("查看接口请求及代理诊断"):
             proxy = service.proxy_configuration()
             st.caption(f"检测到系统代理：{proxy or '未设置'}；实际连接路由：{service.network.status()}。详细请求记录写入 logs/market_data.log。")
