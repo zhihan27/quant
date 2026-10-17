@@ -18,6 +18,8 @@ from streamlit.testing.v1 import AppTest
 from config import settings
 from services.auth import (
     INITIAL_ADMIN_PASSWORD,
+    SESSION_ABSOLUTE_DAYS,
+    SESSION_IDLE_HOURS,
     AuthService,
     AuthenticationError,
     token_digest,
@@ -141,7 +143,23 @@ class AuthDatabaseTests(unittest.TestCase):
     def test_session_expiry_and_disabled_user(self):
         token = self.service.login("tester", self.password, "127.0.0.1")
         with self.repository.connect() as connection:
-            connection.execute("UPDATE public.quant_auth_sessions SET last_seen_at=now()-interval '31 minutes'")
+            connection.execute(
+                "UPDATE public.quant_auth_sessions SET expires_at=now()-interval '1 hour', "
+                "last_seen_at=now()-interval '31 minutes'"
+            )
+        self.assertIsNotNone(self.service.session(token))
+        with self.repository.connect() as connection:
+            expiry = connection.execute(
+                "SELECT expires_at > now()+(%s * interval '1 day') - interval '1 day' "
+                "AND expires_at < now()+(%s * interval '1 day') + interval '1 day' AS valid "
+                "FROM public.quant_auth_sessions",
+                (SESSION_ABSOLUTE_DAYS, SESSION_ABSOLUTE_DAYS),
+            ).fetchone()
+            self.assertTrue(expiry["valid"])
+            connection.execute(
+                "UPDATE public.quant_auth_sessions SET last_seen_at=now()-(%s * interval '1 hour')",
+                (SESSION_IDLE_HOURS + 1,),
+            )
         self.assertIsNone(self.service.session(token))
         token = self.service.login("tester", self.password, "127.0.0.1")
         self.service.disable_user("tester")
