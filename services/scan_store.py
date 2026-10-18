@@ -16,6 +16,7 @@ from typing import Any
 
 from config import settings
 from services.scan_pipeline import ScanResult
+from services.style_factors import production_report_is_current
 
 LOGGER = logging.getLogger("quant.scan_store")
 
@@ -53,6 +54,9 @@ def build_payload(result: ScanResult) -> dict[str, Any]:
         "failed_rows": result.failed_rows,
         "usable": result.usable,
         "notes": result.notes,
+        "market_regime": result.market_regime,
+        "actionable_rankings": result.actionable_rankings,
+        "style_factors": result.style_factors,
         "portfolio": _compact_portfolio(result.portfolio_result),
     }
 
@@ -82,5 +86,8 @@ def load_scan_result(path: Path | None = None) -> dict[str, Any] | None:
             LOGGER.warning("扫描结果不可读 path=%s detail=%s", target, exc)
         return None
     if not isinstance(payload, dict) or payload.get("model_version") != settings.MODEL_VERSION:
+        return None
+    if not production_report_is_current(payload.get("style_factors")):
+        LOGGER.warning("扫描结果的风格规则或独立验收已失效，需重新训练")
         return None
     return payload

@@ -14,7 +14,7 @@
 
 不伪造结果是本模块的硬约束，有三处必须写明而不是给数：
 
-1. 行情源未提供 PE/PB，**估值维度无数据源**，如实标注「未接入」而不是算一个假 PSI；
+1. 没有通过点时核验的历史价值字段时，估值维度如实标注「未接入」而不是算一个假 PSI；
 2. 本地股票池只有几十只，单日截面在 10 个分箱下绝大多数箱计数不足 5，PSI 会剧烈抖动、
    天天误报严重。因此当前分布取最近 N 个交易日**池化**，且有效样本数低于下限时
    明确判「样本不足」，不给等级；
@@ -311,13 +311,17 @@ def _coverage_row(
 
 
 def _valuation_row(panel: pd.DataFrame, reference_dates: list, current_dates: list, report_date: str) -> dict[str, Any]:
-    """估值维度。
-
-    本系统的行情源（东方财富股票池接口）只返回代码、名称、价格、涨跌、成交量成交额、
-    市值与行业，**没有任何 PE/PB/PS 字段**；``services/exposures.py::build_exposure_frame``
-    也只透传市值与行业。因此这里如实写「未接入」，而不是拿一个不相干的列冒充估值。
-    要接入需要先补一个稳定的估值数据源，这属于新增数据采集，不在本次改动范围内。
-    """
+    """监控可靠点时 E/P、B/P、S/P 的原始分布，汇总为最严重的估值漂移。"""
+    columns = [column for column in ("earnings_yield", "book_to_price", "sales_to_price") if column in panel]
+    if columns and "style_value_pit" in panel and panel["style_value_pit"].eq(True).any():
+        reliable = panel.copy()
+        reliable.loc[~reliable["style_value_pit"].eq(True), columns] = np.nan
+        rows = [_numeric_row("估值", column, reliable, reference_dates, current_dates, report_date) for column in columns]
+        priority = {LEVEL_UNAVAILABLE: 0, LEVEL_INSUFFICIENT: 1, LEVEL_OK: 2, LEVEL_WATCH: 3, LEVEL_SEVERE: 4}
+        worst = max(rows, key=lambda row: priority[row["threshold_exceeded"]])
+        detail = "；".join(f"{row['feature_name_column']}：{row['threshold_exceeded']}" for row in rows)
+        worst["note"] = f"点时价值原始分布；{detail}；{worst['note'] or '按最严重项汇总'}"
+        return worst
     reference_start, reference_end = _span(reference_dates)
     current_start, current_end = _span(current_dates)
     return {
@@ -326,7 +330,7 @@ def _valuation_row(panel: pd.DataFrame, reference_dates: list, current_dates: li
         "window_start": current_start, "window_end": current_end,
         "psi": None, "ks_stat": None, "missing_rate": None, "mean_shift": None,
         "threshold_exceeded": LEVEL_UNAVAILABLE, "sample_size": 0,
-        "note": "未接入：现有行情源不提供 PE/PB/PS，股票池接口与暴露数据都没有估值字段；需先补一个稳定的估值数据源才能监控该维",
+        "note": "未接入：面板没有通过点时核验的历史 PE/PB/PS 或 E/P、B/P、S/P；当前估值快照及未核验修订版本不能用于该维监控",
     }
 
 

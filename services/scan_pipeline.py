@@ -34,6 +34,9 @@ from services.progress import throttled
 from services.rank_model import objective_label
 from services.scanning import candidate_codes, rank_candidates, validated_return
 from services.stock_scoring import analyze_stock
+from services.style_factors import load_history
+from services.market_regime import classify_market, save_regime
+from services.rebalancing import ranking_snapshot
 
 LOGGER = logging.getLogger("quant.scan_pipeline")
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -68,6 +71,8 @@ class ScanOptions:
     training_window: int = settings.TRAINING_WINDOW_DAYS
     enable_neutralization: bool = True
     use_extra_factors: bool = True
+    enable_size_features: bool = settings.ENABLE_SIZE_FEATURES
+    enable_value_features: bool = settings.ENABLE_VALUE_FEATURES
     run_portfolio: bool = False
     portfolio_top_n: int = settings.PORTFOLIO_TOP_N
     max_position_weight: float = settings.MAX_POSITION_WEIGHT
@@ -98,6 +103,9 @@ class ScanResult:
     context_id: str | None = None
     reference_date: str | None = None
     finished_at: str = ""
+    market_regime: dict[str, Any] = field(default_factory=dict)
+    actionable_rankings: list[dict[str, Any]] = field(default_factory=list)
+    style_factors: dict[str, Any] = field(default_factory=dict)
 
     def note(self, level: str, text: str) -> None:
         """记一条要显示给用户的数据血缘说明，level 取 Streamlit 的展示通道名。"""
@@ -397,20 +405,31 @@ def _build_extra_factor_data(
     progress: ProgressCallback | None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """筹码、日内与 PIT 财报因子。筹码需要逐股历史，续跑记录从 PanelStore 回读。"""
-    if not options.use_extra_factors:
-        return {}, {}
     if not reference_date:
         return {}, {"status": "缺少截面日期，未装配新增因子", "families": {}}
     histories: dict[str, pd.DataFrame] = {}
-    for item in records:
+    needs_factors = options.use_extra_factors or options.enable_size_features or options.enable_value_features
+    for item in records if needs_factors else []:
         if item.get("error"):
             continue
         frame, error = acquisition_store.snapshot_history(item, reference_date, service.panels)
         if error is None and frame is not None:
             histories[str(item["code"])] = frame
-    extra_factors, extra_meta = build_extra_factors(
-        service.panels, list(histories), histories=histories, progress=_message_only(progress),
-    )
+    extra_factors, extra_meta = {}, {}
+    if options.use_extra_factors:
+        extra_factors, extra_meta = build_extra_factors(
+            service.panels, list(histories), histories=histories, progress=_message_only(progress),
+        )
+    if options.enable_size_features or options.enable_value_features:
+        extra_factors["valuation"] = load_history(service.panels, list(histories))
+    try:
+        small, meta = service.get_history(settings.MARKET_SMALL_INDEX_CODE, count=1200, adjusted=True, market_id=1)
+        if "过期" in str(meta.get("status", "")):
+            raise MarketDataError("中证1000缓存已过期")
+        extra_factors["market_small"] = completed_daily_history(small)
+    except (MarketDataError, OSError, ValueError) as exc:
+        LOGGER.warning("中证1000不可用，市场状态降级 detail=%s", exc)
+        extra_meta["market_regime_warning"] = f"中证1000不可用：{type(exc).__name__}"
     return extra_factors, extra_meta
 
 
@@ -442,6 +461,14 @@ def _finish_pipeline(
 
     total = len(records)
     ready = [item for item in records if not item.get("error")]
+    reference_date = expected_reference_date or _benchmark_reference_date(benchmark)
+    if reference_date:
+        result.market_regime = classify_market(
+            {item["code"]: item["history"] for item in ready}, benchmark,
+            (extra_factors or {}).get("market_small"), reference_date, exposures,
+            full_market=options.pool_mode == FULL_MARKET_POOL_MODE,
+            explicit_style=options.enable_size_features or options.enable_value_features,
+        )
     if options.enable_neutralization and exposure_meta:
         if exposures is None:
             result.note("warning", f"市值与行业暴露不可用，本次不做中性化：{exposure_meta.get('limitation', '')}")
@@ -457,18 +484,26 @@ def _finish_pipeline(
     context: dict[str, Any] = {}
     panel: pd.DataFrame | None = None
     panel_box: dict[str, Any] = {}
+    training_factors = {
+        name: frame for name, frame in (extra_factors or {}).items()
+        if name != "market_small" and (name == "valuation" or options.use_extra_factors)
+    }
+    if options.enable_size_features or options.enable_value_features:
+        training_factors.setdefault("valuation", pd.DataFrame())
     try:
         context = train_market_context(
             {item["code"]: item["history"] for item in ready}, benchmark,
-            metadata={**source_meta, "pool_mode": options.pool_mode}, progress=_message_only(progress),
+            metadata={**source_meta, "pool_mode": options.pool_mode, "market_regime": result.market_regime}, progress=_message_only(progress),
             exposures=exposures, objective=options.objective_mode, window=int(options.training_window),
-            extra_factors=(extra_factors or None) if options.use_extra_factors else None,
+            extra_factors=training_factors or None,
+            style_options={"size": options.enable_size_features, "value": options.enable_value_features},
             store=getattr(service, "panels", None),
             persist=options.pool_mode == FULL_MARKET_POOL_MODE and expected_reference_date is None,
             panel_out=panel_box,
         )
         result.context_id = context.get("context_id")
         result.reference_date = context.get("reference_date")
+        result.style_factors = context.get("style_factors") or {}
         result.note("info", (
             f"共享模型上下文 {context['context_id'][:12]} · 截面日期 {context['reference_date']} · {len(ready)}只有效股票"
         ))
@@ -575,6 +610,15 @@ def _finish_pipeline(
 
     _report(progress, "所有股票处理结束，正在汇总评分与排序…", total, total)
     result.recommendations = rank_candidates(records)
+    result.actionable_rankings = ranking_snapshot(result.recommendations, result.reference_date)
+    if result.market_regime and governance is not None and options.pool_mode == FULL_MARKET_POOL_MODE:
+        repository = getattr(governance, "repository", None)
+        if repository is not None:
+            try:
+                save_regime(repository, result.market_regime, result.context_id, options.trigger)
+            except Exception as exc:
+                LOGGER.exception("扫描市场状态未落库")
+                result.note("warning", f"市场状态落库失败：{type(exc).__name__}，当前仅保留扫描结果")
     result.rows, result.detail_rows, result.failed_rows, result.usable = _build_rows(result.recommendations)
     result.scan_stats = {
         "scanned": total,
@@ -698,6 +742,7 @@ def train_scan_snapshot(
     mismatched = [
         name for name in (
             "pool_mode", "custom_codes", "enable_neutralization", "use_extra_factors",
+            "enable_size_features", "enable_value_features",
         )
         if stored.get(name) != getattr(options, name, None)
     ]

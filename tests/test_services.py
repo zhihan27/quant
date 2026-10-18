@@ -357,7 +357,8 @@ class QuantServiceTests(unittest.TestCase):
     def test_history_cache_is_refetched_when_a_new_trading_day_appears(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             service = MarketDataService(db_path=Path(temporary_directory) / "new_day.db")
-            day = (datetime.now(SHANGHAI) - timedelta(days=2)).date()
+            # 固定在相邻工作日，避免周末运行时把周六当成下一交易日。
+            day = pd.Timestamp("2026-10-14").date()
             rows = _daily_rows([(day - timedelta(days=1)).isoformat(), day.isoformat()])
             fetched_at = datetime.combine(day, datetime_time(16, 0), tzinfo=SHANGHAI).isoformat(timespec="seconds")
             _seed_history_cache(service, "600000", rows, fetched_at)

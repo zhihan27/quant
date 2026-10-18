@@ -157,7 +157,8 @@ class StagedScanTests(unittest.TestCase):
         snapshot = self._collect()
         self.assertEqual(snapshot.status, "ready")
         self.assertEqual(self.service.history_calls.count(settings.MARKET_INDEX_CODE), 1)
-        self.assertEqual(len(self.service.history_calls), 3)
+        self.assertEqual(self.service.history_calls.count(settings.MARKET_SMALL_INDEX_CODE), 1)
+        self.assertEqual(len(self.service.history_calls), 4)
         self.service.history_calls.clear()
 
         captured, _ = self._train_patches()

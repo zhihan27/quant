@@ -10,6 +10,7 @@ import pandas as pd
 
 from config import settings
 from services.feature_engineering import build_features
+from services.stock_style import fundamental_status
 from services.timing_strategy import plan_from_features
 
 FACTOR_WEIGHTS = {
@@ -223,6 +224,6 @@ def analyze_stock(
         "cross_section_scope": market_context.get("limitation") if market_context else "尚未建立历史截面",
         "prediction_reference_price": reference_price,
         "prediction_reference_date": str(latest.get("date", ""))[:10],
-        "fundamental_status": "未接入可验证的历史披露数据，基本面因子未参与评分",
+        "fundamental_status": fundamental_status(model_results),
     }
 

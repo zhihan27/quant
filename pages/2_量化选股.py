@@ -21,6 +21,7 @@ from services.scan_pipeline import (
 )
 from services.scan_store import build_payload, load_scan_result, save_scan_result
 from services.scanning import RESULT_BOARD_OPTIONS, filter_result_board
+from services.research_ui import show_market_regime, show_style_status
 from services.ui_helpers import (
     loading_task,
     show_conclusion,
@@ -44,6 +45,7 @@ is_admin = bool(account["is_admin"])
 # 降级状态下本页仍可正常浏览，但评分列会是空的——先在页顶说清楚为什么，
 # 免得使用者以为是扫描坏了。状态只读一次，扫描管线内部再按同一次读取执行。
 model_health = current_model_status(get_repository())
+show_market_regime(get_repository())
 if model_health["degraded"]:
     st.error(
         f"**{settings.DEGRADED_SCORING_MESSAGE}。** 原因：{model_health['reason'] or '未记录'}。"
@@ -100,6 +102,11 @@ if is_admin:
             value=True,
             help="在原有量价因子之上，再叠加筹码分布集中度、日内波动率衰减与订单流代理、以及按公告日对齐的财报因子。财报因子只在公告日之后才生效，不会用到当时还没公布的数字；某一类因子覆盖不到的交易日会留空，覆盖率不足时模型自动忽略该类因子。",
         )
+        style_columns = st.columns(2)
+        enable_size_features = style_columns[0].checkbox("显式学习市值风格", value=settings.ENABLE_SIZE_FEATURES,
+            help="需要可靠历史市值和匹配当前规则的独立验收。未通过时记录排除原因。")
+        enable_value_features = style_columns[1].checkbox("显式学习估值风格", value=settings.ENABLE_VALUE_FEATURES,
+            help="使用当时可用的 E/P、B/P、S/P；未核验修订版本的历史估值不会入模。")
         with st.expander("更多（可选）：用自定义代码试跑"):
             custom_codes = st.text_input("自定义代码（逗号或空格分隔）", placeholder="例：600000,000001")
             st.caption("留空即扫描全部 A 股。填了代码只在本页试跑，结果不落盘，也不会覆盖其他人看到的全市场结论。")
@@ -112,6 +119,7 @@ if is_admin:
         pool_mode=pool_mode, custom_codes=custom_codes, scan_limit=int(scan_limit),
         objective_mode=objective_mode, training_window=int(training_window),
         enable_neutralization=enable_neutralization, use_extra_factors=use_extra_factors,
+        enable_size_features=enable_size_features, enable_value_features=enable_value_features,
         include_backtest=include_backtest, trigger="manual",
     )
 
@@ -200,6 +208,8 @@ else:
     )
 
 payload = st.session_state.get("scan_result") or load_scan_result()
+if payload:
+    show_style_status(payload.get("style_factors"))
 rows = (payload or {}).get("rows") or []
 scan_stats = (payload or {}).get("scan_stats") or {}
 

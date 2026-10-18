@@ -515,10 +515,10 @@ class MarketDataService:
     def get_quote(self, code: str) -> dict[str, Any]:
         """优先读取有效快照，主源仅有过期缓存时继续尝试备用源。"""
         code = _clean_code(code)
-        cache_key = f"quote:{code}"
+        cache_key = f"quote:v2:{code}"
         params = {
             "secid": f"{_market_id(code)}.{code}",
-            "fields": "f57,f58,f43,f44,f45,f46,f47,f48,f59,f60,f162,f168,f86",
+            "fields": "f57,f58,f43,f44,f45,f46,f47,f48,f59,f60,f116,f117,f152,f162,f164,f167,f168,f86",
         }
         quote: dict[str, Any] | None = None
         try:
@@ -533,6 +533,7 @@ class MarketDataService:
                 raise MarketDataError("行情源返回的股票代码与请求代码不一致。")
             digits = int(payload.get("f59") or 2)
             scale = 10**digits
+            # 官方行情脚本将 f162 定义为动态 PE，f164 才是 TTM，f167 是 PB。
             price = _number(payload.get("f43"))
             previous_close = _number(payload.get("f60"))
             price = price / scale if price is not None and price > 0 else None
@@ -581,7 +582,13 @@ class MarketDataService:
                 "low": _scaled(payload.get("f45"), scale),
                 "previous_close": previous_close,
                 "turnover_rate": _number(payload.get("f168")),
-                "pe_ttm": _number(payload.get("f162")),
+                "pe_ttm": _number(payload.get("f164")),
+                "pe_dynamic": _number(payload.get("f162")),
+                "pb": _number(payload.get("f167")),
+                "market_cap_total": _number(payload.get("f116")),
+                "market_cap_float": _number(payload.get("f117")),
+                "valuation_unit": "ratio",
+                "market_cap_unit": "CNY",
                 "quote_time": quote_timestamp,
                 "source": "东方财富公开行情接口",
                 "fetched_at": meta["fetched_at"],
@@ -659,6 +666,9 @@ class MarketDataService:
             "amount_yuan": amount_yuan, "open": _number(parts[1]),
             "high": _number(parts[4]), "low": _number(parts[5]),
             "previous_close": previous_close, "turnover_rate": None, "pe_ttm": None,
+            "pe_dynamic": None, "pb": None, "ps_ttm": None,
+            "market_cap_total": None, "market_cap_float": None,
+            "valuation_unit": "ratio", "market_cap_unit": "CNY",
             "quote_time": quote_time.isoformat(timespec="seconds"), "source": "新浪财经行情接口",
             "fetched_at": _now_text(), "data_status": data_status,
             "quote_valid": "过期" not in data_status,
@@ -688,6 +698,9 @@ class MarketDataService:
                 "low": _number(bar.get("low")),
                 "previous_close": None,
                 "turnover_rate": _number(bar.get("turnover_rate")),
+                "pe_ttm": None, "pe_dynamic": None, "pb": None, "ps_ttm": None,
+                "market_cap_total": None, "market_cap_float": None,
+                "valuation_unit": "ratio", "market_cap_unit": "CNY",
                 "quote_time": last_date,
                 "source": meta.get("source", "历史行情接口"),
                 "fetched_at": meta["fetched_at"],
@@ -734,7 +747,14 @@ class MarketDataService:
             "amount_yuan": _number(row.get("amount_yuan")), "open": _number(row.get("open")),
             "high": _number(row.get("high")), "low": _number(row.get("low")),
             "previous_close": _number(row.get("previous_close")),
-            "turnover_rate": _number(row.get("turnover_rate")), "pe_ttm": None,
+            "turnover_rate": _number(row.get("turnover_rate")),
+            "pe_ttm": _number(row.get("pe_ttm")),
+            "pb": _number(row.get("pb")),
+            "ps_ttm": _number(row.get("ps_ttm")),
+            "market_cap_total": _number(row.get("market_cap_total")),
+            "market_cap_float": _number(row.get("market_cap_float")),
+            "valuation_unit": "ratio",
+            "market_cap_unit": "CNY",
             "quote_time": None, "fetched_at": fetched_at, "source": meta.get("source"),
             "data_status": data_status, "quote_valid": not is_stale,
             "warning": meta.get("warning"),

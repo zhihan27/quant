@@ -23,6 +23,8 @@ from services.auth_ui import require_session
 from services.database import DatabaseError
 from services.runtime import get_repository
 from services.ui_helpers import show_empty_state, show_page_header
+from services.research_ui import show_market_regime, show_style_status
+from services.ml_pipeline import load_context
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 NO_DATA = "—"
@@ -61,6 +63,11 @@ if not account["is_admin"]:
 
 repository = get_repository()
 operator = account["username"]
+show_market_regime(repository)
+feature_context, _ = load_context()
+actual_features = sorted({column for models in (feature_context or {}).get("models", {}).values()
+                          for model in models for column in model.get("features_used", [])})
+show_style_status((feature_context or {}).get("style_factors"), actual_features)
 
 try:
     current_status = model_governance.model_status(repository)

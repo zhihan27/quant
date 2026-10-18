@@ -19,8 +19,12 @@ from services.ml_pipeline import (
 )
 from services.model_catalog import saved_models
 from services.model_governance import current_model_status
+from services.panel_store import PanelStore
 from services.rank_model import SCORE_KIND_RANK, objective_label
+from services.research_ui import show_stock_style_analysis
 from services.stock_scoring import analyze_stock
+from services.stock_style import build_stock_style_analysis
+from services.style_factors import load_history as load_style_history
 from services.statistical_arbitrage import analyze_pair
 from services.ui_helpers import format_number as _fmt
 from services.ui_helpers import show_backtest_metrics as _show_backtest_metrics
@@ -264,6 +268,11 @@ if run_analysis:
                 market_context=model_context,
                 scoring_paused=scoring_paused,
             )
+            # 仅个股分析时读取这一只的本地历史，不给逐股扫描增加磁盘或网络调用。
+            analysis["style_analysis"] = build_stock_style_analysis(
+                selected_code, analysis["prediction_reference_date"], quote, analysis["models"],
+                history=load_style_history(PanelStore(), [selected_code]), context=model_context,
+            )
             data_date = (
                 pd.to_datetime(completed["date"]).max().strftime("%Y-%m-%d")
                 if not completed.empty and "date" in completed else None
@@ -324,7 +333,7 @@ if state and state.get("code") == selected_code:
     plan = analysis.get("trade_plan", {})
     show_conclusion(*_stock_conclusion(plan))
 
-    chart_tab, factor_tab, model_tab, signal_tab = st.tabs(["行情图表", "走势打分", "模型判断", "买卖参考"])
+    chart_tab, factor_tab, model_tab, signal_tab = st.tabs(["行情图表", "因子分析", "模型判断", "买卖参考"])
     with chart_tab:
         st.caption(f"周线状态：{state['weekly_meta'].get('status', '可用')}")
         st.caption(
@@ -338,7 +347,7 @@ if state and state.get("code") == selected_code:
         st.caption(state.get("benchmark_status", ""))
         show_plain_numbers([
             (
-                "走势打分",
+                "量价走势打分",
                 _fmt(analysis.get("factor_score"), 1, " / 100"),
                 "把近期的涨跌、波动、量能等放在一起算出的 0~100 分（时序多因子评分）。"
                 "这只股票现在跟它自己的历史比是什么水平，分数越高越强。",
@@ -352,7 +361,8 @@ if state and state.get("code") == selected_code:
             st.dataframe(
                 factor_frame,
                 hide_index=True,
-                use_container_width=True,
+                width="stretch",
+                alt="量价时序因子的当前值、历史标准分与评分权重",
                 column_config={
                     "比平时高多少": st.column_config.NumberColumn(
                         help="拿这只股票自己的历史当尺子：0 表示和平时一样，+2 表示明显比平时高，-2 表示明显比平时低（时序 Z 值）。"
@@ -378,6 +388,7 @@ if state and state.get("code") == selected_code:
             "数值越大代表价格越不老实，买卖参考价也要留出更大空间。"
         )
         st.caption(analysis.get("fundamental_status", ""))
+        show_stock_style_analysis(analysis.get("style_analysis"))
     with model_tab:
         used_model = state.get("model") or {}
         model_reference = used_model.get("reference_date")

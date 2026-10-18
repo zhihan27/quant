@@ -9,6 +9,9 @@ import streamlit as st
 from config import settings
 from services.database import DatabaseError
 from services.portfolio import summarize_positions
+from services.rebalancing import build_checklist
+from services.scan_store import load_scan_result
+from services.model_governance import current_model_status
 from services.runtime import get_repository
 from services.ui_helpers import format_number, loading_task, show_empty_state, show_page_header
 
@@ -182,6 +185,22 @@ with position_tab:
             st.caption("浮盈亏未扣未来卖出费用。停牌、冻结、借券及券商可卖规则请按实际情况调整可卖数量。")
         else:
             show_empty_state("记录第一笔持仓", "填写股票、买入价和股数。支持同一股票分批买入，并可随时修改各批次。")
+        st.subheader("次日人工调仓清单")
+        checklist_top_n = st.number_input("保留模型前 N 名", min_value=1, max_value=500,
+            value=settings.PORTFOLIO_TOP_N, step=1, key="checklist_top_n")
+        health = current_model_status(repository)
+        checklist = build_checklist(positions, load_scan_result(), top_n=int(checklist_top_n),
+            scoring_paused=bool(health.get("degraded") or health.get("error")))
+        st.caption(f"排名截面：{checklist['reference_date'] or '未找到'}；成本止损比例 {settings.CHECKLIST_STOP_LOSS_RATIO:.0%}。")
+        for warning in checklist["warnings"]:
+            st.caption(warning)
+        for category, label in (("sell", "调出：卖出 / 止损"), ("buy", "调入：买入候选"),
+                                ("hold", "维持持仓"), ("review", "数据或风控待核查")):
+            with st.expander(f"{label}（{len(checklist[category])}）", expanded=bool(checklist[category])):
+                if checklist[category]:
+                    st.dataframe(pd.DataFrame(checklist[category]), hide_index=True, alt=label)
+                else:
+                    st.caption("当前没有符合条件的标的。")
 
 with audit_tab:
     if audit_tab.open:

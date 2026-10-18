@@ -76,7 +76,29 @@ BOARD_PREFIXES = {
 # 比股票池过滤用的具体号段更宽，故不并入 BOARD_PREFIXES。
 BSE_LIMIT_PREFIXES = ("4", "8", "92")
 MARKET_INDEX_CODE = "000300"
-MODEL_VERSION = "2.2.0"
+MODEL_VERSION = "2.3.0"
+
+# 显式风格特征默认关闭，必须先完成同口径对照和独立留出验收。
+STYLE_FEATURE_PROTOCOL = "pit-style-v1"
+ENABLE_BASE_FEATURES = True
+ENABLE_SIZE_FEATURES = False
+ENABLE_VALUE_FEATURES = False
+STYLE_MINIMUM_COVERAGE = 0.8
+STYLE_WINSOR_QUANTILES = (0.01, 0.99)
+STYLE_MINIMUM_MARKET_CAP = 1.0
+STYLE_MINIMUM_BOOK_EQUITY = 0.0
+STYLE_MINIMUM_REVENUE = 0.0
+STYLE_APPROVAL_PATH = MODEL_DIR / "style_acceptance.json"
+
+# 次日人工任务单使用固定买入成本止损，不使用每日重新计算的入场止损线。
+CHECKLIST_STOP_LOSS_RATIO = 0.08
+CHECKLIST_MINIMUM_AMOUNT = 20_000_000.0
+CHECKLIST_MAXIMUM_SCAN_AGE_DAYS = 7
+MARKET_SMALL_INDEX_CODE = "000852"
+MARKET_REGIME_MOMENTUM_DAYS = 20
+MARKET_REGIME_PERCENTILE_DAYS = 60
+MARKET_REGIME_MINIMUM_DAYS = 20
+MARKET_REGIME_STYLE_GAP = 0.02
 MODEL_HORIZONS = (5, 20, 30, 60)
 
 # 跨进程计算互斥：同一数据库同时只允许一个重计算任务（扫描、组合回测、滚动重训）。
@@ -243,7 +265,7 @@ DRIFT_HHI_MINIMUM_SAMPLES = 20
 # 覆盖率，由 services/extra_factors.py::summarize_extra_factors 计算。
 DRIFT_EXTRA_COVERAGE_SENTINEL = "__EXTRA_FACTOR_COVERAGE__"
 DRIFT_MONITORED_FEATURES = {
-    "估值": None,  # 行情源未提供 PE/PB/PS，见 drift_monitor 的未接入说明
+    "估值": None,  # 按可靠点时 E/P、B/P、S/P 汇总；没有历史则明确未接入
     "财务因子覆盖率": DRIFT_EXTRA_COVERAGE_SENTINEL,
     "波动率": "volatility_20",
     "换手率": "turnover_20",

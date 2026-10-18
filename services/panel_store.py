@@ -25,7 +25,7 @@ LOGGER = logging.getLogger("quant.panel_store")
 ADJUSTMENT_LABELS = {"qfq": "qfq", "raw": "raw"}
 # 按 code=*.parquet 分区的衍生数据目录：PIT 财务面板、筹码分布因子、高频日内因子，
 # 以及用于累积历史深度的原始分钟线。
-PARTITION_DIRECTORIES = ("fundamentals", "chip", "intraday", "intraday_bars")
+PARTITION_DIRECTORIES = ("fundamentals", "chip", "intraday", "intraday_bars", "valuation")
 
 
 def _now_text() -> str:

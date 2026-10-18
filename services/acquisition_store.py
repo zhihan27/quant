@@ -39,6 +39,7 @@ STORAGE_COLUMNS = ("stored_at", "history_source", "code")
 FINGERPRINT_FIELDS = (
     "pool_mode", "custom_codes", "scan_limit", "enable_neutralization", "use_extra_factors",
     "include_backtest",
+    "enable_size_features", "enable_value_features",
 )
 
 
@@ -490,7 +491,7 @@ def finalize(
         if exposures is not None and not exposures.empty:
             _atomic_frame(exposures, run.directory / "exposures.parquet")
         extra_factors = extra_factors or {}
-        for name in ("intraday", "financial"):
+        for name in ("intraday", "financial", "valuation", "market_small"):
             frame = extra_factors.get(name)
             if isinstance(frame, pd.DataFrame) and not frame.empty:
                 _atomic_frame(frame, run.directory / f"{name}.parquet")
@@ -679,6 +680,14 @@ def load_snapshot(
     if exposures_path.exists():
         exposures = pd.read_parquet(exposures_path)
     extra_factors: dict[str, Any] = {}
+    for name in ("valuation", "market_small"):
+        path = directory / f"{name}.parquet"
+        if path.exists():
+            try:
+                extra_factors[name] = pd.read_parquet(path)
+            except (OSError, ValueError, ImportError) as exc:
+                LOGGER.warning("读取冻结风格数据失败 name=%s detail=%s", name, exc)
+                raise ValueError("冻结风格数据损坏，请重新采集。") from exc
     if (meta.get("options") or {}).get("use_extra_factors"):
         extra_factors["chip"] = histories
         for name in ("intraday", "financial"):

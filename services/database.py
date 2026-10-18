@@ -119,6 +119,7 @@ class QuantRepository:
         migrations = [
             "001_portfolio_monitor.sql", "002_monitor_indexes.sql", "003_auth.sql", "004_admin_roles.sql",
             "005_model_governance.sql",
+            "006_market_regime.sql",
         ]
         with self.connect() as connection:
             exists = connection.execute("SELECT to_regclass('public.quant_schema_versions') AS name").fetchone()["name"]

@@ -181,6 +181,18 @@ class FeatureDriftTests(unittest.TestCase):
         self.assertIsNone(valuation["psi"])
         self.assertTrue(valuation["note"], "未接入必须写明原因")
 
+    def test_verified_value_distribution_is_monitored_but_unverified_values_are_not(self):
+        frame = _panel()
+        frame["earnings_yield"] = np.random.default_rng(3).normal(0.06, 0.01, len(frame))
+        frame.loc[frame["date"].gt(frame["date"].max() - pd.Timedelta(days=35)), "earnings_yield"] += 1
+        frame["style_value_pit"] = True
+        rows = {row["feature_name"]: row for row in feature_drift_rows(frame, current_days=20, reference_days=400)}
+        self.assertEqual(rows["估值"]["threshold_exceeded"], LEVEL_SEVERE)
+        self.assertEqual(rows["估值"]["feature_name_column"], "earnings_yield")
+        frame["style_value_pit"] = False
+        rows = {row["feature_name"]: row for row in feature_drift_rows(frame, current_days=20, reference_days=400)}
+        self.assertEqual(rows["估值"]["threshold_exceeded"], LEVEL_UNAVAILABLE)
+
     def test_categorical_dimension_uses_category_psi_not_ks(self):
         rows = {row["feature_name"]: row for row in feature_drift_rows(_panel(), current_days=20, reference_days=400)}
         industry = rows["行业分布"]

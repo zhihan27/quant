@@ -61,6 +61,41 @@ class QuoteFallbackTests(unittest.TestCase):
         self.assertIn("过期", quote["data_status"])
         self.assertIn("新浪失败", quote["warning"])
 
+    def test_quote_distinguishes_ttm_pe_from_dynamic_pe_and_preserves_cap(self):
+        now = datetime.now(ZoneInfo("Asia/Shanghai"))
+        payload = {
+            "f57": "301363", "f58": "美好医疗", "f43": 1490, "f60": 1480,
+            "f59": 2, "f116": 12_000_000_000, "f117": 8_000_000_000,
+            "f162": 24.5, "f164": 19.75, "f167": 3.2, "f86": int(now.timestamp()),
+        }
+        metadata = {"fetched_at": now.isoformat(), "status": "接口获取"}
+        with patch.object(self.service, "_request_with_cache", return_value=(payload, metadata)), patch.object(
+            self.service, "_get_sina_quote"
+        ) as sina:
+            quote = self.service.get_quote("301363")
+        self.assertEqual(quote["pe_ttm"], 19.75)
+        self.assertEqual(quote["pe_dynamic"], 24.5)
+        self.assertEqual(quote["pb"], 3.2)
+        self.assertEqual(quote["market_cap_total"], 12_000_000_000)
+        self.assertEqual(quote["market_cap_float"], 8_000_000_000)
+        self.assertTrue(quote["quote_valid"])
+        sina.assert_not_called()
+
+    def test_universe_quote_keeps_market_cap_units_and_marks_unavailable_valuation(self):
+        row = {
+            "code": "301363", "name": "美好医疗", "price": 14.9,
+            "market_cap_total": 12_000_000_000, "market_cap_float": 8_000_000_000,
+        }
+        metadata = {
+            "fetched_at": datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(),
+            "source": "东方财富完整股票池", "is_stale": False,
+        }
+        quote = self.service.quote_from_universe_row(row, metadata)
+        self.assertEqual(quote["market_cap_total"], 12_000_000_000)
+        self.assertEqual(quote["market_cap_unit"], "CNY")
+        self.assertIsNone(quote["pe_ttm"])
+        self.assertIsNone(quote["pb"])
+
     def test_custom_scan_reuses_current_universe_after_invalid_quote(self):
         candidate = {"code": "301363", "name": "美好医疗"}
         current = pd.DataFrame([{**candidate, "price": 14.9, "volume_lots": 94499.63}])

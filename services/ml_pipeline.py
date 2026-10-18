@@ -23,6 +23,7 @@ from services.neutralization import (
     NEUTRAL_PREFIX, attach_market_cap_exposure, neutralize_cross_section, neutralized_feature_columns,
 )
 from services.panel_store import PanelStore
+from services.style_factors import attach_style_factors, load_history, configuration_id, production_report_is_current
 from services.progress import throttled
 from services.label_processing import winsorize_training_labels
 from services.rank_model import (
@@ -75,6 +76,7 @@ def build_market_panel(
     histories: dict[str, pd.DataFrame], benchmark: pd.DataFrame, exposures: pd.DataFrame | None = None,
     extra_factors: dict[str, Any] | None = None, store: PanelStore | None = None,
     progress: Callable[[str], None] | None = None,
+    style_history: pd.DataFrame | None = None, style_options: dict[str, Any] | None = None,
 ) -> pd.DataFrame:
     """构造可追溯的股票日截面，可选对市值与行业暴露中性化，保留标签结束日以便按日期清除重叠样本。
 
@@ -149,6 +151,16 @@ def build_market_panel(
                 }
         model_features = [*model_features, *features]
         extra_report = {**extra_report, "model_features": len(features)}
+    if not settings.ENABLE_BASE_FEATURES:
+        model_features = []
+    panel.attrs["model_feature_columns"] = model_features
+    if style_history is None and extra_factors is not None:
+        style_history = extra_factors.get("valuation")
+    if style_history is None and store is not None and (settings.ENABLE_SIZE_FEATURES or settings.ENABLE_VALUE_FEATURES):
+        style_history = load_history(store, list(histories))
+    panel, style_report = attach_style_factors(panel, style_history, **(style_options or {}))
+    model_features = [*model_features, *style_report["model_feature_columns"]]
+    panel.attrs["style_factors"] = style_report
     # 截面覆盖只针对本次成功取得历史的股票池，不能冒充历史全市场成分。
     panel.attrs["universe_codes"] = sorted(histories)
     panel.attrs["exposures"] = exposure_report
@@ -298,7 +310,7 @@ def fit_panel_model(
         raise ValueError("样本外重训间隔必须为正整数。")
     frame = panel.loc[panel["date"] < cutoff].copy() if cutoff is not None else panel
     target, endpoint = f"target_{horizon}", f"label_end_{horizon}"
-    feature_pool = list(panel.attrs.get("model_feature_columns") or [f"xs_{column}" for column in FEATURE_COLUMNS])
+    feature_pool = list(panel.attrs.get("model_feature_columns", [f"xs_{column}" for column in FEATURE_COLUMNS]))
     feature_pool = [column for column in feature_pool if column in frame]
     # 个别股票的历史可能远早于全市场；仅从有足够有效特征的截面起算校准期，
     # 避免最早的孤立日期把后续数百万行有效样本误判为没有特征。
@@ -480,6 +492,7 @@ def train_market_context(
     exposures: pd.DataFrame | None = None, objective: str | None = None, window: int | None = None,
     extra_factors: dict[str, Any] | None = None, store: PanelStore | None = None,
     panel_out: dict[str, Any] | None = None,
+    style_options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """一次扫描汇总历史后按滚动窗口训练共享模型，供个股页和扫描页读取相同结果。
 
@@ -489,6 +502,7 @@ def train_market_context(
     """
     panel = build_market_panel(
         histories, benchmark, exposures=exposures, extra_factors=extra_factors, store=store, progress=progress,
+        style_options={**(style_options or {}), "objective": objective, "training_window": window},
     )
     if panel_out is not None:
         panel_out["panel"] = panel
@@ -505,6 +519,10 @@ def train_market_context(
                 "validation_retrain_days": settings.OOS_RETRAIN_DAYS,
                "exposures": panel.attrs.get("exposures"), "neutralization": panel.attrs.get("neutralization"),
                "extra_factors": panel.attrs.get("extra_factors"),
+               "style_factors": panel.attrs.get("style_factors"),
+               "model_feature_columns": panel.attrs.get("model_feature_columns"),
+               "feature_configuration_id": configuration_id(objective, window),
+               "market_regime": (metadata or {}).get("market_regime"),
                # 留出集状态随每次扫描重新注入：context 每轮都是新建的字典，
                # 不从报告文件读回来的话这四个字段永远显示「未评估」。
                **final_holdout_context_fields(),
@@ -516,6 +534,7 @@ def train_market_context(
             if progress:
                 progress(f"按交易日验证 {name} · {horizon}日截面排序模型")
             model = fit_panel_model(panel, name, horizon, objective=objective, window=window)
+            model["feature_protocol"] = settings.STYLE_FEATURE_PROTOCOL
             predicted = predict_panel(model, live)
             if model["validated"] and predicted.empty:
                 model.update(validated=False, status="最新截面不足或模型预测无差异，未输出排序")
@@ -575,6 +594,13 @@ def load_context(include_panel: bool = False) -> tuple[dict[str, Any] | None, pd
     try:
         context = joblib.load(path)
         if context.get("model_version") != settings.MODEL_VERSION or context.get("target_kind") != TARGET_KIND:
+            return None, None
+        expected = configuration_id(context.get("objective_mode"), context.get("training_window_days"))
+        if context.get("feature_configuration_id") and context["feature_configuration_id"] != expected:
+            LOGGER.warning("模型特征规则已变化，旧上下文不可复用，请重新训练")
+            return None, None
+        if not production_report_is_current(context.get("style_factors")):
+            LOGGER.warning("风格规则或独立验收已失效，拒绝继续读取旧模型权重")
             return None, None
         panel = pd.read_parquet(settings.DATA_DIR / f"ml_panel_v{settings.MODEL_VERSION}.parquet") if include_panel else None
         if panel is not None and panel.attrs.get("context_id") != context["context_id"]:
