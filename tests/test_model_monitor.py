@@ -140,6 +140,26 @@ class PassRateTests(unittest.TestCase):
         self.assertEqual(failure["failed_gate"], "ic_t")
         self.assertEqual(failure["reason"], GATE_LABELS["ic_t"])
 
+    def test_cached_validation_replays_are_deduplicated_in_health_statistics(self):
+        replay_identity = "same-validation"
+        older = _row(False, self.now - timedelta(days=2), failed_gate="rank_ic")
+        older.update(
+            model_version=settings.MODEL_VERSION,
+            details={"horizon": 20, "validation_identity": replay_identity},
+        )
+        replay = _row(False, self.now - timedelta(days=1), failed_gate="rank_ic")
+        replay.update(
+            model_version=settings.MODEL_VERSION,
+            details={"horizon": 20, "validation_identity": replay_identity},
+        )
+
+        summary = summarize_pass_rate([replay, older], days=30)
+
+        self.assertEqual(summary["records"], 1)
+        self.assertEqual(summary["failed"], 1)
+        self.assertEqual(summary["batch_count"], 1)
+        self.assertEqual(summary["recent_failure"]["scan_time"], replay["scan_time"].isoformat())
+
 
 class PassRateAlertTests(unittest.TestCase):
     """三条告警各自触发与不触发的边界。"""
@@ -260,6 +280,26 @@ class ValidationRecordTests(unittest.TestCase):
         record = validation_record(self._context(model, "5"), model, 5)
         self.assertIsNone(record["rank_ic"])
         self.assertIsNone(record["hac_t"])
+
+    def test_validation_audit_persists_cache_identity_and_sources_for_auto_mode(self):
+        execution = {
+            "validation_identity": "validation-id",
+            "validation_cache_sources": [{"validation_segment": 1, "source": "hot"}],
+            "validation_cache_replay": True,
+        }
+        model = {
+            "model": "LightGBM", "horizon": 20, "objective": "lambdarank",
+            "validated": False, "oos_metrics": _metrics(),
+            "objective_selection": [{
+                "objective": "lambdarank", "selected": True, "execution": execution,
+            }],
+        }
+
+        record = validation_record(self._context(model), model, 20)
+
+        self.assertEqual(record["details"]["validation_identity"], "validation-id")
+        self.assertEqual(record["details"]["validation_cache_sources"], execution["validation_cache_sources"])
+        self.assertTrue(record["details"]["validation_cache_replay"])
 
     def test_records_cover_every_model_and_horizon(self):
         context = {

@@ -62,7 +62,7 @@ def _zone_text(zone: Any) -> str:
 
 @dataclass(frozen=True)
 class ScanOptions:
-    """一次扫描的全部输入，字段与页面筛选表单一一对应。"""
+    """一次扫描的全部输入，包含页面选项与系统固定的风格因子配置。"""
 
     pool_mode: str
     custom_codes: str = ""
@@ -101,6 +101,8 @@ class ScanResult:
     recommendations: list[dict[str, Any]] = field(default_factory=list)
     portfolio_result: dict[str, Any] | None = None
     context_id: str | None = None
+    # 自定义股票池不发布为全局活动模型，但要在当前会话内供个股分析继续使用。
+    model_context: dict[str, Any] | None = None
     reference_date: str | None = None
     finished_at: str = ""
     market_regime: dict[str, Any] = field(default_factory=dict)
@@ -503,6 +505,7 @@ def _finish_pipeline(
             panel_out=panel_box,
         )
         result.context_id = context.get("context_id")
+        result.model_context = context
         result.reference_date = context.get("reference_date")
         result.style_factors = context.get("style_factors") or {}
         result.note("info", (

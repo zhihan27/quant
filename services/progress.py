@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+from time import monotonic
 from typing import Callable
 
 # 逐只循环的上报间隔。5174 只的筹码并入约每只 46 毫秒，即约 2.3 秒一条，
@@ -26,5 +27,24 @@ def throttled(total: int, every: int = PROGRESS_EVERY) -> Callable[[int], bool]:
     def should_report(index: int) -> bool:
         # 末条与整倍数落在同一次迭代时也只会进一次，不会重复上报。
         return index % every == 0 or index == total - 1
+
+    return should_report
+
+
+def interval_throttled(interval_seconds: float = 0.25) -> Callable[[bool], bool]:
+    """按时间间隔限制回调次数，并允许强制报告重要阶段。
+
+    传入 ``True`` 时强制上报；不传参数时仅当间隔到期才上报。
+    """
+    interval = max(0.0, float(interval_seconds))
+    last_reported_at: float | None = None
+
+    def should_report(force: bool = False) -> bool:
+        nonlocal last_reported_at
+        now = monotonic()
+        if not force and last_reported_at is not None and now - last_reported_at < interval:
+            return False
+        last_reported_at = now
+        return True
 
     return should_report

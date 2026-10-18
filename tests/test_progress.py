@@ -8,8 +8,9 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
-from services.progress import PROGRESS_EVERY, throttled
+from services.progress import PROGRESS_EVERY, interval_throttled, throttled
 
 
 def _fired(total: int) -> list[int]:
@@ -46,6 +47,21 @@ class ThrottledTests(unittest.TestCase):
     def test_throttling_keeps_the_message_count_far_below_the_pool(self) -> None:
         """节流本身不能失效：5174 只的回调必须远少于 5174 次。"""
         self.assertLess(len(_fired(5174)), 110)
+
+
+    def test_interval_throttle_suppresses_rapid_callbacks_and_allows_elapsed_updates(self) -> None:
+        should_report = interval_throttled(0.25)
+        with patch("services.progress.monotonic", side_effect=[1.0, 1.1, 1.3]):
+            self.assertTrue(should_report())
+            self.assertFalse(should_report())
+            self.assertTrue(should_report())
+
+    def test_interval_throttle_can_force_a_stage_update(self) -> None:
+        should_report = interval_throttled(1.0)
+        with patch("services.progress.monotonic", side_effect=[1.0, 1.1, 1.2]):
+            self.assertTrue(should_report())
+            self.assertTrue(should_report(force=True))
+            self.assertFalse(should_report())
 
 
 if __name__ == "__main__":

@@ -19,7 +19,12 @@ from services.scan_pipeline import (
     collect_scan_snapshot,
     train_scan_snapshot,
 )
-from services.scan_store import build_payload, load_scan_result, save_scan_result
+from services.scan_store import (
+    load_scan_result,
+    load_user_scan_result,
+    save_scan_result,
+    save_user_scan_result,
+)
 from services.scanning import RESULT_BOARD_OPTIONS, filter_result_board
 from services.research_ui import show_market_regime, show_style_status
 from services.ui_helpers import (
@@ -41,6 +46,12 @@ show_page_header(
 # 与 pages/5_账号管理.py 一样做二次校验，避免以后调整路由时越权。
 account = require_session()
 is_admin = bool(account["is_admin"])
+if is_admin:
+    st.page_link(
+        str(settings.PROJECT_ROOT / "pages" / "6_模型健康.py"),
+        label="模型管理（版本、回滚与删除）",
+        icon=":material/settings_suggest:",
+    )
 
 # 降级状态下本页仍可正常浏览，但评分列会是空的——先在页顶说清楚为什么，
 # 免得使用者以为是扫描坏了。状态只读一次，扫描管线内部再按同一次读取执行。
@@ -102,24 +113,21 @@ if is_admin:
             value=True,
             help="在原有量价因子之上，再叠加筹码分布集中度、日内波动率衰减与订单流代理、以及按公告日对齐的财报因子。财报因子只在公告日之后才生效，不会用到当时还没公布的数字；某一类因子覆盖不到的交易日会留空，覆盖率不足时模型自动忽略该类因子。",
         )
-        style_columns = st.columns(2)
-        enable_size_features = style_columns[0].checkbox("显式学习市值风格", value=settings.ENABLE_SIZE_FEATURES,
-            help="需要可靠历史市值和匹配当前规则的独立验收。未通过时记录排除原因。")
-        enable_value_features = style_columns[1].checkbox("显式学习估值风格", value=settings.ENABLE_VALUE_FEATURES,
-            help="使用当时可用的 E/P、B/P、S/P；未核验修订版本的历史估值不会入模。")
+        st.caption("市值与估值风格因子已设为统一默认候选配置；生产模型仍需匹配当前版本和配置的独立验收通过后才会纳入。")
         with st.expander("更多（可选）：用自定义代码试跑"):
             custom_codes = st.text_input("自定义代码（逗号或空格分隔）", placeholder="例：600000,000001")
-            st.caption("留空即扫描全部 A 股。填了代码只在本页试跑，结果不落盘，也不会覆盖其他人看到的全市场结论。")
+            st.caption("留空即扫描全部 A 股。自定义试跑结果单独保存到当前账号，不覆盖共享的全市场结论。")
         st.caption("扫描会先下载股票池的历史行情，再训练一个覆盖全池的模型。参与训练的股票太少（不足 5 只）或数据缺失太多（覆盖不到本次股票池的 80%）时不会给出评分。")
 
-    # 试跑范围与正式范围二选一：留空就扫全市场，这也是唯一会落盘、给所有人看的口径。
+    # 留空扫描全市场并更新共享结果；自定义股票池仅保存到当前账号。
     pool_mode = "用户自定义" if custom_codes.strip() else FULL_MARKET_POOL_MODE
 
     options = ScanOptions(
         pool_mode=pool_mode, custom_codes=custom_codes, scan_limit=int(scan_limit),
         objective_mode=objective_mode, training_window=int(training_window),
         enable_neutralization=enable_neutralization, use_extra_factors=use_extra_factors,
-        enable_size_features=enable_size_features, enable_value_features=enable_value_features,
+        enable_size_features=settings.SCAN_DEFAULT_ENABLE_SIZE_FEATURES,
+        enable_value_features=settings.SCAN_DEFAULT_ENABLE_VALUE_FEATURES,
         include_backtest=include_backtest, trigger="manual",
     )
 
@@ -194,9 +202,14 @@ if is_admin:
                 task.fail(str(exc))
                 st.error(f"训练未开始：{exc}")
         if result is not None:
+            # 自定义股票池不会覆盖所有账号共用的活动模型；把本次上下文留在当前会话，
+            # 供切换到「个股分析」后继续使用同一份模型。
+            if result.model_context is not None:
+                st.session_state["scan_model_context"] = result.model_context
             if options.pool_mode == "用户自定义":
-                # 试跑只留在本次会话里：落盘文件是所有账号共用的那份全市场结论，一次试跑不该把它换掉。
-                st.session_state["scan_result"] = build_payload(result)
+                # 自定义结果按账号保存，避免覆盖全局排名，也避免重新登录后丢失。
+                save_user_scan_result(result, account["username"])
+                st.session_state["scan_result"] = load_user_scan_result(account["username"])
             else:
                 save_scan_result(result)
                 # 回读一次再展示：这样管理员此刻看到的，与别人之后读到的严格是同一份内容。
@@ -207,9 +220,18 @@ else:
         "平日由收盘后的定时任务统一执行。下面显示的是最近一次扫描的结果。"
     )
 
-payload = st.session_state.get("scan_result") or load_scan_result()
+payload = (
+    st.session_state.get("scan_result")
+    or load_user_scan_result(account["username"])
+    or load_scan_result(require_current_model=False)
+)
 if payload:
     show_style_status(payload.get("style_factors"))
+    if payload.get("model_version") != settings.MODEL_VERSION:
+        st.warning(
+            f"当前显示的是模型版本 {payload.get('model_version') or '未知'} 的历史扫描快照；"
+            f"当前程序版本为 {settings.MODEL_VERSION}。排名按当时结果保留，不能代表当前模型评分。"
+        )
 rows = (payload or {}).get("rows") or []
 scan_stats = (payload or {}).get("scan_stats") or {}
 

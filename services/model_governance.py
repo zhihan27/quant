@@ -684,6 +684,54 @@ def rollback_to(repository: QuantRepository, context_id: str, operator: str) -> 
     return {"context_id": context_id, "model_version": version, "reference_date": target["reference_date"]}
 
 
+def delete_archived_model(repository: QuantRepository, context_id: str, operator: str) -> dict[str, Any]:
+    """删除非活动模型归档，保留模型登记和治理审计。"""
+    if not isinstance(context_id, str) or not context_id.strip():
+        raise FinalHoldoutError("模型版本 ID 无效，无法删除。")
+    context_id = context_id.strip()
+    with repository.connect() as connection:
+        # 在同一事务内锁定登记、删除文件并清空路径，避免回滚操作与删除并发交错。
+        target = connection.execute(
+            "SELECT * FROM public.quant_model_registry WHERE context_id=%s FOR UPDATE",
+            (context_id,),
+        ).fetchone()
+        if target is None:
+            raise FinalHoldoutError(f"没有找到模型版本 {context_id} 的登记记录。")
+        if target["is_active"]:
+            raise FinalHoldoutError("当前活动模型不能删除，请先生成或回滚到其他模型。")
+
+        archive_root = (settings.MODEL_DIR / settings.MODEL_ARCHIVE_DIRNAME).resolve()
+        archive_path = Path(target["archive_path"]).resolve() if target["archive_path"] else None
+        if archive_path is not None:
+            try:
+                archive_path.relative_to(archive_root)
+            except ValueError as exc:
+                raise FinalHoldoutError("模型归档路径不在受控目录内，拒绝删除。") from exc
+            if archive_path.name != context_id:
+                raise FinalHoldoutError("模型归档路径与模型 ID 不一致，拒绝删除。")
+            if archive_path.exists():
+                if not archive_path.is_dir():
+                    raise FinalHoldoutError("模型归档路径不是目录，拒绝删除。")
+                shutil.rmtree(archive_path)
+
+        connection.execute(
+            "UPDATE public.quant_model_registry SET archive_path=NULL,panel_path=NULL,"
+            "retired_at=COALESCE(retired_at,now()) WHERE context_id=%s AND is_active=FALSE",
+            (context_id,),
+        )
+    log_governance_event(
+        repository,
+        "删除模型归档",
+        operator=operator,
+        model_version=target["model_version"],
+        context_id=context_id,
+        before={"archive_path": target["archive_path"], "passed": target["passed"]},
+        after={"archive_path": None},
+        note="管理员手动删除非活动模型归档，保留登记记录以便审计。",
+    )
+    return {"context_id": context_id, "model_version": target["model_version"]}
+
+
 # ---------------------------------------------------------------------------
 # 降级状态
 # ---------------------------------------------------------------------------

@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 
 from config import settings
+from services.dataframe_utils import column_values_without_attrs
 
 LOGGER = logging.getLogger("quant.rank_model")
 SCORE_KIND_RANK = "rank_score"
@@ -49,16 +50,20 @@ def ndcg_at_k(grades: np.ndarray, scores: np.ndarray, k: int) -> float:
 
 
 def random_ndcg_baseline(grades: np.ndarray, k: int, repeats: int = 20, seed: int = 42) -> float:
-    """固定随机种子下的随机排序 NDCG 均值，作为“没有排序能力”的参照。"""
-    generator = np.random.default_rng(seed)
-    scores = np.zeros(len(grades), dtype=float)
-    values = []
-    for _ in range(max(1, repeats)):
-        generator.shuffle(scores)
-        value = ndcg_at_k(grades, scores, k)
-        if np.isfinite(value):
-            values.append(value)
-    return float(np.mean(values)) if values else float("nan")
+    """用随机排列的解析期望计算 NDCG 基线，避免抽样噪声与行序依赖。"""
+    values = np.asarray(grades, dtype=float)
+    values = values[np.isfinite(values)]
+    if len(values) < 2 or int(k) < 1:
+        return float("nan")
+    gains = np.power(2.0, values) - 1.0
+    cutoff = min(int(k), len(gains))
+    discounts = 1.0 / np.log2(np.arange(2, cutoff + 2))
+    ideal = float(np.sum(np.sort(gains)[::-1][:cutoff] * discounts))
+    if not np.isfinite(ideal) or ideal <= 1e-12:
+        return float("nan")
+    # 随机排列中每个位置以相同概率取得任一等级，因此期望增益等于截面均值。
+    expected_dcg = float(np.mean(gains) * discounts.sum())
+    return expected_dcg / ideal
 
 
 class CrossSectionRanker:
@@ -148,11 +153,20 @@ def make_ranker(name: str, grade_count: int | None = None, seed: int = 42) -> Cr
     return CrossSectionRanker(name, grade_count=grade_count, seed=seed)
 
 
-def evaluate_ndcg(frame: pd.DataFrame, k: int | None = None, score_column: str = "prediction", actual_column: str = "actual") -> dict[str, float | None]:
+def evaluate_ndcg(frame: pd.DataFrame, k: int | None = None, score_column: str = "prediction", actual_column: str = "actual") -> dict[str, Any]:
     """按日计算预测排序的 NDCG@k 与随机基线，用于排序模型的偏置检验。"""
-    clean = frame.dropna(subset=[score_column, actual_column])
+    clean = pd.DataFrame(
+        {
+            "date": column_values_without_attrs(frame, "date"),
+            score_column: column_values_without_attrs(frame, score_column),
+            actual_column: column_values_without_attrs(frame, actual_column),
+        },
+        index=frame.index,
+        copy=False,
+    ).dropna(subset=[score_column, actual_column])
     if clean.empty:
-        return {"ndcg": None, "ndcg_random_baseline": None, "ndcg_days": 0}
+        return {"ndcg": None, "ndcg_random_baseline": None, "ndcg_days": 0,
+                "ndcg_protocol": settings.NDCG_PROTOCOL}
     values = []
     baselines = []
     for _, group in clean.groupby("date", sort=True):
@@ -166,11 +180,13 @@ def evaluate_ndcg(frame: pd.DataFrame, k: int | None = None, score_column: str =
             values.append(value)
             baselines.append(random_ndcg_baseline(grades, top))
     if not values:
-        return {"ndcg": None, "ndcg_random_baseline": None, "ndcg_days": 0}
+        return {"ndcg": None, "ndcg_random_baseline": None, "ndcg_days": 0,
+                "ndcg_protocol": settings.NDCG_PROTOCOL}
     return {
         "ndcg": float(np.mean(values)),
         "ndcg_random_baseline": float(np.nanmean(baselines)),
         "ndcg_days": len(values),
+        "ndcg_protocol": settings.NDCG_PROTOCOL,
     }
 
 

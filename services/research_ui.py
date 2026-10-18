@@ -53,19 +53,53 @@ def show_market_regime(repository: Any) -> None:
 
 
 def show_style_status(report: dict[str, Any] | None, features: list[str] | None = None) -> None:
-    """分别呈现配置请求、覆盖门控与真实模型特征名单。"""
+    """用简短状态说明市值估值特征的默认请求、验收与实际入模情况。"""
     report = report or {}
-    st.caption(f"特征协议 {settings.STYLE_FEATURE_PROTOCOL}；{report.get('status', '尚无当前版本的训练摘要')}")
-    with st.expander("显式市值与估值特征的生效状态"):
-        if report.get("exposure_warning"):
-            st.warning(report["exposure_warning"])
-        decisions = report.get("features") or {}
-        if decisions:
-            st.dataframe(pd.DataFrame.from_dict(decisions, orient="index"), alt="风格特征覆盖率与排除原因")
-        st.write("通过面板门控的候选列：", report.get("model_feature_columns") or [])
+    requested = report.get("requested") or {
+        "size": settings.SCAN_DEFAULT_ENABLE_SIZE_FEATURES,
+        "value": settings.SCAN_DEFAULT_ENABLE_VALUE_FEATURES,
+    }
+    accepted = set(report.get("accepted_columns") or [])
+    candidates = set(report.get("model_feature_columns") or [])
+    active_features = set(features or [])
+    groups = {
+        "市值": ("log_market_cap_total", "log_market_cap_float"),
+        "估值": ("earnings_yield", "book_to_price", "sales_to_price"),
+    }
+    labels = {
+        "log_market_cap_total": "总市值",
+        "log_market_cap_float": "流通市值",
+        "earnings_yield": "盈利收益率",
+        "book_to_price": "市净率倒数",
+        "sales_to_price": "市销率倒数",
+    }
+
+    states = []
+    for group, columns in groups.items():
+        option = "size" if group == "市值" else "value"
+        actual = [
+            name for column in columns
+            if any(str(feature).endswith(column) for feature in active_features)
+            for name in [labels[column]]
+        ]
+        passed = [labels[column] for column in columns if column in accepted]
+        requested_text = "默认请求" if requested.get(option) else "未请求"
         if features is not None:
-            st.write("已训练模型的实际入模列：", features)
-        st.caption("面板候选列仍可能因训练样本不足被模型排除；实际入模以各模型 features_used 为准。")
+            effective_text = "实际入模：" + "、".join(actual) if actual else "实际未入模"
+        elif report:
+            effective_text = "通过面板门控：" + "、".join(passed) if passed else "尚未通过面板门控"
+        else:
+            effective_text = "尚无本轮训练状态"
+        states.append(f"{group}{requested_text} · {effective_text}")
+
+    st.caption("显式特征：" + "；".join(states))
+    if (requested.get("size") or requested.get("value")) and not accepted:
+        st.caption("默认配置会请求这些特征；生产训练还要求独立验收通过，当前状态："
+                   f"{report.get('status', '尚无当前版本的训练摘要')}。")
+    elif candidates and features is None:
+        st.caption("通过数据覆盖门槛的候选不等于模型最终使用；是否实际入模以训练模型为准。")
+    if report.get("exposure_warning"):
+        st.caption(report["exposure_warning"])
 
 
 def show_stock_style_analysis(report: dict[str, Any] | None) -> None:

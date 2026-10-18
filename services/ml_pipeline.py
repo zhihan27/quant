@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import math
 import os
 import pickle
+import platform
 import re
+import sys
+from time import perf_counter
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -17,6 +21,7 @@ import numpy as np
 import pandas as pd
 
 from config import settings
+from services.dataframe_utils import column_values_without_attrs
 from services.extra_factors import apply_health_veto, attach_extra_factors
 from services.feature_engineering import FEATURE_COLUMNS, add_forward_returns, build_features, normalize_cross_section
 from services.neutralization import (
@@ -24,11 +29,12 @@ from services.neutralization import (
 )
 from services.panel_store import PanelStore
 from services.style_factors import attach_style_factors, load_history, configuration_id, production_report_is_current
-from services.progress import throttled
+from services.progress import interval_throttled, throttled
 from services.label_processing import winsorize_training_labels
 from services.rank_model import (
     SCORE_KIND_RANK, SCORE_KIND_RETURN, evaluate_ndcg, make_ranker, summarize_importances,
 )
+from services.validation_cache import ValidationCache, build_cache_key
 
 TARGET_KIND = "excess_return_vs_csi300"
 MINIMUM_STOCKS = 5
@@ -51,6 +57,7 @@ def unavailable_model(name: str, horizon: int, status: str, objective: str | Non
     return {
         "model": name, "horizon": horizon, "target_kind": TARGET_KIND,
         "model_version": settings.MODEL_VERSION, "validated": False, "status": status,
+        "ndcg_protocol": settings.NDCG_PROTOCOL,
         "objective": objective, "score_kind": None, "training_window_days": window,
         "predicted_excess_return": None, "prediction_zscore": None, "prediction_percentile": None,
         "predicted_return": None, "predicted_price": None, "oos_metrics": None,
@@ -227,7 +234,14 @@ def evaluate_oos(
     """计算每日Rank IC、HAC显著性、Top/Bottom收益与排序质量基线。"""
     from statsmodels.api import OLS
 
-    clean = frame.replace([np.inf, -np.inf], np.nan).dropna(subset=["prediction", "actual", "baseline", "absolute_return"])
+    evaluation_columns = ["date", "code", "prediction", "actual", "baseline", "absolute_return"]
+    clean = pd.DataFrame(
+        {column: column_values_without_attrs(frame, column) for column in evaluation_columns},
+        index=frame.index,
+        copy=False,
+    ).replace([np.inf, -np.inf], np.nan).dropna(
+        subset=["prediction", "actual", "baseline", "absolute_return"]
+    )
     required = max(MINIMUM_STOCKS, math.ceil((total_stocks or MINIMUM_STOCKS) * MINIMUM_COVERAGE))
     rows = []
     eligible_indices = []
@@ -251,6 +265,7 @@ def evaluate_oos(
     ranking = score_kind == SCORE_KIND_RANK
     metrics = {"dates": len(rows), "oos_samples": len(evaluated), "daily_groups": rows, "target_kind": TARGET_KIND,
                "score_kind": score_kind, "ndcg": None, "ndcg_random_baseline": None, "ndcg_ratio": None,
+               "ndcg_protocol": settings.NDCG_PROTOCOL,
                "rank_ic": None, "rank_ic_hac_t": None, "top_excess_return": None, "bottom_excess_return": None,
                "top_return": None, "bottom_return": None, "top_bottom_spread": None, "mae": None, "baseline_mae": None,
                "validated": False, "validation_rule": (
@@ -297,13 +312,308 @@ def _selection_key(result: dict[str, Any]) -> tuple[int, float]:
     return (1 if result.get("validated") else 0, float(rank_ic) if rank_ic is not None else -1.0)
 
 
+def _prepare_validation_data(
+    panel: pd.DataFrame, horizon: int, cutoff: pd.Timestamp | None, window: int,
+) -> dict[str, Any]:
+    """为单个预测周期准备窄列评估输入与可复用的日期边界。"""
+    started = perf_counter()
+    target, endpoint = f"target_{horizon}", f"label_end_{horizon}"
+    forward_return = f"forward_return_{horizon}"
+    feature_pool = list(panel.attrs.get("model_feature_columns", [f"xs_{column}" for column in FEATURE_COLUMNS]))
+    feature_pool = list(dict.fromkeys(column for column in feature_pool if column in panel.columns))
+    required_columns = ["date", "code", *feature_pool, target, endpoint, forward_return]
+    # 通过列数组构造临时表，避免复制原始面板上与当前周期无关的 attrs。
+    frame = pd.DataFrame(
+        {column: column_values_without_attrs(panel, column) for column in required_columns},
+        index=panel.index,
+        copy=False,
+    )
+    if cutoff is not None:
+        frame = frame.loc[frame["date"].lt(cutoff)]
+    frame_preparation_seconds = perf_counter() - started
+
+    required = max(MINIMUM_STOCKS, math.ceil(frame["code"].nunique() * MINIMUM_COVERAGE))
+    calibration_started = perf_counter()
+    if feature_pool and not frame.empty:
+        coverage = frame[feature_pool].notna().groupby(frame["date"], sort=True).sum()
+        calibration_dates = coverage.index[coverage.ge(required).any(axis=1)][:MINIMUM_TRAIN_DATES]
+        calibration = frame.loc[frame["date"].isin(calibration_dates)]
+        features = [
+            column for column in feature_pool
+            if calibration[column].notna().sum() >= MINIMUM_STOCKS * 20
+        ]
+    else:
+        features = []
+    feature_calibration_seconds = perf_counter() - calibration_started
+    fingerprint_started = perf_counter()
+    fingerprint_columns = ["date", "code", *features, target, endpoint, forward_return]
+    row_hashes = pd.util.hash_pandas_object(
+        frame.loc[:, fingerprint_columns], index=True, categorize=True,
+    ).to_numpy(dtype=np.uint64, copy=False)
+    input_fingerprint = hashlib.sha256(row_hashes.tobytes()).hexdigest()
+    fingerprint_seconds = perf_counter() - fingerprint_started
+    sample_filter_started = perf_counter()
+    filtered = frame.dropna(subset=[*features, target, endpoint])
+    if cutoff is not None:
+        filtered = filtered.loc[filtered[endpoint].lt(cutoff)]
+    # 后续拟合和预测只需实际入模列及本周期标签，不保留其他周期或诊断列。
+    labelled = filtered.loc[:, ["date", "code", *features, target, endpoint, forward_return]]
+    labelled_dates = pd.to_datetime(labelled["date"]).to_numpy(dtype="datetime64[ns]")
+    dates = np.unique(labelled_dates)
+    sample_filter_seconds = perf_counter() - sample_filter_started
+
+    started = perf_counter()
+    folds: list[dict[str, int]] = []
+    if len(dates) >= 240:
+        from sklearn.model_selection import TimeSeriesSplit
+
+        first_test = int(next(TimeSeriesSplit(n_splits=3).split(dates))[1][0])
+        for block_start in range(first_test, len(dates), int(settings.OOS_RETRAIN_DAYS)):
+            folds.append({
+                "train_start_index": max(0, block_start - window) if window > 0 else 0,
+                "train_stop_index": block_start,
+                "test_start_index": block_start,
+                "test_stop_index": min(block_start + int(settings.OOS_RETRAIN_DAYS), len(dates)),
+            })
+    date_positions = np.searchsorted(dates, labelled_dates) if len(dates) else np.zeros(0, dtype=int)
+    sorted_by_date = bool(labelled["date"].is_monotonic_increasing)
+    fold_preparation_seconds = perf_counter() - started
+    return {
+        "labelled": labelled,
+        "features": features,
+        "dates": dates,
+        "folds": folds,
+        "date_positions": date_positions,
+        "sorted_by_date": sorted_by_date,
+        "target": target,
+        "endpoint": endpoint,
+        "forward_return": forward_return,
+        "required_stocks": required,
+        "total_stocks": int(frame["code"].nunique()),
+        "input_fingerprint": input_fingerprint,
+        "feature_configuration_id": (panel.attrs.get("style_factors") or {}).get("configuration_id"),
+        "cutoff": str(pd.Timestamp(cutoff).isoformat()) if cutoff is not None else None,
+        "preparation_seconds": {
+            "frame_preparation": frame_preparation_seconds,
+            "feature_calibration": feature_calibration_seconds,
+            "input_fingerprint": fingerprint_seconds,
+            "sample_filter": sample_filter_seconds,
+            "fold_preparation": fold_preparation_seconds,
+        },
+    }
+
+
+def _fold_row_positions(prepared: dict[str, Any], fold: dict[str, int]) -> tuple[np.ndarray, np.ndarray]:
+    """按原始行序生成一折训练与测试位置，兼容未排序的外部面板。"""
+    dates = prepared["dates"]
+    labelled = prepared["labelled"]
+    train_start = fold["train_start_index"]
+    train_stop = fold["train_stop_index"]
+    test_start_index = fold["test_start_index"]
+    test_stop_index = fold["test_stop_index"]
+    test_start = pd.Timestamp(dates[test_start_index])
+    date_positions = prepared["date_positions"]
+    if prepared["sorted_by_date"]:
+        labelled_dates = pd.to_datetime(labelled["date"]).to_numpy(dtype="datetime64[ns]")
+        train_start_date = dates[train_start] if train_start < train_stop else dates[train_stop]
+        train_start_row = int(np.searchsorted(labelled_dates, train_start_date, side="left"))
+        train_stop_row = int(np.searchsorted(labelled_dates, dates[test_start_index], side="left"))
+        candidates = np.arange(train_start_row, train_stop_row, dtype=np.int64)
+        mature = labelled[prepared["endpoint"]].iloc[candidates].lt(test_start).to_numpy()
+        train_positions = candidates[mature]
+        test_start_row = int(np.searchsorted(labelled_dates, dates[test_start_index], side="left"))
+        test_end_row = int(np.searchsorted(labelled_dates, dates[test_stop_index - 1], side="right"))
+        test_positions = np.arange(test_start_row, test_end_row, dtype=np.int64)
+        return train_positions, test_positions
+
+    train_mask = (date_positions >= train_start) & (date_positions < train_stop)
+    train_mask &= labelled[prepared["endpoint"]].lt(test_start).to_numpy()
+    test_mask = (date_positions >= test_start_index) & (date_positions < test_stop_index)
+    return np.flatnonzero(train_mask), np.flatnonzero(test_mask)
+
+
+def _runtime_environment() -> dict[str, Any]:
+    """记录可复现实测所需的运行环境版本。"""
+    from importlib.metadata import PackageNotFoundError, version
+
+    packages = {}
+    for package in ("lightgbm", "xgboost", "scikit-learn", "statsmodels", "numpy", "pandas"):
+        try:
+            packages[package] = version(package)
+        except PackageNotFoundError:
+            packages[package] = None
+    return {"python": sys.version.split()[0], "platform": platform.platform(), "packages": packages}
+
+
+def _memory_metrics() -> dict[str, Any]:
+    """读取操作系统记录的进程峰值常驻内存；不可用时明确返回缺失状态。"""
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            class ProcessMemoryCounters(ctypes.Structure):
+                _fields_ = [
+                    ("cb", ctypes.c_ulong), ("PageFaultCount", ctypes.c_ulong),
+                    ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t),
+                ]
+
+            counters = ProcessMemoryCounters()
+            counters.cb = ctypes.sizeof(counters)
+            from ctypes import wintypes
+
+            kernel32 = ctypes.windll.kernel32
+            psapi = ctypes.windll.psapi
+            kernel32.GetCurrentProcess.argtypes = []
+            kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+            psapi.GetProcessMemoryInfo.argtypes = [
+                wintypes.HANDLE, ctypes.POINTER(ProcessMemoryCounters), wintypes.DWORD,
+            ]
+            psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
+            process = kernel32.GetCurrentProcess()
+            ok = psapi.GetProcessMemoryInfo(
+                process, ctypes.byref(counters), counters.cb,
+            )
+            if ok:
+                return {
+                    "peak_memory_mb": counters.PeakWorkingSetSize / (1024 ** 2),
+                    "memory_status": "操作系统进程生命周期峰值工作集",
+                }
+        else:
+            import resource
+
+            peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            divisor = 1024 ** 2 if sys.platform == "darwin" else 1024
+            return {
+                "peak_memory_mb": float(peak) / divisor,
+                "memory_status": "操作系统进程生命周期峰值 RSS",
+            }
+    except (AttributeError, ImportError, OSError, TypeError, ValueError):
+        pass
+    return {"peak_memory_mb": None, "memory_status": "当前环境不支持进程峰值内存读取"}
+
+
+def _execution_summary(
+    name: str, horizon: int, objective: str, prepared: dict[str, Any], started: float,
+    stage_seconds: dict[str, float], fold_details: list[dict[str, Any]], cache: dict[str, Any],
+    model_parameters: Any = None,
+) -> dict[str, Any]:
+    """汇总当前模型、目标函数和验证段的工作量、耗时与运行环境。"""
+    dates = prepared["dates"]
+    environment = _runtime_environment()
+    validation_identity = build_cache_key({
+        "model_version": settings.MODEL_VERSION,
+        "validation_protocol": settings.VALIDATION_PROTOCOL_VERSION,
+        "model": name,
+        "horizon": int(horizon),
+        "objective": objective,
+        "input_fingerprint": prepared["input_fingerprint"],
+        "feature_configuration_id": prepared["feature_configuration_id"],
+        "features": prepared["features"],
+        "model_parameters": model_parameters,
+        "cutoff": prepared["cutoff"],
+        "folds": [
+            {
+                "cache_key": detail.get("cache_key"),
+                "validation_segment": detail.get("validation_segment"),
+                "test_start": detail.get("test_start"),
+                "test_end": detail.get("test_end"),
+            }
+            for detail in fold_details if "validation_segment" in detail
+        ],
+        "environment": environment,
+    })
+    cache_sources = [
+        {"validation_segment": detail.get("validation_segment"), "source": detail.get("cache_source")}
+        for detail in fold_details if detail.get("cache_source")
+    ]
+    executed_sources = [item["source"] for item in cache_sources if item["source"] != "not_run"]
+    return {
+        "model": name,
+        "horizon": horizon,
+        "objective": objective,
+        "target_function": objective,
+        "stocks": prepared["total_stocks"],
+        "features": len(prepared["features"]),
+        "effective_samples": len(prepared["labelled"]),
+        "training_dates": len(dates),
+        "training_date_start": str(pd.Timestamp(dates[0]).date()) if len(dates) else None,
+        "training_date_end": str(pd.Timestamp(dates[-1]).date()) if len(dates) else None,
+        "validation_date_start": fold_details[0].get("test_start") if fold_details else None,
+        "validation_date_end": fold_details[-1].get("test_end") if fold_details else None,
+        "threads": int(settings.TRAINING_N_JOBS),
+        "preparation_seconds": prepared["preparation_seconds"],
+        "stage_seconds": stage_seconds,
+        "elapsed_seconds": perf_counter() - started,
+        **_memory_metrics(),
+        "environment": environment,
+        "validation_identity": validation_identity if any(
+            source != "not_run" for source in executed_sources
+        ) else None,
+        "validation_cache_sources": cache_sources,
+        "validation_cache_replay": bool(executed_sources) and all(source == "hot" for source in executed_sources),
+        "cache": cache,
+        "folds": fold_details,
+    }
+
+
+def _validation_cache_key(
+    name: str, horizon: int, objective: str, window: int, fold_number: int,
+    fold: dict[str, int], prepared: dict[str, Any], training_samples: int,
+    validation_samples: int, environment: dict[str, Any], model_parameters: Any = None,
+) -> str:
+    """将缓存绑定到完整数据、模型处理协议、依赖版本和验证日期。"""
+    dates = prepared["dates"]
+    train_start = fold["train_start_index"]
+    train_stop = fold["train_stop_index"]
+    test_start = fold["test_start_index"]
+    test_stop = fold["test_stop_index"]
+    identity = {
+        "validation_protocol": settings.VALIDATION_PROTOCOL_VERSION,
+        "model_version": settings.MODEL_VERSION,
+        "model": name,
+        "objective": objective,
+        "horizon": int(horizon),
+        "target": prepared["target"],
+        "ndcg_protocol": settings.NDCG_PROTOCOL,
+        "feature_protocol": settings.STYLE_FEATURE_PROTOCOL,
+        "feature_configuration_id": prepared["feature_configuration_id"],
+        "features": prepared["features"],
+        "input_fingerprint": prepared["input_fingerprint"],
+        "model_parameters": model_parameters,
+        "cutoff": prepared["cutoff"],
+        "parameters": {
+            "training_window_days": int(window),
+            "retrain_interval_days": int(settings.OOS_RETRAIN_DAYS),
+            "threads": int(settings.TRAINING_N_JOBS),
+            "seed": 42,
+            "rank_grade_count": int(settings.RANK_GRADE_COUNT),
+            "ndcg_top_fraction": float(settings.NDCG_TOP_FRACTION),
+            "regression_loss": settings.REGRESSION_LOSS,
+            "label_winsor_upper_quantile": float(settings.LABEL_WINSOR_UPPER_QUANTILE),
+        },
+        "fold": {
+            "number": int(fold_number),
+            "train_start": str(pd.Timestamp(dates[train_start]).date()),
+            "train_end": str(pd.Timestamp(dates[train_stop - 1]).date()),
+            "test_start": str(pd.Timestamp(dates[test_start]).date()),
+            "test_end": str(pd.Timestamp(dates[test_stop - 1]).date()),
+            "training_samples": int(training_samples),
+            "validation_samples": int(validation_samples),
+        },
+        "environment": environment,
+    }
+    return build_cache_key(identity)
+
+
 def fit_panel_model(
     panel: pd.DataFrame, name: str, horizon: int, model_factory: Callable | None = None,
     cutoff: pd.Timestamp | None = None, window: int | None = None, objective: str | None = None,
+    progress: Callable[[str], None] | None = None, _prepared: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """按完整交易日划分滚动样本外折，训练窗口只保留最近N个交易日，严格清除标签跨入测试期的样本。"""
-    from sklearn.model_selection import TimeSeriesSplit
-
     requested = objective or settings.DEFAULT_OBJECTIVE_MODE
     if requested not in settings.RANK_OBJECTIVE_MODES:
         raise ValueError(f"目标函数仅支持 {'、'.join(settings.RANK_OBJECTIVE_MODES)}；当前为 {requested}。")
@@ -311,26 +621,37 @@ def fit_panel_model(
     validation_block = int(settings.OOS_RETRAIN_DAYS)
     if validation_block < 1:
         raise ValueError("样本外重训间隔必须为正整数。")
-    frame = panel.loc[panel["date"] < cutoff].copy() if cutoff is not None else panel
-    target, endpoint = f"target_{horizon}", f"label_end_{horizon}"
-    feature_pool = list(panel.attrs.get("model_feature_columns", [f"xs_{column}" for column in FEATURE_COLUMNS]))
-    feature_pool = [column for column in feature_pool if column in frame]
-    # 个别股票的历史可能远早于全市场；仅从有足够有效特征的截面起算校准期，
-    # 避免最早的孤立日期把后续数百万行有效样本误判为没有特征。
-    required = max(MINIMUM_STOCKS, math.ceil(frame["code"].nunique() * MINIMUM_COVERAGE))
-    coverage = frame[feature_pool].notna().groupby(frame["date"], sort=True).sum()
-    calibration_dates = coverage.index[coverage.ge(required).any(axis=1)][:MINIMUM_TRAIN_DATES]
-    calibration = frame.loc[frame["date"].isin(calibration_dates)]
-    features = [
-        column for column in feature_pool
-        if column in calibration and calibration[column].notna().sum() >= MINIMUM_STOCKS * 20
-    ]
+    started = perf_counter()
+    if progress is not None:
+        original_progress = progress
+        should_report_progress = interval_throttled()
+
+        def throttled_progress(message: str) -> None:
+            if should_report_progress(force=" / " in message):
+                original_progress(message)
+
+        progress = throttled_progress
+    prepared = _prepared or _prepare_validation_data(panel, horizon, cutoff, window)
+    labelled = prepared["labelled"]
+    features = prepared["features"]
+    dates = prepared["dates"]
+    target, endpoint = prepared["target"], prepared["endpoint"]
+    forward_return = prepared["forward_return"]
+    if progress:
+        progress(f"按交易日验证 {name} · {horizon}日 · 数据准备完成 · 已用 {perf_counter() - started:.1f} 秒")
     if not features:
-        return unavailable_model(name, horizon, "截面特征样本不足，未生成预测", objective=requested, window=window)
-    labelled = frame.dropna(subset=features + [target, endpoint]).copy()
-    if cutoff is not None:
-        labelled = labelled.loc[labelled[endpoint] < cutoff]
-    dates = np.sort(labelled["date"].unique())
+        result = unavailable_model(name, horizon, "截面特征样本不足，未生成预测", objective=requested, window=window)
+        result["execution"] = _execution_summary(
+            name, horizon, requested, prepared, started, {}, [],
+            {"enabled": False, "hits": 0, "misses": 0, "reason": "没有可用特征"},
+        )
+        return result
+    cache_enabled = bool(settings.VALIDATION_CACHE_ENABLED and model_factory is None)
+    validation_cache = ValidationCache(
+        settings.VALIDATION_CACHE_DIR,
+        settings.VALIDATION_CACHE_MAX_BYTES,
+        settings.VALIDATION_CACHE_TTL_DAYS,
+    ) if cache_enabled else None
 
     def _estimator(candidate: str) -> Any:
         # 显式注入的工厂优先，保持测试与自定义估计器的行为完全可控。
@@ -353,57 +674,208 @@ def fit_panel_model(
             estimator.fit(sample[features], labels)
         return estimator, processing
 
+    def _estimator_parameter_identity(candidate: str) -> dict[str, Any]:
+        estimator = _estimator(candidate)
+        identity: dict[str, Any] = {
+            "class": f"{type(estimator).__module__}.{type(estimator).__qualname__}",
+        }
+        if callable(getattr(estimator, "_build", None)):
+            built = estimator._build()
+            getter = getattr(built, "get_params", None)
+            identity["wrapper"] = {
+                "name": getattr(estimator, "name", None),
+                "grade_count": getattr(estimator, "grade_count", None),
+                "seed": getattr(estimator, "seed", None),
+            }
+            identity["parameters"] = getter(deep=True) if callable(getter) else vars(built)
+            return identity
+        getter = getattr(estimator, "get_params", None)
+        identity["parameters"] = getter(deep=True) if callable(getter) else vars(estimator)
+        return identity
+
     def _run(candidate: str) -> dict[str, Any]:
+        candidate_started = perf_counter()
         result = unavailable_model(name, horizon, "截面样本不足，未生成预测", objective=candidate, window=window)
         result["samples"] = len(labelled)
         result["training_dates"] = len(dates)
         result["score_kind"] = SCORE_KIND_RETURN if candidate == "regression" else SCORE_KIND_RANK
-        if len(dates) < 240 or labelled["code"].nunique() < MINIMUM_STOCKS:
-            return result
-        oos: list[pd.DataFrame] = []
+        stage_seconds = {key: 0.0 for key in (
+            "fold_preparation", "native_fit", "prediction", "metrics", "final_fit", "cache_lookup", "cache_write",
+        )}
         fold_details = []
+        oos: list[pd.DataFrame] = []
+        cache_summary = {
+            "enabled": cache_enabled,
+            "hits": 0,
+            "misses": 0,
+            "input_fingerprint": prepared["input_fingerprint"],
+            "fingerprint_seconds": prepared["preparation_seconds"]["input_fingerprint"],
+        }
+        if len(dates) < 240 or labelled["code"].nunique() < MINIMUM_STOCKS:
+            result["execution"] = _execution_summary(
+                name, horizon, candidate, prepared, candidate_started, stage_seconds, fold_details, cache_summary,
+            )
+            return result
+        model_parameters: Any = None
         try:
-            first_test = next(TimeSeriesSplit(n_splits=3).split(dates))[1][0]
-            for block_start in range(int(first_test), len(dates), validation_block):
-                train_dates = np.arange(block_start)
-                test_dates = np.arange(block_start, min(block_start + validation_block, len(dates)))
-                test_start = pd.Timestamp(dates[test_dates[0]])
-                train = labelled.loc[labelled["date"].isin(dates[train_dates]) & (labelled[endpoint] < test_start)]
-                if window > 0:
-                    # 滚动窗口：只用最近 window 个交易日重训，自适应市场风格切换。
-                    train = train.loc[train["date"].isin(dates[train_dates][-window:])]
-                test = labelled.loc[labelled["date"].isin(dates[test_dates])]
-                if train["date"].nunique() < MINIMUM_TRAIN_DATES:
+            if model_factory is None:
+                model_parameters = _estimator_parameter_identity(candidate)
+            else:
+                model_parameters = {
+                    "factory": f"{getattr(model_factory, '__module__', type(model_factory).__module__)}."
+                               f"{getattr(model_factory, '__qualname__', type(model_factory).__qualname__)}",
+                }
+            for fold_number, fold_spec in enumerate(prepared["folds"], start=1):
+                fold_started = perf_counter()
+                train_positions, test_positions = _fold_row_positions(prepared, fold_spec)
+                fold_prep_seconds = perf_counter() - fold_started
+                stage_seconds["fold_preparation"] += fold_prep_seconds
+                train_dates = labelled["date"].iloc[train_positions]
+                training_date_count = int(train_dates.nunique())
+                if training_date_count < MINIMUM_TRAIN_DATES:
+                    fold_details.append({
+                        "validation_segment": fold_number,
+                        "test_start": str(pd.Timestamp(dates[fold_spec["test_start_index"]]).date()),
+                        "test_end": str(pd.Timestamp(dates[fold_spec["test_stop_index"] - 1]).date()),
+                        "training_samples": len(train_positions), "validation_samples": len(test_positions),
+                        "training_dates": training_date_count, "threads": int(settings.TRAINING_N_JOBS),
+                        "status": "训练日期不足，跳过该段", "preparation_seconds": fold_prep_seconds,
+                        "fit_seconds": 0.0, "prediction_seconds": 0.0, "cache_source": "not_run",
+                    })
                     continue
-                model, processing = _fit(_estimator(candidate), train, candidate)
-                predictions = np.asarray(model.predict(test[features]), dtype=float)
-                fold = test[["date", "code"]].copy()
+                test_dates = pd.to_datetime(dates[fold_spec["test_start_index"]:fold_spec["test_stop_index"]])
+                test_start = pd.Timestamp(test_dates[0])
+                test_end = pd.Timestamp(test_dates[-1])
+                training_start = pd.Timestamp(train_dates.min())
+                training_end = pd.Timestamp(train_dates.max())
+                latest_training_label_end = pd.Timestamp(labelled[endpoint].iloc[train_positions].max())
+                environment = _runtime_environment()
+                cache_key = _validation_cache_key(
+                    name, horizon, candidate, window, fold_number, fold_spec, prepared,
+                    len(train_positions), len(test_positions), environment, model_parameters,
+                ) if validation_cache is not None else None
+                cached = None
+                lookup_seconds = 0.0
+                if validation_cache is not None and cache_key is not None:
+                    lookup_started = perf_counter()
+                    cached = validation_cache.load(cache_key, len(test_positions))
+                    lookup_seconds = perf_counter() - lookup_started
+                    stage_seconds["cache_lookup"] += lookup_seconds
+                    if cached is not None:
+                        metadata = cached["metadata"]
+                        try:
+                            cached_baseline = float(metadata["baseline"])
+                            cached_processing = metadata["label_processing"]
+                            if not math.isfinite(cached_baseline) or not isinstance(cached_processing, dict):
+                                raise ValueError("缓存折元数据无效")
+                            baseline, processing = cached_baseline, cached_processing
+                        except (KeyError, TypeError, ValueError):
+                            validation_cache.delete(cache_key)
+                            cached = None
+                    if cached is not None:
+                        cache_summary["hits"] += 1
+                    else:
+                        cache_summary["misses"] += 1
+                cache_source = "hot" if cached is not None else "cold" if cache_enabled else "disabled"
+                if progress:
+                    stage = "复用缓存验证段" if cached is not None else "原生拟合"
+                    progress(
+                        f"按交易日验证 {name} · {horizon}日 · {candidate} · 第{fold_number}/{len(prepared['folds'])}段 · "
+                        f"{stage} · 训练 {len(train_positions):,} 行 / {training_date_count} 日 · "
+                        f"已用 {perf_counter() - started:.1f} 秒"
+                    )
+                fit_seconds = 0.0
+                prediction_seconds = 0.0
+                write_seconds = 0.0
+                if cached is not None:
+                    predictions = cached["predictions"]
+                else:
+                    train = labelled.iloc[train_positions]
+                    fit_started = perf_counter()
+                    model, processing = _fit(_estimator(candidate), train, candidate)
+                    fit_seconds = perf_counter() - fit_started
+                    stage_seconds["native_fit"] += fit_seconds
+                    if progress:
+                        progress(
+                            f"按交易日验证 {name} · {horizon}日 · {candidate} · 第{fold_number}/{len(prepared['folds'])}段 · "
+                            f"预测 · 已用 {perf_counter() - started:.1f} 秒"
+                        )
+                    prediction_started = perf_counter()
+                    test_features = labelled.loc[:, features].iloc[test_positions]
+                    predictions = np.asarray(model.predict(test_features), dtype=float)
+                    prediction_seconds = perf_counter() - prediction_started
+                    stage_seconds["prediction"] += prediction_seconds
+                    baseline = float(train[target].median())
+                    if validation_cache is not None and cache_key is not None:
+                        write_started = perf_counter()
+                        validation_cache.save(cache_key, predictions, {
+                            "baseline": baseline, "label_processing": processing,
+                        })
+                        write_seconds = perf_counter() - write_started
+                        stage_seconds["cache_write"] += write_seconds
+                fold = pd.DataFrame({
+                    "date": labelled["date"].to_numpy()[test_positions],
+                    "code": labelled["code"].to_numpy()[test_positions],
+                })
                 fold["prediction"] = predictions
-                fold["actual"] = test[target].to_numpy()
-                fold["absolute_return"] = test[f"forward_return_{horizon}"].to_numpy()
-                fold["baseline"] = float(train[target].median())
+                fold["actual"] = labelled[target].to_numpy()[test_positions]
+                fold["absolute_return"] = labelled[forward_return].to_numpy()[test_positions]
+                fold["baseline"] = baseline
                 oos.append(fold)
-                fold_details.append({"trained_through": str(train["date"].max().date()),
-                                     "trained_from": str(train["date"].min().date()),
-                                     "training_dates": int(train["date"].nunique()),
-                                     "latest_training_label_end": str(train[endpoint].max().date()),
-                                      "test_start": str(test_start.date()), "test_end": str(pd.Timestamp(dates[test_dates[-1]]).date()),
-                                      "label_processing": processing})
+                fold_details.append({"validation_segment": fold_number,
+                                     "trained_through": str(training_end.date()),
+                                     "trained_from": str(training_start.date()),
+                                     "training_dates": training_date_count,
+                                     "latest_training_label_end": str(latest_training_label_end.date()),
+                                     "test_start": str(test_start.date()), "test_end": str(test_end.date()),
+                                     "training_samples": len(train_positions), "validation_samples": len(test_positions),
+                                     "features": len(features), "threads": int(settings.TRAINING_N_JOBS),
+                                     "fit_seconds": fit_seconds, "prediction_seconds": prediction_seconds,
+                                     "preparation_seconds": fold_prep_seconds, "cache_lookup_seconds": lookup_seconds,
+                                     "cache_write_seconds": write_seconds, "cache_source": cache_source,
+                                     "cache_key": cache_key,
+                                     "label_processing": processing})
             if len(oos) < 2:
                 result["status"] = "有效日期验证折不足，未生成预测"
+                result["execution"] = _execution_summary(
+                    name, horizon, candidate, prepared, candidate_started, stage_seconds, fold_details, cache_summary,
+                    model_parameters,
+                )
                 return result
             evaluation = pd.concat(oos, ignore_index=True)
+            if progress:
+                progress(f"按交易日验证 {name} · {horizon}日 · {candidate} · 指标计算 · 已用 {perf_counter() - started:.1f} 秒")
+            metrics_started = perf_counter()
             metrics = evaluate_oos(evaluation, horizon, panel["code"].nunique(), score_kind=result["score_kind"])
-            metrics["folds"] = fold_details
+            stage_seconds["metrics"] = perf_counter() - metrics_started
+            metrics["folds"] = [
+                {key: detail[key] for key in (
+                    "trained_through", "trained_from", "training_dates", "latest_training_label_end",
+                    "test_start", "test_end", "label_processing",
+                )}
+                for detail in fold_details if "trained_through" in detail
+            ]
             result.update(oos_metrics=metrics, features_used=features,
                           regression_loss=settings.REGRESSION_LOSS if candidate == "regression" else None,
                           validation_retrain_days=validation_block,
-                          label_processing={"folds": [fold["label_processing"] for fold in fold_details]})
+                          label_processing={"folds": [
+                              fold["label_processing"] for fold in fold_details if "label_processing" in fold
+                          ]})
             if not metrics["validated"]:
                 result["status"] = "未通过样本外基线、Rank IC或分组收益检验"
+                result["execution"] = _execution_summary(
+                    name, horizon, candidate, prepared, candidate_started, stage_seconds, fold_details, cache_summary,
+                    model_parameters,
+                )
                 return result
-            final = labelled.loc[labelled["date"].isin(dates[-window:] if window > 0 else dates)]
+            final_start = max(0, len(dates) - window) if window > 0 else 0
+            final_mask = prepared["date_positions"] >= final_start
+            final = labelled.iloc[np.flatnonzero(final_mask)]
+            if progress:
+                progress(f"按交易日验证 {name} · {horizon}日 · {candidate} · 最终拟合 · 已用 {perf_counter() - started:.1f} 秒")
+            final_started = perf_counter()
             model, final_processing = _fit(_estimator(candidate), final, candidate)
+            stage_seconds["final_fit"] = perf_counter() - final_started
             result["label_processing"]["final"] = final_processing
             importance = np.asarray(getattr(model, "feature_importances_", np.zeros(len(features))), dtype=float)
             result.update(validated=True, status="通过样本外基线、Rank IC与分组收益检验", estimator=model,
@@ -413,6 +885,17 @@ def fit_panel_model(
         except (ValueError, RuntimeError, TypeError) as exc:
             LOGGER.exception("截面模型训练失败：%s %s日", name, horizon)
             result["status"] = f"模型训练失败：{type(exc).__name__}"
+        result["execution"] = _execution_summary(
+            name, horizon, candidate, prepared, candidate_started, stage_seconds, fold_details, cache_summary,
+            model_parameters,
+        )
+        LOGGER.info(
+            "按交易日验证完成 model=%s horizon=%d objective=%s validated=%s stocks=%d features=%d samples=%d "
+            "threads=%d elapsed=%.2fs cache_hits=%d cache_misses=%d stages=%s",
+            name, horizon, candidate, result.get("validated"), prepared["total_stocks"], len(features), len(labelled),
+            settings.TRAINING_N_JOBS, result["execution"]["elapsed_seconds"],
+            cache_summary["hits"], cache_summary["misses"], stage_seconds,
+        )
         return result
 
     if requested != "auto":
@@ -426,6 +909,7 @@ def fit_panel_model(
           "status": item["status"], "selected": item is best,
           "training_dates": item.get("training_dates"), "samples": item.get("samples"),
           "regression_loss": item.get("regression_loss"), "label_processing": item.get("label_processing"),
+          "execution": item.get("execution"),
           "oos_metrics": {key: value for key, value in (item.get("oos_metrics") or {}).items() if key != "daily_groups"}}
         for item in attempts
     ]
@@ -520,6 +1004,7 @@ def train_market_context(
                 "label_winsor_upper_quantile": settings.LABEL_WINSOR_UPPER_QUANTILE,
                 "regression_loss": settings.REGRESSION_LOSS,
                 "validation_retrain_days": settings.OOS_RETRAIN_DAYS,
+               "ndcg_protocol": settings.NDCG_PROTOCOL,
                "exposures": panel.attrs.get("exposures"), "neutralization": panel.attrs.get("neutralization"),
                "extra_factors": panel.attrs.get("extra_factors"),
                "style_factors": panel.attrs.get("style_factors"),
@@ -533,10 +1018,16 @@ def train_market_context(
     for horizon in HORIZONS:
         context["models"][horizon] = []
         context["predictions"][horizon] = {}
+        if progress:
+            progress(f"按交易日验证 {horizon}日 · 准备共享评估数据")
+        prepared = _prepare_validation_data(panel, horizon, None, window)
         for name in MODEL_NAMES:
             if progress:
                 progress(f"按交易日验证 {name} · {horizon}日截面排序模型")
-            model = fit_panel_model(panel, name, horizon, objective=objective, window=window)
+            model = fit_panel_model(
+                panel, name, horizon, objective=objective, window=window,
+                progress=progress, _prepared=prepared,
+            )
             model["feature_protocol"] = settings.STYLE_FEATURE_PROTOCOL
             predicted = predict_panel(model, live)
             if model["validated"] and predicted.empty:

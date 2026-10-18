@@ -83,7 +83,7 @@ if current_status["degraded"]:
         icon=":material/report:",
     )
 
-tabs = st.tabs(["通过率", "漂移看板", "最终留出集", "模型版本与回滚", "告警"])
+tabs = st.tabs(["通过率", "漂移看板", "最终留出集", "模型版本、回滚与删除", "告警"])
 
 # ---------------------------------------------------------------------------
 # 通过率
@@ -95,15 +95,16 @@ with tabs[0]:
     )
     try:
         history_rows = model_monitor.fetch_validation_rows(repository)
-        versions = sorted({row["model_version"] for row in history_rows}, reverse=True)
-        selected_version = st.selectbox("检验模型版本", [settings.MODEL_VERSION, *[version for version in versions if version != settings.MODEL_VERSION], "全部版本"])
-        trend_rows = [row for row in history_rows if selected_version == "全部版本" or row["model_version"] == selected_version]
+        selected_version = settings.MODEL_VERSION
+        st.caption(
+            f"当前仅汇总程序版本 {selected_version} 的检验记录。"
+            "旧版本记录仍保留在数据库用于审计，但不作为此处的可选版本。"
+        )
+        trend_rows = [row for row in history_rows if row["model_version"] == selected_version]
         summary = model_monitor.summarize_pass_rate(trend_rows)
         failures = model_monitor.get_recent_failures(
-            repository, limit=20, model_version=None if selected_version == "全部版本" else selected_version,
+            repository, limit=20, model_version=selected_version,
         )
-        if selected_version == "全部版本":
-            st.caption("不同版本的标签处理和损失函数可能不同；累计结果不能替代同口径对照实验。")
     except DatabaseError as exc:
         st.error(str(exc))
         summary, failures = None, []
@@ -458,7 +459,8 @@ with tabs[3]:
         "数据来源：`public.quant_model_registry`。活动文件恒等于最新一次产出，历史版本归档在 "
         f"`{settings.MODEL_DIR / settings.MODEL_ARCHIVE_DIRNAME}/`，只保留最近 "
         f"{settings.MODEL_ARCHIVE_LIMIT} 个通过验证的版本。"
-        "「可回滚」是现场校验归档文件真的存在后得出的，不采信登记表里的布尔值。"
+        f"当前程序版本为 {settings.MODEL_VERSION}。"
+        "「可回滚」是现场校验归档文件真的存在后得出的，不采信登记表里的布尔值；旧版本活动记录不代表能供当前程序加载。"
     )
     try:
         versions = model_governance.registry_versions(repository)
@@ -474,7 +476,8 @@ with tabs[3]:
                  "生成时间": stamp(row["created_at"]), "参考日": row["reference_date"] or NO_DATA,
                  "通过": "是" if row["passed"] else "否",
                  "通过率": NO_DATA if row["base_rate"] is None else f"{row['base_rate']:.0%}",
-                 "当前活动": "是" if row["is_active"] else "否",
+                 "当前活动": "是" if row["is_active"] and row["model_version"] == settings.MODEL_VERSION
+                 else "版本不兼容" if row["is_active"] else "否",
                  "可回滚": "是" if row["rollbackable"] else "否",
                  "归档": row["archive_path"] or "已清理"}
                 for row in versions
@@ -506,6 +509,34 @@ with tabs[3]:
                     )
                     st.rerun()
                 except (model_governance.FinalHoldoutError, DatabaseError) as exc:
+                    st.error(str(exc))
+
+        deletable = {
+            f"{row['context_id'][:12]}　{stamp(row['created_at'])}　{row['reference_date'] or '无参考日'}": row["context_id"]
+            for row in versions
+            if not row["is_active"] and row.get("archive_path")
+        }
+        st.divider()
+        st.subheader("删除历史模型归档")
+        st.caption("本入口删除非活动模型的归档文件，并保留登记和审计记录。当前活动模型不能在这里删除。")
+        if not deletable:
+            st.info("当前没有可删除的历史归档模型。首次训练出的模型是活动模型；请先训练另一版或回滚到其他版本。")
+        else:
+            delete_choice = st.selectbox("选择要删除的模型", list(deletable), key="delete_model_choice")
+            confirm_delete = st.checkbox("我确认永久删除所选模型归档", key="confirm_delete_model")
+            if st.button("删除所选模型", type="secondary", disabled=not confirm_delete):
+                try:
+                    outcome = model_governance.delete_archived_model(
+                        repository, deletable[delete_choice], operator,
+                    )
+                    if (st.session_state.get("scan_model_context") or {}).get("context_id") == outcome["context_id"]:
+                        st.session_state.pop("scan_model_context", None)
+                    st.cache_data.clear()
+                    st.success(
+                        f"已删除模型 {outcome['context_id'][:12]} 的归档（模型版本 {outcome['model_version']}）。"
+                    )
+                    st.rerun()
+                except (model_governance.FinalHoldoutError, DatabaseError, OSError) as exc:
                     st.error(str(exc))
 
 # ---------------------------------------------------------------------------

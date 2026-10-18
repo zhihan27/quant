@@ -10,7 +10,8 @@ from config import settings
 from services.feature_engineering import FEATURE_COLUMNS
 from services.ml_pipeline import evaluate_oos, fit_panel_model, predict_panel, relative_signal
 from services.rank_model import (
-    SCORE_KIND_RANK, SCORE_KIND_RETURN, CrossSectionRanker, ndcg_at_k, random_ndcg_baseline, relevance_grades,
+    SCORE_KIND_RANK, SCORE_KIND_RETURN, CrossSectionRanker, evaluate_ndcg, ndcg_at_k,
+    random_ndcg_baseline, relevance_grades,
 )
 from services.stock_scoring import _make_model
 
@@ -68,6 +69,38 @@ class NdcgTests(unittest.TestCase):
         flat = ndcg_at_k(grades, np.zeros(len(grades)), 3)
         self.assertLessEqual(abs(flat - baseline), 0.5)
         self.assertGreater(baseline, 0.0)
+
+    def test_random_baseline_is_analytic_and_invariant_to_row_order(self):
+        grades = np.array([4.0, 4.0, 2.0, 1.0, 1.0, 0.0])
+        k = 3
+        gains = np.power(2.0, grades) - 1.0
+        discounts = 1.0 / np.log2(np.arange(2, k + 2))
+        ideal = np.sum(np.sort(gains)[::-1][:k] * discounts)
+        expected = np.mean(gains) * discounts.sum() / ideal
+
+        self.assertAlmostEqual(random_ndcg_baseline(grades, k), expected)
+        self.assertAlmostEqual(random_ndcg_baseline(grades[::-1], k), expected)
+        self.assertAlmostEqual(random_ndcg_baseline(grades, len(grades) + 5), random_ndcg_baseline(grades[::-1], len(grades) + 5))
+
+    def test_random_baseline_rejects_no_gain_or_invalid_cutoff(self):
+        self.assertTrue(np.isnan(random_ndcg_baseline(np.zeros(5), 3)))
+        self.assertTrue(np.isnan(random_ndcg_baseline(np.array([4.0, 2.0]), 0)))
+
+    def test_ndcg_result_records_its_protocol(self):
+        class MetadataGuard:
+            def __deepcopy__(self, memo):
+                raise AssertionError("NDCG 临时表不应深拷贝原始面板 attrs")
+
+        frame = pd.DataFrame({
+            "date": ["2026-01-02"] * 5,
+            "prediction": [5.0, 4.0, 3.0, 2.0, 1.0],
+            "actual": [0.5, 0.4, 0.3, 0.2, 0.1],
+        })
+        metadata = MetadataGuard()
+        frame.attrs["unrelated_panel_metadata"] = metadata
+
+        self.assertEqual(evaluate_ndcg(frame)["ndcg_protocol"], settings.NDCG_PROTOCOL)
+        self.assertIs(frame.attrs["unrelated_panel_metadata"], metadata)
 
 
 class RelativeSignalTests(unittest.TestCase):

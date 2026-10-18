@@ -107,6 +107,14 @@ def validation_record(context: dict[str, Any], model: dict[str, Any], horizon: i
     gates = evaluation_gates(metrics) if metrics else {"passed": False, "gates": {}, "failed_gate": NO_METRICS_GATE}
     folds = metrics.get("folds") or []
     window_start, window_end, fold_days = _training_span(folds)
+    execution = model.get("execution")
+    if not isinstance(execution, dict):
+        selected = next(
+            (attempt for attempt in model.get("objective_selection") or [] if attempt.get("selected")),
+            None,
+        )
+        execution = selected.get("execution") if isinstance(selected, dict) else None
+    execution = execution if isinstance(execution, dict) else {}
     # score_kind 在「训练还没跑到评估就退出」时是空的，退回看训练目标：
     # 自动择优模式下目标本身就是 rank 或 reg，比记一个 unknown 有用。
     score_kind = model.get("score_kind")
@@ -154,6 +162,9 @@ def validation_record(context: dict[str, Any], model: dict[str, Any], horizon: i
             "training_window_days": context.get("training_window_days"),
             "objective_mode": context.get("objective_mode"),
             "objective_selection": model.get("objective_selection"),
+            "validation_identity": execution.get("validation_identity"),
+            "validation_cache_sources": execution.get("validation_cache_sources", []),
+            "validation_cache_replay": bool(execution.get("validation_cache_replay", False)),
             "regression_loss": model.get("regression_loss"),
             "label_processing": model.get("label_processing"),
             "mae_relative_change": mae / baseline_mae - 1 if mae is not None and baseline_mae is not None and baseline_mae > 0 else None,
@@ -216,6 +227,36 @@ def _rate(passed: int, total: int) -> float | None:
     return float(passed) / float(total) if total else None
 
 
+def _validation_batch_key(row: dict[str, Any]) -> tuple[str, str, str, str, str]:
+    """返回健康统计的稳定批次键，旧记录退回上下文或扫描时间。"""
+    details = row.get("details") or {}
+    identity = details.get("validation_identity") or details.get("context_id") or row.get("scan_time")
+    return (
+        str(row.get("model_version") or settings.MODEL_VERSION),
+        str(row.get("model_type") or ""),
+        str(row.get("target_type") or ""),
+        str(details.get("horizon") or ""),
+        str(identity),
+    )
+
+
+def _deduplicate_validation_replays(rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """统计时每个验证身份只计一次，完整审计记录仍保留在数据库。"""
+    deduplicated = []
+    seen = set()
+    for row in rows:
+        details = row.get("details") or {}
+        if not (details.get("validation_identity") or details.get("context_id")):
+            deduplicated.append(row)
+            continue
+        key = _validation_batch_key(row)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduplicated.append(row)
+    return deduplicated
+
+
 def _group_summary(rows: Sequence[dict[str, Any]], key: str) -> dict[str, dict[str, Any]]:
     groups: dict[str, dict[str, Any]] = {}
     for row in rows:
@@ -266,6 +307,7 @@ def summarize_pass_rate(
     门槛失败率的分母是「评估过该门槛的记录数」而不是全部记录：排序目标判 NDCG、
     回归目标判 MAE，两者门槛集合不同，拿全部记录当分母会把对方的通过算成自己的失败。
     """
+    rows = _deduplicate_validation_replays(rows)
     total = len(rows)
     passed = sum(1 for row in rows if row.get("pass"))
     evaluated = [row for row in rows if row.get("passed_gates")]
@@ -394,7 +436,8 @@ def fetch_failure_streaks(repository: QuantRepository, limit: int) -> list[dict[
             "  SELECT *, details->>'horizon' AS horizon,"
             "         row_number() OVER ("
             "           PARTITION BY model_version, model_type, target_type, details->>'horizon',"
-            "                        COALESCE(NULLIF(details->>'context_id', ''), scan_time::text)"
+            "                        COALESCE(NULLIF(details->>'validation_identity', ''),"
+            "                                 NULLIF(details->>'context_id', ''), scan_time::text)"
             "           ORDER BY scan_time DESC, id DESC) AS batch_position"
             "  FROM public.quant_model_validation_log WHERE model_version = %s"
             "), ranked AS ("

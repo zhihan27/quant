@@ -1,13 +1,13 @@
 """最近一次扫描结果的落盘与读回。
 
-扫描排名原先只写在 Streamlit 会话里，刷新即丢，因此除了点按钮的那个人，谁也不知道
-今天扫描选出了什么。定时任务跑完之后更需要在界面上留下痕迹，故把它落成一份 JSON。
+全市场扫描结果保存在共享 JSON；自定义试跑结果按账号保存在独立 JSON，避免登录状态变化时丢失。
 
 只保存完整的轻量结果表，不存全池逐股分析对象，供页面先按板块筛选、再限制显示行数。
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -21,6 +21,7 @@ from services.style_factors import production_report_is_current
 LOGGER = logging.getLogger("quant.scan_store")
 
 SCAN_RESULT_PATH = settings.DATA_DIR / "last_scan.json"
+USER_SCAN_RESULT_DIR = settings.DATA_DIR / "user_scans"
 
 # 逐笔成交、每日净值、每段训练日志与期末持仓都随回测长度增长，落盘会让文件大到没必要。
 # 只读视图只展示汇总口径；这些明细留在跑出它的那个会话里，页面上对应的展开区本就有守卫。
@@ -36,8 +37,7 @@ def _compact_portfolio(portfolio_result: dict[str, Any] | None) -> dict[str, Any
 def build_payload(result: ScanResult) -> dict[str, Any]:
     """把扫描产物整理成页面直接渲染的字典。
 
-    落盘与不落盘两条展示路径共用这一份口径：页面上的试跑结果不写文件，但必须与
-    读回的文件长得一模一样，否则同一张表会因为来源不同而少几个字段。
+    全市场与个人试跑共用这一份口径，确保页面展示与读回文件保持一致。
     """
     limit = int(result.options.scan_limit)
     return {
@@ -61,33 +61,76 @@ def build_payload(result: ScanResult) -> dict[str, Any]:
     }
 
 
-def save_scan_result(result: ScanResult, path: Path | None = None) -> Path:
-    """原子写入最近一次扫描结果，避免读到写了一半的文件。"""
-    target = Path(path or SCAN_RESULT_PATH)
+def _save_payload(payload: dict[str, Any], target: Path) -> Path:
+    """原子保存扫描结果，避免并行读取到写了一半的文件。"""
+    target = Path(target)
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_name(target.name + ".tmp")
-    temporary.write_text(json.dumps(build_payload(result), ensure_ascii=False, default=str), encoding="utf-8")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, default=str), encoding="utf-8")
     os.replace(temporary, target)
+    return target
+
+
+def save_scan_result(result: ScanResult, path: Path | None = None) -> Path:
+    """原子写入共享的最近一次全市场扫描结果。"""
+    target = Path(path or SCAN_RESULT_PATH)
+    _save_payload(build_payload(result), target)
     LOGGER.info("扫描结果已落盘 path=%s kind=%s", target, result.options.trigger)
     return target
 
 
-def load_scan_result(path: Path | None = None) -> dict[str, Any] | None:
-    """读回最近一次扫描结果；缺失、损坏或模型版本不符都返回 None，不抛异常。
-
-    与 services/ml_pipeline.py 的 load_context 同口径：模型版本升级后旧结果自动作废，
-    免得页面上显示一份与当前模型对不上的排名。
-    """
-    target = Path(path or SCAN_RESULT_PATH)
+def _read_payload(target: Path) -> dict[str, Any] | None:
+    """读取 JSON 结果；文件缺失或损坏时返回 None。"""
     try:
         payload = json.loads(target.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         if target.exists():
             LOGGER.warning("扫描结果不可读 path=%s detail=%s", target, exc)
         return None
-    if not isinstance(payload, dict) or payload.get("model_version") != settings.MODEL_VERSION:
+    return payload if isinstance(payload, dict) else None
+
+
+def load_scan_result(
+    path: Path | None = None, *, require_current_model: bool = True,
+) -> dict[str, Any] | None:
+    """读回最近一次全市场结果；显示历史结果时可保留旧版本快照。
+
+    模型版本或特征验收不匹配时，调仓等当前模型业务仍拒绝使用；选股页面可以选择
+    显示旧扫描快照，并明确标注它对应的历史模型版本。
+    """
+    target = Path(path or SCAN_RESULT_PATH)
+    payload = _read_payload(target)
+    if payload is None:
         return None
-    if not production_report_is_current(payload.get("style_factors")):
-        LOGGER.warning("扫描结果的风格规则或独立验收已失效，需重新训练")
-        return None
+    if require_current_model:
+        if payload.get("model_version") != settings.MODEL_VERSION:
+            return None
+        if not production_report_is_current(payload.get("style_factors")):
+            LOGGER.warning("扫描结果的风格规则或独立验收已失效，需重新训练")
+            return None
     return payload
+
+
+def _user_scan_path(username: str) -> Path:
+    """将账号名映射为不可逆文件名，个人扫描结果不会与其他账号混用。"""
+    normalized = str(username).strip().casefold()
+    if not normalized:
+        raise ValueError("保存个人扫描结果需要有效的用户名。")
+    identifier = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    return USER_SCAN_RESULT_DIR / f"{identifier}.json"
+
+
+def save_user_scan_result(result: ScanResult, username: str) -> Path:
+    """原子保存当前账号的自定义股票池试跑结果。"""
+    target = _user_scan_path(username)
+    _save_payload(build_payload(result), target)
+    LOGGER.info("个人扫描结果已保存 username_hash=%s", target.stem[:12])
+    return target
+
+
+def load_user_scan_result(username: str) -> dict[str, Any] | None:
+    """读取当前账号最近一次自定义股票池试跑结果。"""
+    try:
+        return _read_payload(_user_scan_path(username))
+    except ValueError:
+        return None

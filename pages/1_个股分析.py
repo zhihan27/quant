@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -33,6 +34,7 @@ from services.ui_helpers import loading_task, show_conclusion, show_empty_state,
 from services.runtime import get_market_data, get_repository
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+LOGGER = logging.getLogger(__name__)
 
 st.set_page_config(page_title="个股分析 | A 股量化研究", layout="wide")
 show_page_header(
@@ -171,28 +173,81 @@ if selected_code:
     try:
         catalog = _model_catalog()
     except Exception as exc:  # 目录读不到不妨碍用活动模型继续分析
-        catalog_error = f"{type(exc).__name__}: {exc}"
-    catalog_by_id = {item["context_id"]: item for item in catalog}
-    option_ids = list(catalog_by_id) or [""]
-    default_id = next(
-        (item["context_id"] for item in catalog if item.get("is_active")), option_ids[0]
-    )
-    selected_model_id = st.selectbox(
-        "分析使用的模型",
-        option_ids,
-        index=option_ids.index(default_id),
-        format_func=lambda identifier: _model_label(catalog_by_id[identifier])
-        if identifier in catalog_by_id else "当前活动模型（目录中尚未登记）",
-        help="可以选择已保存的历史模型回看它在自己截面日期上的判断；旧模型不会给新数据打分。",
-    )
+        LOGGER.exception("读取个股分析模型目录失败")
+        catalog_error = type(exc).__name__
+    if not isinstance(catalog, list):
+        catalog = []
+    catalog_by_id = {
+        item["context_id"]: item
+        for item in catalog
+        if isinstance(item, dict) and isinstance(item.get("context_id"), str) and item["context_id"].strip()
+    }
+    session_context = st.session_state.get("scan_model_context")
+    if not isinstance(session_context, dict):
+        session_context = None
+    session_context_id = (session_context or {}).get("context_id")
+    if not isinstance(session_context_id, str) or not session_context_id.strip():
+        session_context_id = None
+    if session_context_id:
+        # 当前会话刚完成的自定义股票池模型未归档到全局目录，单独放入下拉选项。
+        catalog_by_id[session_context_id] = {
+            "context_id": session_context_id,
+            "reference_date": session_context.get("reference_date"),
+            "objective_mode": session_context.get("objective_mode"),
+            "training_window_days": session_context.get("training_window_days"),
+            "passed": True,
+            "is_active": False,
+            "source": "当前会话扫描",
+            "created_at": session_context.get("created_at"),
+        }
+    model_select_key = "stock_analysis_model_id"
+    option_ids = list(catalog_by_id)
+    if option_ids:
+        default_id = session_context_id or next(
+            (item["context_id"] for item in catalog_by_id.values() if item.get("is_active")), option_ids[0]
+        )
+        # 清掉删除模型或版本切换后残留在会话中的无效选项，避免选择框重跑时报错。
+        if st.session_state.get(model_select_key) not in option_ids:
+            st.session_state[model_select_key] = default_id
+        selected_model_id = st.selectbox(
+            "分析使用的模型",
+            option_ids,
+            format_func=lambda identifier: _model_label(catalog_by_id[identifier]),
+            help="可以选择已保存的历史模型回看它在自己截面日期上的判断；旧模型不会给新数据打分。",
+            key=model_select_key,
+        )
+    else:
+        selected_model_id = ""
+        st.session_state[model_select_key] = ""
     if catalog_error:
-        st.warning(f"模型目录暂不可用（{catalog_error}），本次只能使用当前活动模型。")
+        st.warning(f"模型目录暂不可用（{catalog_error}），本次尝试读取当前活动模型。")
+    elif not catalog_by_id:
+        st.warning(
+            f"没有找到程序版本 {settings.MODEL_VERSION} 的已登记模型。"
+            "若磁盘上只有旧版本模型，需要先完成一次全量扫描生成当前版本模型。"
+        )
 
-    model_context = _model_context(selected_model_id) if selected_model_id else None
+    model_context = None
+    try:
+        model_context = (
+            session_context
+            if selected_model_id and selected_model_id == session_context_id
+            else _model_context(selected_model_id) if selected_model_id else None
+        )
+        if model_context is not None and not isinstance(model_context, dict):
+            raise TypeError("模型上下文格式无效")
+    except Exception as exc:
+        LOGGER.exception("读取个股分析所选模型失败")
+        st.warning(f"所选模型读取失败（{type(exc).__name__}），本次回退到当前活动模型。")
+        model_context = None
     if selected_model_id and model_context is None:
         st.warning("该模型文件已被清理或不完整，请重新选择；本次改用当前活动模型。")
     if model_context is None:
-        model_context, _ = load_context(include_panel=False)
+        try:
+            model_context, _ = load_context(include_panel=False)
+        except Exception:
+            LOGGER.exception("加载个股分析活动模型失败")
+            model_context = None
         selected_model_id = (model_context or {}).get("context_id") or ""
     selected_model = catalog_by_id.get(selected_model_id) or {}
     if model_context:

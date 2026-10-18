@@ -27,6 +27,11 @@ DB_PATH = DATA_DIR / "quant.db"
 # 列式面板存储根目录：逐股日线、因子面板与暴露数据均以 Parquet 保存。
 PANEL_DIR = DATA_DIR / "panel"
 PARQUET_COMPRESSION = "zstd"
+VALIDATION_CACHE_ENABLED = os.environ.get("QUANT_VALIDATION_CACHE", "1").strip().lower() not in {"0", "false", "no", "off"}
+VALIDATION_CACHE_DIR = PANEL_DIR / "validation_cache"
+VALIDATION_CACHE_MAX_BYTES = _env_int("QUANT_VALIDATION_CACHE_MAX_BYTES", 2 * 1024 ** 3)
+VALIDATION_CACHE_TTL_DAYS = _env_int("QUANT_VALIDATION_CACHE_TTL_DAYS", 30)
+VALIDATION_PROTOCOL_VERSION = "walk-forward-cache-v1"
 
 EASTMONEY_QUOTE_URL = "https://push2.eastmoney.com/api/qt/stock/get"
 EASTMONEY_KLINE_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
@@ -76,13 +81,16 @@ BOARD_PREFIXES = {
 # 比股票池过滤用的具体号段更宽，故不并入 BOARD_PREFIXES。
 BSE_LIMIT_PREFIXES = ("4", "8", "92")
 MARKET_INDEX_CODE = "000300"
-MODEL_VERSION = "2.3.0"
+MODEL_VERSION = "2.4.0"
+NDCG_PROTOCOL = "random-permutation-expectation-v2"
 
-# 显式风格特征默认关闭，必须先完成同口径对照和独立留出验收。
+# 选股页统一请求市值与估值候选；通用训练入口保持关闭，生产入模仍须通过独立验收。
 STYLE_FEATURE_PROTOCOL = "pit-style-v1"
 ENABLE_BASE_FEATURES = True
 ENABLE_SIZE_FEATURES = False
 ENABLE_VALUE_FEATURES = False
+SCAN_DEFAULT_ENABLE_SIZE_FEATURES = True
+SCAN_DEFAULT_ENABLE_VALUE_FEATURES = True
 STYLE_MINIMUM_COVERAGE = 0.8
 STYLE_WINSOR_QUANTILES = (0.01, 0.99)
 STYLE_MINIMUM_MARKET_CAP = 1.0
