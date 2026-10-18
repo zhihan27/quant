@@ -66,7 +66,8 @@ class QuoteFallbackTests(unittest.TestCase):
         payload = {
             "f57": "301363", "f58": "美好医疗", "f43": 1490, "f60": 1480,
             "f59": 2, "f116": 12_000_000_000, "f117": 8_000_000_000,
-            "f162": 24.5, "f164": 19.75, "f167": 3.2, "f86": int(now.timestamp()),
+            "f162": 2450, "f164": 1975, "f165": 480, "f167": 320, "f168": 120,
+            "f86": int(now.timestamp()),
         }
         metadata = {"fetched_at": now.isoformat(), "status": "接口获取"}
         with patch.object(self.service, "_request_with_cache", return_value=(payload, metadata)), patch.object(
@@ -76,6 +77,8 @@ class QuoteFallbackTests(unittest.TestCase):
         self.assertEqual(quote["pe_ttm"], 19.75)
         self.assertEqual(quote["pe_dynamic"], 24.5)
         self.assertEqual(quote["pb"], 3.2)
+        self.assertEqual(quote["ps_ttm"], 4.8)
+        self.assertEqual(quote["turnover_rate"], 1.2)
         self.assertEqual(quote["market_cap_total"], 12_000_000_000)
         self.assertEqual(quote["market_cap_float"], 8_000_000_000)
         self.assertTrue(quote["quote_valid"])

@@ -10,10 +10,10 @@ import numpy as np
 import pandas as pd
 
 from config import settings
-from services.ml_pipeline import TARGET_KIND, fit_panel_model, load_context, predict_panel, save_context
+from services.ml_pipeline import TARGET_KIND, fit_panel_model, load_context, load_context_by_id, models_for_stock, predict_panel, save_context
 from services.panel_store import PanelStore
-from services.style_experiments import comparison_fingerprint, compare_variants, experiment_panels, independent_acceptance
-from services.style_factors import SIZE_COLUMNS, VALUE_COLUMNS, align_history, attach_style_factors, load_history, save_history
+from services.style_experiments import _portfolio_metrics, _variant_configuration, comparison_fingerprint, compare_variants, experiment_panels, independent_acceptance
+from services.style_factors import SIZE_COLUMNS, VALUE_COLUMNS, align_history, attach_style_factors, configuration_id_from_config, load_history, production_report_is_current, save_history
 from services.valuation_data import normalize_daily_basic, reconstruct_valuation
 from tests.test_ml_pipeline import _ExactModel
 
@@ -79,8 +79,9 @@ class StyleHistoryTests(unittest.TestCase):
         pd.testing.assert_frame_equal(align_history(panel, facts), align_history(panel, changed))
         with tempfile.TemporaryDirectory() as directory:
             store = PanelStore(Path(directory))
-            save_history(store, facts)
-            save_history(store, revision)
+            self.assertEqual(save_history(store, facts)["new_rows"], len(facts))
+            self.assertEqual(save_history(store, revision)["new_rows"], 1)
+            self.assertEqual(save_history(store, revision)["new_rows"], 0, "重复版本不能再计为新增")
             loaded = load_history(store, ["600000"])
             self.assertEqual(len(loaded), 2)
             mutated = facts.iloc[[0]].copy()
@@ -149,13 +150,17 @@ class StyleFactorTests(unittest.TestCase):
         from services.scan_store import load_scan_result
         from services.style_factors import configuration_id, processing_config
 
-        report = {"protocol": settings.STYLE_FEATURE_PROTOCOL, "configuration_id": configuration_id(),
-            "config": processing_config(), "requested": {"size": True, "value": False},
+        report = {"protocol": settings.STYLE_FEATURE_PROTOCOL, "configuration_id": configuration_id(size=True, value=False),
+            "config": processing_config(size=True, value=False), "requested": {"size": True, "value": False},
             "accepted_columns": ["log_market_cap_total"]}
         approval = {"protocol": settings.STYLE_FEATURE_PROTOCOL, "model_version": settings.MODEL_VERSION,
-            "configuration_id": configuration_id(), "variant": "size", "passed": True}
-        context = {"context_id": "测试风格缓存", "model_version": settings.MODEL_VERSION,
-            "target_kind": TARGET_KIND, "style_factors": report, "models": {}}
+            "configuration_id": report["configuration_id"], "variant": "size", "passed": True}
+        context = {"context_id": "a" * 32, "model_version": settings.MODEL_VERSION,
+            "target_kind": TARGET_KIND, "style_factors": report,
+            "feature_configuration_id": report["configuration_id"],
+            "reference_date": "2026-10-16", "reference_closes": {"600000": 10.0},
+            "models": {20: [{"model": "LightGBM", "validated": True}]},
+            "predictions": {20: {"600000": {"LightGBM": {"prediction_percentile": 0.9}}}}}
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             target = root / "acceptance.json"
@@ -163,12 +168,44 @@ class StyleFactorTests(unittest.TestCase):
             with patch.object(settings, "MODEL_DIR", root), patch.object(settings, "DATA_DIR", root), patch.object(settings, "STYLE_APPROVAL_PATH", target):
                 target.write_text(json.dumps(approval), encoding="utf-8")
                 save_context(context, pd.DataFrame({"code": ["600000"]}))
+                archive = root / settings.MODEL_ARCHIVE_DIRNAME / context["context_id"]
+                archive.mkdir(parents=True)
+                (archive / f"market_context_v{settings.MODEL_VERSION}.joblib").write_bytes(
+                    (root / f"market_context_v{settings.MODEL_VERSION}.joblib").read_bytes())
                 scan_path.write_text(json.dumps({"model_version": settings.MODEL_VERSION, "style_factors": report}), encoding="utf-8")
                 self.assertIsNotNone(load_context()[0])
+                cached, _ = load_context_by_id(context["context_id"])
+                self.assertIsNotNone(cached)
+                self.assertTrue(models_for_stock(cached, "600000", "2026-10-16", 10.0, 20)[0]["validated"])
                 self.assertIsNotNone(load_scan_result(scan_path))
                 target.write_text(json.dumps({**approval, "passed": False}), encoding="utf-8")
                 self.assertIsNone(load_context()[0])
+                self.assertIsNone(load_context_by_id(context["context_id"])[0])
+                rejected = models_for_stock(cached, "600000", "2026-10-16", 10.0, 20)
+                self.assertTrue(all(not row["validated"] and row["prediction_percentile"] is None for row in rejected))
                 self.assertIsNone(load_scan_result(scan_path))
+
+    def test_acceptance_is_bound_to_actual_base_features_and_processing_rules(self):
+        facts = _facts(1)
+        panel = facts[["date", "code"]].copy()
+        panel.attrs["model_feature_columns"] = ["xs_momentum_5"]
+        _, report = attach_style_factors(panel, facts, size=True, value=False, research=True)
+        with tempfile.TemporaryDirectory() as directory, patch.object(settings, "STYLE_APPROVAL_PATH", Path(directory) / "acceptance.json"):
+            settings.STYLE_APPROVAL_PATH.write_text(json.dumps({
+                "passed": True, "variant": "size", "protocol": settings.STYLE_FEATURE_PROTOCOL,
+                "model_version": settings.MODEL_VERSION, "configuration_id": report["configuration_id"],
+            }), encoding="utf-8")
+            self.assertTrue(production_report_is_current(report))
+            _, accepted = attach_style_factors(panel, facts, size=True, value=False)
+            self.assertTrue(accepted["accepted_columns"])
+            for columns, neutralized in ((["neutral_momentum_5"], True), (["xs_momentum_5", "xs_chip"], False)):
+                panel.attrs["model_feature_columns"] = columns
+                _, changed = attach_style_factors(panel, facts, size=True, value=False, neutralization_enabled=neutralized)
+                self.assertNotEqual(changed["configuration_id"], report["configuration_id"])
+                self.assertFalse(changed["accepted_columns"])
+            for name in ("EXTRA_FACTOR_MINIMUM_COVERAGE", "NEUTRALIZATION_MINIMUM_STOCKS", "NEUTRALIZATION_MINIMUM_INDUSTRY_STOCKS"):
+                with patch.object(settings, name, getattr(settings, name) + 1):
+                    self.assertFalse(production_report_is_current(report))
 
     def test_future_coverage_and_extremes_cannot_change_past(self):
         facts = _facts(100)
@@ -223,6 +260,22 @@ class StyleExperimentTests(unittest.TestCase):
             self.assertGreater(result["portfolio"]["periods"], 0)
         self.assertEqual(report["results"]["base"]["features_used"], ["xs_momentum_5"])
         self.assertIn("xs_log_market_cap_float", report["results"]["size_value"]["features_used"])
+        # 验收报告必须能被相同实际特征和目标的生产入口识别。
+        comparison = {**report, "selected_variant": "size"}
+        baseline = {"usable": True, "features_used": ["xs_momentum_5"],
+            "metrics": {"rank_ic": 0.1},
+            "portfolio": {"after_cost_excess_return": 0.01, "maximum_drawdown": -0.2}}
+        candidate = {"usable": True, "features_used": ["xs_momentum_5", *[f"xs_{column}" for column in SIZE_COLUMNS]],
+            "metrics": {"validated": True, "rank_ic": 0.2, "raw_label_mae": 0.01, "raw_label_baseline_mae": 0.02},
+            "portfolio": {"after_cost_excess_return": 0.02, "maximum_drawdown": -0.1,
+                          "industry_pit_coverage": 1.0, "average_log_market_cap": 20}}
+        with tempfile.TemporaryDirectory() as directory, patch.object(settings, "STYLE_APPROVAL_PATH", Path(directory) / "acceptance.json"):
+            with patch("services.style_experiments.evaluate_variant", side_effect=[baseline, candidate]):
+                accepted = independent_acceptance(panels, comparison, "2022-01-01", "2022-03-01")
+            self.assertTrue(accepted["passed"])
+            _, production = attach_style_factors(base, facts, size=True, value=False, objective="regression")
+            self.assertTrue(production["accepted_columns"])
+            self.assertEqual(production["configuration_id"], accepted["configuration_id"])
         original = comparison_fingerprint(panels, end)
         # 只追加未来数据不改变对照证据；改动过去特征必须使旧验收失效。
         changed = {name: frame.copy() for name, frame in panels.items()}
@@ -240,15 +293,38 @@ class StyleExperimentTests(unittest.TestCase):
             "objective": "regression", "experiment_id": "测试实验"}
         panels = {name: pd.DataFrame({"date": pd.to_datetime([]), "code": pd.Series(dtype=str)}) for name in ("base", "size")}
         comparison["data_fingerprint"] = comparison_fingerprint(panels, comparison["validation_end"])
+        comparison["variant_configuration_ids"] = {name: configuration_id_from_config(_variant_configuration(panel, name, "regression"))
+                                                  for name, panel in panels.items()}
         failed = {"usable": False, "features_used": [], "metrics": None, "portfolio": None}
         with tempfile.TemporaryDirectory() as directory, patch("services.style_experiments.evaluate_variant", return_value=failed):
             target = Path(directory) / "acceptance.json"
+            panels["size"].attrs["model_feature_columns"] = ["neutral_momentum_5"]
+            with self.assertRaisesRegex(ValueError, "实际入模特征"):
+                independent_acceptance(panels, comparison, "2020-07-01", "2020-10-01", target)
+            self.assertFalse(target.exists())
+            panels["size"].attrs.pop("model_feature_columns")
             with self.assertRaises(ValueError):
                 independent_acceptance(panels, comparison, "2020-05-01", "2020-10-01", target)
             result = independent_acceptance(panels, comparison, "2020-07-01", "2020-10-01", target)
             self.assertFalse(result["passed"])
+            self.assertEqual(result["configuration_id"], comparison["variant_configuration_ids"]["size"])
             self.assertTrue(target.exists())
             with self.assertRaises(ValueError):
                 independent_acceptance(panels, comparison, "2020-07-01", "2020-10-01", target)
             with self.assertRaises(ValueError):
                 independent_acceptance(panels, comparison, "2020-08-01", "2020-11-01", target)
+
+    def test_equal_weight_rebalance_charges_drift_even_with_unchanged_members(self):
+        dates = pd.bdate_range("2020-01-01", periods=21)
+        panel = pd.DataFrame({"date": dates, "code": "0"})
+        evaluation = pd.DataFrame([{
+            "date": date, "code": str(index), "prediction": 10 - index,
+            "absolute_return": 1.0 if period == 0 and index == 0 else 0.0,
+            "actual": 1.0 if period == 0 and index == 0 else 0.0,
+        } for period, date in enumerate((dates[0], dates[20])) for index in range(10)])
+        with patch("services.style_experiments.cost_rates", return_value=(0.01, 0.01)):
+            result = _portfolio_metrics(evaluation, panel, 20)
+        # 首期等权持仓涨成 2/3 和 1/3，次期各买卖 1/6，末期还需平仓。
+        expected = (1.5 - 0.01) * (1 - (1 / 6) * 0.02 - 0.01) - 1
+        self.assertAlmostEqual(result["net_total_return"], expected)
+        self.assertAlmostEqual(result["average_turnover"], (0.5 + 1 / 6) / 2)

@@ -17,7 +17,9 @@ from streamlit.testing.v1 import AppTest
 from config import settings
 from services.database import connection_settings
 from services.market_regime import classify_market, latest_regime, save_regime
-from services.rebalancing import build_checklist
+from services.market_data import MarketDataService
+from services.rebalancing import build_checklist, ranking_snapshot
+from services.timing_strategy import build_trade_plan
 
 
 def _rank(code, rank=1, price=10):
@@ -26,7 +28,8 @@ def _rank(code, rank=1, price=10):
         "reference_date": "2026-10-16", "model_validated": True, "price": price,
         "quote_time": "2026-10-16 15:00:00", "quote_valid": True,
         "volume_lots": 10000, "amount_yuan": 5e7, "ma20_gap": 0.05,
-        "entry_allowed": True, "entry_trade_status": "可正常评估"}
+        "entry_allowed": True, "entry_trade_status": "可正常评估",
+        "entry_generated_at": "2026-10-16T18:00:00+08:00", "entry_valid_until": "2026-10-23T18:00:00+08:00"}
 
 
 def _position(code, price=10):
@@ -90,6 +93,36 @@ class ChecklistTests(unittest.TestCase):
         self.assertEqual(result["hold"][0]["当前确认可卖"], 100)
         self.assertFalse(result["buy"])
 
+    def test_after_close_universe_quote_uses_complete_bar_for_next_day_checklist(self):
+        service = MarketDataService.__new__(MarketDataService)
+        quote = service.quote_from_universe_row(
+            {"code": "600001", "price": 99, "volume_lots": 10000, "amount_yuan": 5e7},
+            {"fetched_at": datetime.now(ZoneInfo("Asia/Shanghai")).isoformat()},
+        )
+        self.assertIsNone(quote["quote_time"])
+        self.assertTrue(quote["quote_valid"])
+        plan = build_trade_plan(10, 0.02, 9, 8, 1, True,
+            volume=10000, average_volume=9000, data_status="最近收盘全市场行情快照（非实时）",
+            as_of="2026-10-16T18:00:00+08:00", evaluation_time="2026-10-16T18:00:00+08:00")
+        self.assertFalse(plan["signal_active"])
+        rows = ranking_snapshot([{
+            "code": "600001", "quote": quote, "entry_trade_status": "可正常评估",
+            "features": {"date": pd.Timestamp("2026-10-16"), "close": 10,
+                         "volume": 10000, "amount": 5e7, "ma20_gap": 0.05},
+            "analysis": {"models": {20: [{"validated": True, "prediction_percentile": 0.9}]}, "trade_plan": plan},
+        }], "2026-10-16")
+        result = self.run_checklist([], self.scan(rows))
+        self.assertEqual(result["buy"][0]["参考价格"], 10)
+        held = self.run_checklist([_position("600001")], self.scan(rows))
+        self.assertEqual(held["hold"][0]["代码"], "600001")
+        for change in ({"daily_bar_date": "2026-10-15"}, {"entry_valid_until": "2026-10-17"},
+                       {"entry_generated_at": "2026-10-19"}, {"entry_valid_until": None},
+                       {"quote_valid": False}, {"amount_yuan": None}):
+            self.assertFalse(self.run_checklist([], self.scan([{**rows[0], **change}]))["buy"])
+        before_close = build_checklist([], self.scan(rows),
+            now=datetime(2026, 10, 16, 14, tzinfo=ZoneInfo("Asia/Shanghai")))
+        self.assertFalse(before_close["buy"])
+
 
 class MarketRegimeTests(unittest.TestCase):
     """市场统计仅使用共同交易日和当时行情。"""
@@ -112,6 +145,12 @@ class MarketRegimeTests(unittest.TestCase):
         self.assertIn("小盘相对占优", first["label"])
         self.assertIn("放量高热", first["label"])
         self.assertEqual(len(first["top_industries"]), 3)
+        # 样本口径与行业映射说明只是提示，指标已计算时不应误报降级。
+        self.assertTrue(first["warnings"])
+        self.assertFalse(first["degraded"])
+        styled = classify_market(histories, large, small, reference, exposures, explicit_style=True)
+        self.assertFalse(styled["degraded"])
+        self.assertTrue(any("显式风格" in warning for warning in styled["warnings"]))
         for frame in [large, small, *histories.values()]:
             frame.loc[frame.index >= 60, "close"] = 999999
             if "amount" in frame:

@@ -31,6 +31,8 @@ def classify_market(
     """返回大小盘相对动量、成交额、换手分位与申万行业前三；仅使用截至指定日的数据。"""
     date = pd.Timestamp(reference_date).normalize()
     warnings: list[str] = []
+    # 口径说明与已计算数据的解释性提示，不表示数据缺失，不触发降级。
+    informational: list[str] = []
     result: dict[str, Any] = {"reference_date": str(date.date()), "label": "数据不足，无法识别市场状态",
         "relative_momentum": None, "index_ratio": None, "amount_yuan": None,
         "turnover_percentile": None, "amount_percentile": None, "top_industries": [],
@@ -84,7 +86,9 @@ def classify_market(
         if full_market and len(current) >= settings.MINIMUM_EXPECTED_A_SHARE_UNIVERSE and current["amount"].notna().mean() >= 0.8:
             result["scope"] = "本轮全市场有效股票（不含停牌及采集失败）"
         else:
-            warnings.append("流动性仅代表扫描样本，不能视为全市场总量")
+            note = "流动性仅代表扫描样本，不能视为全市场总量"
+            warnings.append(note)
+            informational.append(note)
         if exposures is not None and not exposures.empty and {"code", "industry", "industry_source"}.issubset(exposures):
             industry_map = exposures.loc[exposures["industry_source"].astype(str).str.contains("申万一级", regex=False)]
             industry_map = industry_map.drop_duplicates("code", keep="last").set_index("code")["industry"]
@@ -100,7 +104,9 @@ def classify_market(
                 "amount_yuan": float(row["amount_yuan"]) if pd.notna(row["amount_yuan"]) else None,
                 "stocks": int(row["stocks"])} for name, row in leaders.iterrows()]
             result["top_amount_industries"] = list(liquid.index)
-            warnings.append("行业为当前申万分类映射，历史成分未经点时核验；成交额不等同资金净流入")
+            note = "行业为当前申万分类映射，历史成分未经点时核验；成交额不等同资金净流入"
+            warnings.append(note)
+            informational.append(note)
         if not result["top_industries"]:
             warnings.append("申万一级行业缺失，行业轮动未接入")
     else:
@@ -117,8 +123,10 @@ def classify_market(
                 "；缩量偏冷" if max(heat, amount_heat) <= 0.2 else "；流动性平稳")
         result["label"] = style + state
         if explicit_style and abs(gap) >= settings.MARKET_REGIME_STYLE_GAP:
-            warnings.append("市场风格分化明显，显式风格模型需复核市值暴露；无法仅凭状态断言模型失效")
-    result["degraded"] = bool(warnings)
+            note = "市场风格分化明显，显式风格模型需复核市值暴露；无法仅凭状态断言模型失效"
+            warnings.append(note)
+            informational.append(note)
+    result["degraded"] = any(warning not in informational for warning in warnings)
     for warning in warnings:
         LOGGER.warning("市场状态降级 date=%s detail=%s", reference_date, warning)
     return result

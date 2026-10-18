@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 
 from config import settings
-from services.feature_engineering import normalize_cross_section
+from services.feature_engineering import FEATURE_COLUMNS, normalize_cross_section
 from services.panel_store import PanelStore
 
 LOGGER = logging.getLogger("quant.style_factors")
@@ -23,16 +23,31 @@ METADATA_COLUMNS = ("source", "collected_at", "available_at", "revision_id", "un
                     "quality", "size_pit", "value_pit")
 
 
-def processing_config(objective: str | None = None, training_window: int | None = None) -> dict[str, Any]:
+def processing_config(
+    objective: str | None = None, training_window: int | None = None, *,
+    size: bool | None = None, value: bool | None = None,
+    neutralization_enabled: bool = False, base_feature_columns: list[str] | None = None,
+    extra_factor_families: list[str] | None = None,
+) -> dict[str, Any]:
     """返回影响入模与独立验收有效性的全部处理配置。"""
     return {
         "protocol": settings.STYLE_FEATURE_PROTOCOL,
+        "configuration_version": 2,
         "minimum_coverage": float(settings.STYLE_MINIMUM_COVERAGE),
         "winsor_quantiles": list(settings.STYLE_WINSOR_QUANTILES),
         "minimum_market_cap": float(settings.STYLE_MINIMUM_MARKET_CAP),
         "minimum_book_equity": float(settings.STYLE_MINIMUM_BOOK_EQUITY),
         "minimum_revenue": float(settings.STYLE_MINIMUM_REVENUE),
         "base_features_enabled": bool(settings.ENABLE_BASE_FEATURES),
+        "base_feature_definitions": list(FEATURE_COLUMNS),
+        "base_feature_columns": list(base_feature_columns or []),
+        "size_features_enabled": bool(settings.ENABLE_SIZE_FEATURES if size is None else size),
+        "value_features_enabled": bool(settings.ENABLE_VALUE_FEATURES if value is None else value),
+        "neutralization_enabled": bool(neutralization_enabled),
+        "neutralization_minimum_stocks": int(settings.NEUTRALIZATION_MINIMUM_STOCKS),
+        "neutralization_minimum_industry_stocks": int(settings.NEUTRALIZATION_MINIMUM_INDUSTRY_STOCKS),
+        "extra_factor_minimum_coverage": float(settings.EXTRA_FACTOR_MINIMUM_COVERAGE),
+        "extra_factor_families": sorted(str(name) for name in (extra_factor_families or [])),
         "training_window": int(settings.TRAINING_WINDOW_DAYS if training_window is None else training_window),
         "objective": objective or settings.DEFAULT_OBJECTIVE_MODE,
         "label_upper_quantile": float(settings.LABEL_WINSOR_UPPER_QUANTILE),
@@ -44,10 +59,23 @@ def processing_config(objective: str | None = None, training_window: int | None 
     }
 
 
-def configuration_id(objective: str | None = None, training_window: int | None = None) -> str:
+def configuration_id(
+    objective: str | None = None, training_window: int | None = None, **feature_options: Any,
+) -> str:
     """为处理配置生成稳定指纹，规则变更后旧验收自动失效。"""
-    payload = json.dumps(processing_config(objective, training_window), sort_keys=True).encode("utf-8")
+    payload = json.dumps(processing_config(objective, training_window, **feature_options), sort_keys=True).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+def configuration_id_from_config(configuration: dict[str, Any]) -> str:
+    """保留本轮显式选项和实际列，使用当前处理规则重新核验指纹。"""
+    return configuration_id(
+        configuration.get("objective"), configuration.get("training_window"),
+        size=configuration.get("size_features_enabled"), value=configuration.get("value_features_enabled"),
+        neutralization_enabled=configuration.get("neutralization_enabled", False),
+        base_feature_columns=configuration.get("base_feature_columns"),
+        extra_factor_families=configuration.get("extra_factor_families"),
+    )
 
 
 def normalize_history(frame: pd.DataFrame) -> pd.DataFrame:
@@ -88,9 +116,11 @@ def save_history(store: PanelStore, frame: pd.DataFrame) -> dict[str, Any]:
     """追加保存历史版本；同一版本重采不覆盖原始记录，修订不得倒灌。"""
     normalized = normalize_history(frame)
     count = 0
+    added = 0
     for code, group in normalized.groupby("code"):
         try:
             existing = store.read_partition("valuation", code)
+            previous_rows = len(existing) if existing is not None and not existing.empty else 0
             if existing is not None and not existing.empty:
                 # 日指标接口不提供历史修订发布时间；重采出现新版本时只能从采集时点可用。
                 previous = existing.loc[existing["source"].eq("Tushare daily_basic")]
@@ -107,10 +137,11 @@ def save_history(store: PanelStore, frame: pd.DataFrame) -> dict[str, Any]:
                 group = group.drop_duplicates(["code", "date", "source", "revision_id"], keep="first")
             store.write_partition("valuation", code, group)
             count += len(group)
+            added += max(len(group) - previous_rows, 0)
         except (OSError, ValueError, ImportError):
             LOGGER.exception("历史估值版本落盘失败 code=%s", code)
             raise
-    return {"codes": int(normalized["code"].nunique()), "stored_rows": count}
+    return {"codes": int(normalized["code"].nunique()), "stored_rows": count, "new_rows": added}
 
 
 def load_history(store: PanelStore, codes: list[str]) -> pd.DataFrame:
@@ -150,7 +181,7 @@ def approval_status(size: bool, value: bool, config_id: str | None = None) -> di
             report.get("passed") is True and report.get("variant") == variant
             and report.get("protocol") == settings.STYLE_FEATURE_PROTOCOL
             and report.get("model_version") == settings.MODEL_VERSION
-            and report.get("configuration_id") == (config_id or configuration_id())
+            and report.get("configuration_id") == (config_id or configuration_id(size=size, value=value))
         )
     except (OSError, ValueError, TypeError):
         approved = False
@@ -163,12 +194,16 @@ def production_report_is_current(report: dict[str, Any] | None) -> bool:
     if not report:
         return True
     configuration = report.get("config") or {}
-    expected = configuration_id(configuration.get("objective"), configuration.get("training_window"))
+    expected = configuration_id_from_config(configuration)
     if report.get("protocol") != settings.STYLE_FEATURE_PROTOCOL or report.get("configuration_id") != expected:
         return False
     if not report.get("accepted_columns"):
         return True
     requested = report.get("requested") or {}
+    if (bool(requested.get("size")), bool(requested.get("value"))) != (
+        configuration.get("size_features_enabled"), configuration.get("value_features_enabled"),
+    ):
+        return False
     return approval_status(bool(requested.get("size")), bool(requested.get("value")), expected)["approved"]
 
 
@@ -213,12 +248,17 @@ def attach_style_factors(
     panel: pd.DataFrame, history: pd.DataFrame | None, *, size: bool | None = None,
     value: bool | None = None, research: bool = False, calibration_end: Any = None,
     objective: str | None = None, training_window: int | None = None,
+    neutralization_enabled: bool = False,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """生成截面风格特征，按校准期覆盖门控；显式特征不对自身中性化。"""
     size = settings.ENABLE_SIZE_FEATURES if size is None else bool(size)
     value = settings.ENABLE_VALUE_FEATURES if value is None else bool(value)
-    report = {"protocol": settings.STYLE_FEATURE_PROTOCOL, "config": processing_config(objective, training_window),
-              "configuration_id": configuration_id(objective, training_window), "requested": {"size": size, "value": value},
+    config = processing_config(objective, training_window, size=size, value=value,
+                               neutralization_enabled=neutralization_enabled,
+                               base_feature_columns=panel.attrs.get("model_feature_columns", []),
+                               extra_factor_families=panel.attrs.get("extra_factor_families", []))
+    report = {"protocol": settings.STYLE_FEATURE_PROTOCOL, "config": config,
+              "configuration_id": configuration_id_from_config(config), "requested": {"size": size, "value": value},
               "features": {}, "accepted_columns": [], "model_feature_columns": [],
               "sources": [], "status": "显式市值与估值特征均关闭"}
     if not size and not value:

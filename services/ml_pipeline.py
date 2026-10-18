@@ -109,6 +109,7 @@ def build_market_panel(
         panel, extra_report = attach_extra_factors(panel, extra_factors, store=store, progress=progress)
     panel, veto_report = apply_health_veto(panel)
     panel = normalize_cross_section(panel, FEATURE_COLUMNS, MINIMUM_STOCKS, MINIMUM_COVERAGE)
+    panel.attrs["extra_factor_families"] = sorted((extra_report.get("families") or {}).keys())
     model_features = [f"xs_{column}" for column in FEATURE_COLUMNS]
     neutralization: dict[str, Any] = {"status": "未启用市值与行业中性化，模型使用截面Z分数因子"}
     exposure_report: dict[str, Any] = {"status": "未接入市值与行业暴露"}
@@ -158,7 +159,9 @@ def build_market_panel(
         style_history = extra_factors.get("valuation")
     if style_history is None and store is not None and (settings.ENABLE_SIZE_FEATURES or settings.ENABLE_VALUE_FEATURES):
         style_history = load_history(store, list(histories))
-    panel, style_report = attach_style_factors(panel, style_history, **(style_options or {}))
+    panel, style_report = attach_style_factors(panel, style_history, **{
+        "neutralization_enabled": exposures is not None and not exposures.empty, **(style_options or {}),
+    })
     model_features = [*model_features, *style_report["model_feature_columns"]]
     panel.attrs["style_factors"] = style_report
     # 截面覆盖只针对本次成功取得历史的股票池，不能冒充历史全市场成分。
@@ -521,7 +524,7 @@ def train_market_context(
                "extra_factors": panel.attrs.get("extra_factors"),
                "style_factors": panel.attrs.get("style_factors"),
                "model_feature_columns": panel.attrs.get("model_feature_columns"),
-               "feature_configuration_id": configuration_id(objective, window),
+               "feature_configuration_id": panel.attrs["style_factors"]["configuration_id"],
                "market_regime": (metadata or {}).get("market_regime"),
                # 留出集状态随每次扫描重新注入：context 每轮都是新建的字典，
                # 不从报告文件读回来的话这四个字段永远显示「未评估」。
@@ -584,6 +587,16 @@ def save_context(context: dict[str, Any], panel: pd.DataFrame) -> None:
     save_context_summary(context, settings.MODEL_DIR / f"market_context_v{settings.MODEL_VERSION}.json")
 
 
+def _context_configuration_is_current(context: dict[str, Any]) -> bool:
+    """加载和每次输出预测共用验收闸门，页面缓存不能绕过验收撤销。"""
+    report = context.get("style_factors")
+    if not production_report_is_current(report):
+        return False
+    expected = report["configuration_id"] if report else configuration_id(
+        context.get("objective_mode"), context.get("training_window_days"))
+    return not context.get("feature_configuration_id") or context["feature_configuration_id"] == expected
+
+
 def load_context(include_panel: bool = False) -> tuple[dict[str, Any] | None, pd.DataFrame | None]:
     """读取本程序生成的受信任本地模型；版本或上下文不一致时拒绝使用。"""
     import joblib
@@ -595,11 +608,7 @@ def load_context(include_panel: bool = False) -> tuple[dict[str, Any] | None, pd
         context = joblib.load(path)
         if context.get("model_version") != settings.MODEL_VERSION or context.get("target_kind") != TARGET_KIND:
             return None, None
-        expected = configuration_id(context.get("objective_mode"), context.get("training_window_days"))
-        if context.get("feature_configuration_id") and context["feature_configuration_id"] != expected:
-            LOGGER.warning("模型特征规则已变化，旧上下文不可复用，请重新训练")
-            return None, None
-        if not production_report_is_current(context.get("style_factors")):
+        if not _context_configuration_is_current(context):
             LOGGER.warning("风格规则或独立验收已失效，拒绝继续读取旧模型权重")
             return None, None
         panel = pd.read_parquet(settings.DATA_DIR / f"ml_panel_v{settings.MODEL_VERSION}.parquet") if include_panel else None
@@ -658,6 +667,9 @@ def load_context_by_id(
             LOGGER.warning("模型归档内容与 id/版本不一致：%s", context_id)
             return None, None
         panel = None
+        if not _context_configuration_is_current(context):
+            LOGGER.warning("归档模型特征规则或独立验收已失效：%s", context_id)
+            return None, None
         if include_panel:
             panel = pd.read_parquet(directory / f"ml_panel_v{version}.parquet")
             if panel.attrs.get("context_id") != context_id:
@@ -707,6 +719,9 @@ def models_for_stock(context: dict[str, Any] | None, code: str | None, date: str
     status = "请先在量化选股中扫描至少5只股票以建立同日截面模型"
     if context:
         status = "当前股票不在已训练截面内，或日线已更新，请重新扫描股票池"
+        if not _context_configuration_is_current(context):
+            return [unavailable_model(name, horizon, "模型特征规则或独立验收已失效，请重新验收并训练")
+                    for name in MODEL_NAMES]
     valid = context and context.get("reference_date") == date and str(code) in context.get("reference_closes", {})
     if valid:
         expected = context["reference_closes"][str(code)]

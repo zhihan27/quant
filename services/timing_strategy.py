@@ -80,6 +80,8 @@ def build_trade_plan(
     return {
         "status": state,
         "signal_active": active,
+        # 完整收盘信号供次日人工复核，行情实时性仍由即时信号单独约束。
+        "close_signal_active": bool(model_ready and forecast_ok and trend_ok and volume_ok and history_ready and time_ok),
         "reference_price": float(current_price),
         "buy_zone": (round(current_price - 0.25 * atr, 2), round(current_price + 0.25 * atr, 2)),
         "entry_trigger": "模型通过基线、Rank IC及分组检验，预期超额收益为正且位于同日截面均值上方；收盘价高于20日均线、20日均线高于60日均线且量能达标；次日开盘仅在买入区间内评估",

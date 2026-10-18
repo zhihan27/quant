@@ -17,7 +17,10 @@ from config import settings
 from services.acquisition_store import _atomic_json
 from services.backtest import cost_rates
 from services.ml_pipeline import build_market_panel, evaluate_oos, fit_panel_model, predict_panel
-from services.style_factors import SIZE_COLUMNS, VALUE_COLUMNS, attach_style_factors, configuration_id
+from services.style_factors import (
+    SIZE_COLUMNS, VALUE_COLUMNS, attach_style_factors, configuration_id,
+    configuration_id_from_config, processing_config,
+)
 
 LOGGER = logging.getLogger("quant.style_experiments")
 VARIANTS = {"base": (False, False), "size": (True, False), "value": (False, True), "size_value": (True, True)}
@@ -54,7 +57,8 @@ def experiment_panels(
     required = []
     for variant, (size, value) in VARIANTS.items():
         frame, report = attach_style_factors(base, valuation, size=size, value=value,
-                                             research=True, calibration_end=calibration_end)
+                                             research=True, calibration_end=calibration_end,
+                                             neutralization_enabled=exposures is not None and not exposures.empty)
         frame.attrs = {**base.attrs, "style_factors": report,
                        "model_feature_columns": [*base.attrs["model_feature_columns"], *report["model_feature_columns"]]}
         panels[variant] = frame
@@ -78,7 +82,7 @@ def experiment_panels(
 def _portfolio_metrics(evaluation: pd.DataFrame, panel: pd.DataFrame, horizon: int) -> dict[str, Any]:
     """用非重叠持仓期、实际标签和统一费用诊断组合及风格暴露。"""
     buy, sell = cost_rates()
-    previous: set[str] = set()
+    previous_weights: dict[str, float] = {}
     returns, excesses, turnovers, caps = [], [], [], []
     industries: dict[str, list[float]] = {}
     industry_ready = {"style_industry", "style_industry_pit"}.issubset(panel)
@@ -91,13 +95,13 @@ def _portfolio_metrics(evaluation: pd.DataFrame, panel: pd.DataFrame, horizon: i
         if selected.empty:
             continue
         members = set(selected["code"])
-        if previous:
-            buy_turnover = len(members - previous) / len(members)
-            sell_turnover = len(previous - members) / len(previous)
-            fee = buy_turnover * buy + sell_turnover * sell
-        else:
-            buy_turnover, sell_turnover = 1.0, 0.0
-            fee = buy
+        # 上期涨跌会改变持仓权重；即使成分不变，恢复等权仍需计入双边成交费用。
+        target_weights = {code: 1 / len(members) for code in members}
+        codes = members | previous_weights.keys()
+        changes = [target_weights.get(code, 0.0) - previous_weights.get(code, 0.0) for code in codes]
+        buy_turnover = sum(max(change, 0.0) for change in changes)
+        sell_turnover = sum(max(-change, 0.0) for change in changes)
+        fee = buy_turnover * buy + sell_turnover * sell
         turnover = (buy_turnover + sell_turnover) / 2
         returns.append(float(selected["absolute_return"].mean()) - fee)
         excesses.append(float(selected["actual"].mean()) - fee)
@@ -113,7 +117,12 @@ def _portfolio_metrics(evaluation: pd.DataFrame, panel: pd.DataFrame, horizon: i
             weights = exposure.loc[known, "style_industry"].value_counts(normalize=True)
             for industry, weight in weights.items():
                 industries.setdefault(str(industry), []).append(float(weight))
-        previous = members
+        grown = {row.code: target_weights[row.code] * (1 + float(row.absolute_return))
+                 for row in selected.itertuples()}
+        total = sum(grown.values())
+        if total <= 0:
+            break
+        previous_weights = {code: weight / total for code, weight in grown.items()}
     if returns:
         returns[-1] -= sell
         excesses[-1] -= sell
@@ -177,6 +186,17 @@ def evaluate_variant(panel: pd.DataFrame, start: str, end: str, objective: str, 
     return report
 
 
+def _variant_configuration(panel: pd.DataFrame, variant: str, objective: str) -> dict[str, Any]:
+    """将实验目标和实际基础列绑定到生产同口径的风格配置。"""
+    stored = (panel.attrs.get("style_factors") or {}).get("config") or {}
+    style_columns = {f"xs_{column}" for column in (*SIZE_COLUMNS, *VALUE_COLUMNS)}
+    base_columns = [column for column in panel.attrs.get("model_feature_columns", []) if column not in style_columns]
+    size, value = VARIANTS[variant]
+    return processing_config(objective, size=size, value=value, base_feature_columns=base_columns,
+                             neutralization_enabled=stored.get("neutralization_enabled", False),
+                             extra_factor_families=stored.get("extra_factor_families", []))
+
+
 def compare_variants(panels: dict[str, pd.DataFrame], start: str, end: str, objective: str | None = None,
                      model_factory: Any = None) -> dict[str, Any]:
     """固定规则评估四组，配置选择只使用验证期，返回可保存的对照报告。"""
@@ -195,6 +215,8 @@ def compare_variants(panels: dict[str, pd.DataFrame], start: str, end: str, obje
     selected = max(candidates, key=lambda name: results[name]["metrics"]["rank_ic"]) if candidates else None
     report = {"protocol": settings.STYLE_FEATURE_PROTOCOL, "model_version": settings.MODEL_VERSION,
         "configuration_id": configuration_id(objective), "validation_start": start, "validation_end": end,
+        "variant_configuration_ids": {name: configuration_id_from_config(_variant_configuration(panel, name, objective))
+                                      for name, panel in panels.items()},
         "data_fingerprint": comparison_fingerprint(panels, end),
         "objective": objective, "selected_variant": selected, "results": results,
         "created_at": datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(), "production_enabled": False}
@@ -212,6 +234,10 @@ def independent_acceptance(
         raise ValueError("验证期未选出可用新增特征组合，不能进行独立验收。")
     if comparison.get("configuration_id") != configuration_id(comparison.get("objective")) or comparison.get("model_version") != settings.MODEL_VERSION:
         raise ValueError("对照配置或模型版本已变化，旧对照不能用于独立验收。")
+    current_ids = {name: configuration_id_from_config(_variant_configuration(panel, name, comparison["objective"]))
+                   for name, panel in panels.items()}
+    if comparison.get("variant_configuration_ids") != current_ids:
+        raise ValueError("实际入模特征或中性化配置已变化，必须重新进行同口径对照。")
     if pd.Timestamp(start) <= pd.Timestamp(comparison["validation_end"]) or pd.Timestamp(start) >= pd.Timestamp(end):
         raise ValueError("独立验收必须严格位于验证区间之后，且起点早于终点。")
     if comparison.get("data_fingerprint") != comparison_fingerprint(panels, comparison["validation_end"]):
@@ -259,7 +285,7 @@ def independent_acceptance(
     gates["actual_model_features"] = all(column in candidate["features_used"] for column in required)
     report = {"passed": all(gates.values()), "gates": gates, "results": results,
         "variant": variant, "protocol": settings.STYLE_FEATURE_PROTOCOL, "model_version": settings.MODEL_VERSION,
-            "configuration_id": configuration_id(comparison.get("objective")), "experiment_id": comparison["experiment_id"],
+        "configuration_id": current_ids[variant], "experiment_id": comparison["experiment_id"],
         "holdout_start": start, "holdout_end": end, "validation_end": comparison["validation_end"],
         "evaluated_at": datetime.now(ZoneInfo("Asia/Shanghai")).isoformat()}
     _atomic_json(marker, report)

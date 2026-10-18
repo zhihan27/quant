@@ -24,11 +24,31 @@ def _number(value: Any) -> float | None:
 
 def _quote_is_current(row: dict[str, Any], date: pd.Timestamp, now: datetime) -> bool:
     """排名行和行情必须来自同一截面，且行情时间不能晚于复核时点。"""
+    if pd.isna(date) or row.get("reference_date") != str(date.date()):
+        return False
+    if row.get("daily_bar_date"):
+        # 日线来源日期独立记录，不把快照采集时间冒充逐股行情时间。
+        bar_date = pd.to_datetime(row["daily_bar_date"], errors="coerce")
+        if pd.isna(bar_date) or bar_date.date() != date.date():
+            return False
+        close_time = pd.Timestamp(date.date()).tz_localize("Asia/Shanghai") + pd.Timedelta(hours=15)
+        return bool(close_time <= pd.Timestamp(now))
     stamp = pd.to_datetime(row.get("quote_time"), errors="coerce")
-    if pd.isna(stamp) or pd.isna(date) or row.get("reference_date") != str(date.date()):
+    if pd.isna(stamp):
         return False
     stamp = stamp.tz_localize("Asia/Shanghai") if stamp.tzinfo is None else stamp.tz_convert("Asia/Shanghai")
     return bool(stamp.date() == date.date() and stamp <= pd.Timestamp(now))
+
+
+def _signal_is_current(row: dict[str, Any], now: datetime) -> bool:
+    """信号生成时间与有效期都必须明确，缺失或过期时不生成调入任务。"""
+    stamps = [pd.to_datetime(row.get(key), errors="coerce")
+              for key in ("entry_generated_at", "entry_valid_until")]
+    if any(pd.isna(stamp) for stamp in stamps):
+        return False
+    generated, expires = [stamp.tz_localize("Asia/Shanghai") if stamp.tzinfo is None
+                          else stamp.tz_convert("Asia/Shanghai") for stamp in stamps]
+    return bool(generated <= pd.Timestamp(now) <= expires)
 
 
 def ranking_snapshot(records: list[dict[str, Any]], reference_date: str | None) -> list[dict[str, Any]]:
@@ -42,14 +62,20 @@ def ranking_snapshot(records: list[dict[str, Any]], reference_date: str | None) 
         features = item.get("features") or {}
         quote = item.get("quote") or {}
         plan = (item.get("analysis") or {}).get("trade_plan") or {}
+        bar_date = pd.to_datetime(features.get("date"), errors="coerce")
+        daily_bar_date = str(bar_date.date()) if pd.notna(bar_date) else None
+        has_daily_bar = daily_bar_date is not None
         ranked.append({"code": item["code"], "name": item.get("name", item["code"]),
             "score": score, "rank": None, "reference_date": reference_date,
-            "model_validated": bool(validated), "price": _number(quote.get("price")),
+            "model_validated": bool(validated),
+            "price": _number(features.get("close") if has_daily_bar else quote.get("price")),
+            "daily_bar_date": daily_bar_date,
             "quote_time": quote.get("quote_time"), "quote_valid": bool(quote.get("quote_valid")),
-            "amount_yuan": _number(quote.get("amount_yuan", quote.get("amount"))),
-            "volume_lots": _number(quote.get("volume_lots")),
+            "amount_yuan": _number(features.get("amount") if has_daily_bar else quote.get("amount_yuan", quote.get("amount"))),
+            "volume_lots": _number(features.get("volume") if has_daily_bar else quote.get("volume_lots")),
             "ma20_gap": _number(features.get("ma20_gap")),
-            "entry_allowed": bool(plan.get("signal_active")),
+            "entry_allowed": bool(plan.get("close_signal_active")),
+            "entry_generated_at": plan.get("generated_at"), "entry_valid_until": plan.get("valid_until"),
             "entry_trade_status": item.get("entry_trade_status"), "error": item.get("error")})
     eligible = sorted([row for row in ranked if row["score"] is not None], key=lambda row: (-row["score"], row["code"]))
     for rank, row in enumerate(eligible, 1):
@@ -122,6 +148,7 @@ def build_checklist(
                 continue
             amount, volume = _number(row.get("amount_yuan")), _number(row.get("volume_lots"))
             allowed = bool(row.get("model_validated") and row.get("quote_valid") and row.get("entry_allowed")
+                and _signal_is_current(row, now)
                 and row.get("entry_trade_status") == "可正常评估" and not row.get("error")
                 and amount is not None and amount >= settings.CHECKLIST_MINIMUM_AMOUNT
                 and volume is not None and volume > 0 and _quote_is_current(row, date, now)

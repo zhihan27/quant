@@ -518,7 +518,7 @@ class MarketDataService:
         cache_key = f"quote:v2:{code}"
         params = {
             "secid": f"{_market_id(code)}.{code}",
-            "fields": "f57,f58,f43,f44,f45,f46,f47,f48,f59,f60,f116,f117,f152,f162,f164,f167,f168,f86",
+            "fields": "f57,f58,f43,f44,f45,f46,f47,f48,f59,f60,f116,f117,f152,f162,f164,f165,f167,f168,f86",
         }
         quote: dict[str, Any] | None = None
         try:
@@ -533,7 +533,8 @@ class MarketDataService:
                 raise MarketDataError("行情源返回的股票代码与请求代码不一致。")
             digits = int(payload.get("f59") or 2)
             scale = 10**digits
-            # 官方行情脚本将 f162 定义为动态 PE，f164 才是 TTM，f167 是 PB。
+            # 官方行情脚本将 f162 定义为动态 PE，f164 是 TTM PE，f165 是 PS(TTM)，f167 是 PB；
+            # 这些倍数字段固定以百分之一为单位返回，与价格的 f59 精度无关。
             price = _number(payload.get("f43"))
             previous_close = _number(payload.get("f60"))
             price = price / scale if price is not None and price > 0 else None
@@ -581,10 +582,11 @@ class MarketDataService:
                 "high": _scaled(payload.get("f44"), scale),
                 "low": _scaled(payload.get("f45"), scale),
                 "previous_close": previous_close,
-                "turnover_rate": _number(payload.get("f168")),
-                "pe_ttm": _number(payload.get("f164")),
-                "pe_dynamic": _number(payload.get("f162")),
-                "pb": _number(payload.get("f167")),
+                "turnover_rate": _ratio(payload.get("f168")),
+                "pe_ttm": _ratio(payload.get("f164")),
+                "pe_dynamic": _ratio(payload.get("f162")),
+                "pb": _ratio(payload.get("f167")),
+                "ps_ttm": _ratio(payload.get("f165")),
                 "market_cap_total": _number(payload.get("f116")),
                 "market_cap_float": _number(payload.get("f117")),
                 "valuation_unit": "ratio",
@@ -1700,4 +1702,10 @@ finally:
 def _scaled(value: Any, scale: int) -> float | None:
     number = _number(value)
     return number / scale if number is not None and number > 0 else None
+
+
+def _ratio(value: Any) -> float | None:
+    """东财估值倍数与换手率以百分之一为单位返回，缺失时保持 None。"""
+    number = _number(value)
+    return number / 100 if number is not None else None
 
