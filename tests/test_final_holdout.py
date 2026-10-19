@@ -17,7 +17,7 @@ import pandas as pd
 from config import settings
 from services import model_governance
 from services.backtest import cost_rates
-from services.ml_pipeline import HORIZONS, MINIMUM_RANK_IC, fit_panel_model as real_fit_panel_model
+from services.ml_pipeline import HORIZONS, MINIMUM_RANK_IC, MODEL_NAMES, fit_panel_model as real_fit_panel_model
 from services.model_governance import (
     FinalHoldoutError,
     build_holdout_evaluation,
@@ -135,6 +135,9 @@ class HoldoutFilterTests(unittest.TestCase):
             self.assertTrue(line["usable"])
             self.assertGreater(line["metrics"]["rank_ic"], MINIMUM_RANK_IC)
             self.assertEqual(line["metrics"]["dates"], HOLDOUT_DATES)
+            self.assertEqual(set(line["model_results"]), set(MODEL_NAMES))
+            self.assertTrue(line["ensemble"]["usable"])
+            self.assertGreater(line["ensemble"]["metrics"]["rank_ic"], MINIMUM_RANK_IC)
 
     def test_report_states_the_training_window_is_short_of_configuration(self):
         """留出集之前的可训练历史不足配置窗口时必须如实写明，不能只说「已通过」。"""
@@ -176,6 +179,17 @@ class HoldoutFilterTests(unittest.TestCase):
         self.assertIn("样本不足", line["status"])
         self.assertIsNone(line["metrics"])
 
+    def test_missing_required_horizon_fails_complete_gate_matrix(self):
+        panel = self.panel.drop(columns=["target_60"])
+        report, _record = _run_holdout(panel)
+        line = report["horizons"]["60"]
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["failed_horizon"], "60")
+        self.assertEqual(set(line["model_results"]), set(MODEL_NAMES))
+        self.assertTrue(all(not result["usable"] for result in line["model_results"].values()))
+        self.assertFalse(line["ensemble"]["usable"])
+        self.assertIn("target_60", line["status"])
+
     def test_unlimited_window_is_not_silently_replaced_by_the_default(self):
         """窗口 0 的含义是「用上全部历史」，不能被当成空值换成 750。"""
         report, _record = _run_holdout(self.panel, {"objective_mode": "lambdarank", "training_window_days": 0})
@@ -192,11 +206,11 @@ class TurnoverTests(unittest.TestCase):
         逐日相邻地看会把同一段持仓期数成多次调仓，因此这里必须铺满日历日：
         20 个交易日一格，取样点才是 0、20、40……，中间那些日子不该参与换手率。
         """
-        dates = pd.bdate_range(start="2026-01-01", periods=20 * (periods - 1) + 1)
+        dates = pd.bdate_range(start="2026-01-01", periods=20 * periods + 1)
         rows = []
         for index, date in enumerate(dates):
             period = index // 20
-            sampled = index % 20 == 0
+            sampled = index % 20 == 0 and index + 20 < len(dates)
             members = ("A", "B") if period == 0 else ("A", "C")
             for code in "ABCDEFGHIJ":
                 rows.append({
@@ -209,9 +223,10 @@ class TurnoverTests(unittest.TestCase):
 
     def test_turnover_and_cost_match_hand_computed_values(self):
         buy, sell = cost_rates()
-        result = portfolio_turnover(self._evaluation(), TURNOVER_HORIZON)
+        result = portfolio_turnover(self._evaluation(), TURNOVER_HORIZON, top_n=2)
         self.assertEqual(result["status"], "已计算")
         self.assertEqual(result["periods"], 2)
+        self.assertEqual(result["top_n"], 2)
         self.assertAlmostEqual(result["average_turnover"], 0.5, msg="首期换手记 0 不算进平均")
         self.assertAlmostEqual(result["per_period_cost"], 0.5 * (buy + sell))
         self.assertAlmostEqual(result["gross_excess_return"], (0.01 + 0.02) / 2)
@@ -221,17 +236,18 @@ class TurnoverTests(unittest.TestCase):
 
     def test_unchanged_members_are_zero_turnover(self):
         frame = self._evaluation()
-        latest = frame["date"].eq(frame["date"].max())
+        second_period = sorted(frame["date"].unique())[TURNOVER_HORIZON]
+        latest = frame["date"].eq(second_period)
         # 第二期不换人：B 留下、C 挪出 Top。
         frame.loc[latest & frame["code"].eq("B"), ["prediction", "actual"]] = [1.0, 0.02]
         frame.loc[latest & frame["code"].eq("C"), ["prediction", "actual"]] = [0.0, 0.0]
-        result = portfolio_turnover(frame, TURNOVER_HORIZON)
+        result = portfolio_turnover(frame, TURNOVER_HORIZON, top_n=2)
         self.assertAlmostEqual(result["average_turnover"], 0.0)
         self.assertAlmostEqual(result["per_period_cost"], 0.0)
         self.assertAlmostEqual(result["after_cost_return"], result["gross_excess_return"])
 
     def test_single_period_reports_insufficient_not_zero_turnover(self):
-        result = portfolio_turnover(self._evaluation(periods=1), TURNOVER_HORIZON)
+        result = portfolio_turnover(self._evaluation(periods=1), TURNOVER_HORIZON, top_n=2)
         self.assertEqual(result["periods"], 1)
         self.assertIn("不足", result["status"])
         self.assertNotIn("after_cost_return", result)

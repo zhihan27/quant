@@ -62,12 +62,17 @@ class LabelWinsorizationTests(unittest.TestCase):
 
     def test_thirty_day_labels_use_benchmark_calendar(self):
         dates = pd.bdate_range("2024-01-01", periods=50)
-        stock = pd.DataFrame({"date": dates, "close": 100 * 1.01 ** np.arange(50)})
-        benchmark = pd.DataFrame({"date": dates, "close": 100 * 1.002 ** np.arange(50)})
+        stock = pd.DataFrame({
+            "date": dates, "open": 100 * 1.01 ** np.arange(50), "close": 100 * 1.01 ** np.arange(50),
+        })
+        benchmark = pd.DataFrame({
+            "date": dates, "open": 100 * 1.002 ** np.arange(50), "close": 100 * 1.002 ** np.arange(50),
+        })
         frame = add_forward_returns(stock, (30,), benchmark)
         self.assertAlmostEqual(frame.loc[0, "target_30"], 1.01 ** 30 - 1.002 ** 30)
-        self.assertEqual(frame.loc[0, "label_end_30"], dates[30])
-        self.assertTrue(frame["target_30"].tail(30).isna().all())
+        self.assertEqual(frame.loc[0, "label_end_30"], dates[31])
+        self.assertTrue(frame["target_30"].tail(31).isna().all())
+        self.assertEqual(frame.loc[0, "research_label_end_30"], dates[30])
 
     def test_training_clips_but_oos_actual_and_baseline_remain_raw(self):
         dates = pd.bdate_range("2020-01-01", periods=420)

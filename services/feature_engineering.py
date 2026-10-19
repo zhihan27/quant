@@ -19,7 +19,6 @@ FEATURE_COLUMNS = [
     "volume_change_20",
     "turnover_20",
     "price_volume_corr_20",
-    "relative_strength_20",
     "rsi_14",
     # 另类特征：短期反转捕捉 A 股散户主导的均值回归，Amihud 与量价背离描述流动性与量价结构。
     "reversal_1",
@@ -125,7 +124,7 @@ def add_forward_returns(
     horizons: tuple[int, ...] = settings.MODEL_HORIZONS,
     benchmark: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """以基准交易日历生成未来超额收益标签，缺失端点不填充。"""
+    """并列生成收盘研究标签与 t+1 开盘入场的执行对齐标签。"""
     frame = features.copy()
     frame["date"] = pd.to_datetime(frame["date"])
     if any(horizon not in settings.MODEL_HORIZONS for horizon in horizons):
@@ -133,23 +132,59 @@ def add_forward_returns(
     if benchmark is None or benchmark.empty:
         for horizon in horizons:
             frame[f"target_{horizon}"] = np.nan
+            frame[f"forward_return_{horizon}"] = np.nan
             frame[f"label_end_{horizon}"] = pd.NaT
+            frame[f"research_target_{horizon}"] = np.nan
+            frame[f"research_forward_return_{horizon}"] = np.nan
+            frame[f"research_label_end_{horizon}"] = pd.NaT
         return frame
-    reference = benchmark[["date", "close"]].copy()
+    reference = benchmark[[column for column in ("date", "open", "close") if column in benchmark]].copy()
     reference["date"] = pd.to_datetime(reference["date"])
     reference = reference.sort_values("date").set_index("date")
     if reference.index.duplicated().any() or frame["date"].duplicated().any():
         raise ValueError("标签计算不接受重复交易日。")
-    reference["close"] = pd.to_numeric(reference["close"], errors="coerce")
-    stock = frame.set_index("date")["close"].reindex(reference.index)
+    for column in ("open", "close"):
+        if column in reference:
+            reference[column] = pd.to_numeric(reference[column], errors="coerce")
+    stock_frame = frame.set_index("date")
+    stock_close = pd.to_numeric(stock_frame["close"], errors="coerce").reindex(reference.index)
+    stock_open = (
+        pd.to_numeric(stock_frame["open"], errors="coerce").reindex(reference.index)
+        if "open" in stock_frame else pd.Series(np.nan, index=reference.index, dtype=float)
+    )
     for horizon in horizons:
-        absolute = stock.shift(-horizon) / stock - 1
-        benchmark_return = reference["close"].shift(-horizon) / reference["close"] - 1
-        valid = stock.gt(0) & stock.shift(-horizon).gt(0) & reference["close"].gt(0) & reference["close"].shift(-horizon).gt(0)
-        valid &= np.isfinite(absolute) & np.isfinite(benchmark_return)
+        research_absolute = stock_close.shift(-horizon) / stock_close - 1
+        research_benchmark = reference["close"].shift(-horizon) / reference["close"] - 1
+        research_valid = (
+            stock_close.gt(0) & stock_close.shift(-horizon).gt(0)
+            & reference["close"].gt(0) & reference["close"].shift(-horizon).gt(0)
+            & np.isfinite(research_absolute) & np.isfinite(research_benchmark)
+        )
+        research_endpoints = pd.Series(reference.index, index=reference.index).shift(-horizon)
+        frame[f"research_forward_return_{horizon}"] = frame["date"].map(research_absolute.where(research_valid))
+        frame[f"research_target_{horizon}"] = frame["date"].map(
+            (research_absolute - research_benchmark).where(research_valid)
+        )
+        frame[f"research_label_end_{horizon}"] = frame["date"].map(research_endpoints)
+        frame.loc[frame[f"research_target_{horizon}"].isna(), f"research_label_end_{horizon}"] = pd.NaT
+
+        entry = stock_open.shift(-1)
+        exit_price = stock_open.shift(-(horizon + 1))
+        benchmark_entry = reference["open"].shift(-1) if "open" in reference else pd.Series(np.nan, index=reference.index)
+        benchmark_exit = reference["open"].shift(-(horizon + 1)) if "open" in reference else pd.Series(np.nan, index=reference.index)
+        absolute = exit_price / entry - 1
+        benchmark_return = benchmark_exit / benchmark_entry - 1
+        # 任一中间交易日缺少开盘价时不把缺口跨过去當成可执行持仓收益。
+        stock_path = stock_open.notna().rolling(horizon + 1, min_periods=horizon + 1).sum().shift(-(horizon + 1))
+        benchmark_path = reference["open"].notna().rolling(horizon + 1, min_periods=horizon + 1).sum().shift(-(horizon + 1)) if "open" in reference else pd.Series(0, index=reference.index)
+        valid = (
+            entry.gt(0) & exit_price.gt(0) & benchmark_entry.gt(0) & benchmark_exit.gt(0)
+            & stock_path.eq(horizon + 1) & benchmark_path.eq(horizon + 1)
+            & np.isfinite(absolute) & np.isfinite(benchmark_return)
+        )
         frame[f"forward_return_{horizon}"] = frame["date"].map(absolute.where(valid))
         frame[f"target_{horizon}"] = frame["date"].map((absolute - benchmark_return).where(valid))
-        endpoints = pd.Series(reference.index, index=reference.index).shift(-horizon)
+        endpoints = pd.Series(reference.index, index=reference.index).shift(-(horizon + 1))
         frame[f"label_end_{horizon}"] = frame["date"].map(endpoints)
         frame.loc[frame[f"target_{horizon}"].isna(), f"label_end_{horizon}"] = pd.NaT
     return frame

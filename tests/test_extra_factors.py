@@ -37,6 +37,7 @@ def _history(bars: int = 200) -> pd.DataFrame:
     frame["low"] = frame["close"] - 0.2
     frame["amount"] = frame["close"] * frame["volume"]
     frame["turnover_rate"] = 1.0
+    frame.attrs["turnover_rate_unit"] = "percent"
     return frame
 
 
@@ -172,12 +173,13 @@ class HealthVetoTests(unittest.TestCase):
         self.assertEqual(report["veto_rate"], 0.0)
         self.assertNotIn("applied", report)
 
-    def test_veto_that_would_empty_the_panel_is_abandoned(self) -> None:
-        """全部否决等于无数据可算，此时放弃否决并说明原因，不假装算出了结果。"""
+    def test_veto_that_would_empty_the_panel_returns_no_candidates(self) -> None:
+        """全部否决时必须返回空候选池，不能把高风险标的重新放行。"""
         result, report = apply_health_veto(self._panel([True, True]))
-        self.assertEqual(len(result), 2)
-        self.assertFalse(report["applied"])
+        self.assertTrue(result.empty)
+        self.assertTrue(report["applied"])
         self.assertEqual(report["vetoed"], 2)
+        self.assertIn("无可交易面板", report["status"])
 
     def test_attrs_survive_the_trim(self) -> None:
         frame = self._panel([True, False])

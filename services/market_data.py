@@ -968,6 +968,8 @@ class MarketDataService:
             frame, cleaning = clean_daily_history(frame, code=code, adjusted=adjusted)
         except ValueError as exc:
             raise MarketDataError(f"行情清洗失败：{exc}") from exc
+        # 东方财富、腾讯和新浪适配器统一输出百分数值；筹码因子不再用历史分布猜单位。
+        frame.attrs["turnover_rate_unit"] = "percent"
         source = payload.get("source") if isinstance(payload, dict) else None
         if meta.get("status") in ("本地缓存", "行情源失败，使用过期缓存（非实时）"):
             source = f"SQLite 历史行情缓存（原始来源：{source or '未知'}）"
@@ -984,6 +986,7 @@ class MarketDataService:
                 "latest_bar_date": frame["date"].iloc[-1].strftime("%Y-%m-%d") if not frame.empty else None,
                 "retry_count": retry_count,
                 "cleaning": cleaning,
+                "turnover_rate_unit": "percent",
             }
         )
         # 列式面板作为派生产物写穿保存；写入失败不影响已取得的行情，但必须显式记录。

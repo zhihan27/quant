@@ -17,6 +17,7 @@ from config import settings
 from services.backtest import _metrics, cost_rates
 from services.data_cleaning import clean_daily_history
 from services.ml_pipeline import MODEL_NAMES, fit_panel_model, predict_panel
+from services.strategy_scoring import fuse_prediction_percentiles
 
 LOGGER = logging.getLogger("quant.portfolio")
 PRICE_COLUMNS = (
@@ -26,7 +27,8 @@ PRICE_COLUMNS = (
 CONSTRAINTS = (
     "T+1：当日开盘买入的股票当日起不可卖出，最早于下一个交易日开盘卖出",
     "开盘一字涨停不假设买入成交，开盘一字跌停不假设卖出成交，停牌当日不交易并按最近收盘价估值",
-    "卖出收 0.05% 印花税，买卖双边各收佣金与滑点；费率按比例近似，未模拟最低佣金与整手",
+    "卖出收印花税，买卖双边各收佣金与滑点；费率按比例近似，未模拟最低佣金",
+    "默认标准化权益允许小数股；传入逐股 lot_sizes 后才执行买入整手及卖出整手约束",
     "单股仓位上限按调仓前权益计算，超出上限的资金保留为现金，不放大杠杆",
     "组合净值仅代表本次采集股票池内按模型排序的结果，未考虑冲击成本与申购赎回",
 )
@@ -135,6 +137,7 @@ def run_portfolio_backtest(
     slippage_rate: float = settings.DEFAULT_COSTS["slippage_rate"],
     rebalance_every: int = 1,
     initial_equity: float = 1.0,
+    lot_sizes: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     """在信号日的下一个交易日开盘调仓，逐日估值并计入全部交易摩擦。"""
     if rebalance_every < 1:
@@ -151,6 +154,22 @@ def run_portfolio_backtest(
     if weights.empty:
         return {"status": "没有可用目标权重，未产生组合交易", "metrics": None, "trades": [], "daily_equity": []}
     target = weights.pivot_table(index="date", columns="code", values="target_weight", aggfunc="last")
+    lot_size_by_code: dict[str, int] | None = None
+    if lot_sizes is not None:
+        supplied_lot_sizes = {str(code): value for code, value in lot_sizes.items()}
+        target_codes = {str(code) for code in target.columns}
+        missing_lot_sizes = sorted(target_codes - set(supplied_lot_sizes))
+        if missing_lot_sizes:
+            raise ValueError(f"整手回测缺少股票交易单位：{', '.join(missing_lot_sizes)}")
+        lot_size_by_code = {}
+        for code in target_codes:
+            try:
+                raw_size = float(supplied_lot_sizes[code])
+            except (TypeError, ValueError):
+                raise ValueError(f"股票 {code} 的交易单位必须是正整数。") from None
+            if not np.isfinite(raw_size) or raw_size < 1 or not raw_size.is_integer():
+                raise ValueError(f"股票 {code} 的交易单位必须是正整数。")
+            lot_size_by_code[code] = int(raw_size)
     matrices = _price_matrices(prices, sorted(target.columns))
     dates = matrices["dates"]
     if not dates:
@@ -161,6 +180,7 @@ def run_portfolio_backtest(
     trades: list[dict[str, Any]] = []
     equity_path: list[dict[str, Any]] = []
     unfilled_buys = unfilled_sells = 0
+    partial_buys = 0
     buy_cost, sell_cost = cost_rates(commission_rate, stamp_duty_rate, slippage_rate)
 
     for index, date in enumerate(dates):
@@ -173,24 +193,81 @@ def run_portfolio_backtest(
                 desired = desired[desired > 0].sort_values(ascending=False)
                 opens = matrices["open"].loc[date]
                 previous_close = matrices["valuation"].loc[dates[index - 1]]
-                # 仓位上限以调仓前权益为基准，避免用当日尚未实现的收益放大仓位。
-                reference = cash
+                current_values: dict[str, float] = {}
+                execution_equity = cash
                 for code, item in holdings.items():
-                    price = previous_close.get(code)
-                    if price is not None and np.isfinite(price):
-                        reference += item["shares"] * float(price)
-                # 先卖出不在目标名单内的持仓；跌停或停牌则顺延到下一个可成交日。
+                    price = opens.get(code)
+                    if price is None or not np.isfinite(price) or price <= 0:
+                        price = previous_close.get(code)
+                    if price is not None and np.isfinite(price) and price > 0:
+                        current_values[code] = item["shares"] * float(price)
+                        execution_equity += current_values[code]
+                target_budget = execution_equity
+                # 反推扣除本次买卖费用后的权益，令可成交持仓按该权益满足目标权重。
+                for _ in range(20):
+                    sell_notional = 0.0
+                    for code, item in holdings.items():
+                        price = opens.get(code)
+                        can_sell = (
+                            item["entry_date"] < date
+                            and price is not None
+                            and np.isfinite(price)
+                            and price > 0
+                            and bool(matrices["sellable"].loc[date].get(code, False))
+                        )
+                        if can_sell:
+                            target_value = float(desired.get(code, 0.0)) * target_budget
+                            sell_notional += max(0.0, current_values.get(code, 0.0) - target_value)
+                    buy_notional = 0.0
+                    for code, weight in desired.items():
+                        price = opens.get(code)
+                        can_buy = (
+                            price is not None
+                            and np.isfinite(price)
+                            and price > 0
+                            and bool(matrices["buyable"].loc[date].get(code, False))
+                        )
+                        if can_buy:
+                            target_value = float(weight) * target_budget
+                            buy_notional += max(0.0, target_value - current_values.get(code, 0.0))
+                    adjusted_budget = max(0.0, execution_equity - sell_cost * sell_notional - buy_cost * buy_notional)
+                    if abs(adjusted_budget - target_budget) <= 1e-12:
+                        target_budget = adjusted_budget
+                        break
+                    target_budget = adjusted_budget
+                # 先卖出超出目标股数的部分；跌停、停牌或 T+1 限制会阻止本次减仓。
                 for code in list(holdings):
                     item = holdings[code]
-                    if code in desired.index or item["entry_date"] >= date:
+                    if item["entry_date"] >= date:
+                        continue
+                    open_price = opens.get(code)
+                    if open_price is None or not np.isfinite(open_price) or open_price <= 0:
+                        if code not in desired.index:
+                            unfilled_sells += 1
+                        continue
+                    target_weight = float(desired.get(code, 0.0))
+                    target_shares = target_weight * target_budget / float(open_price)
+                    current_shares = float(item["shares"])
+                    shares_to_sell = min(current_shares, max(0.0, current_shares - target_shares))
+                    lot_size = lot_size_by_code.get(str(code)) if lot_size_by_code is not None else None
+                    if lot_size is not None:
+                        if current_shares - shares_to_sell <= 1e-9:
+                            shares_to_sell = current_shares
+                        else:
+                            # 部分卖出向上取整到整手，优先守住目标仓位上限；全量退出允许卖完剩余零股。
+                            lots_to_sell = int(np.ceil(shares_to_sell / lot_size - 1e-12))
+                            shares_to_sell = float(min(current_shares, lots_to_sell * lot_size))
+                    if shares_to_sell <= 1e-12:
                         continue
                     if not bool(matrices["sellable"].loc[date].get(code, False)):
                         unfilled_sells += 1
                         continue
-                    price = float(opens[code])
-                    cash += item["shares"] * price * (1 - sell_cost)
-                    gross_cash += item["gross_shares"] * price
-                    daily_turnover += item["shares"] * price / prior_equity
+                    price = float(open_price)
+                    gross_shares_sold = item["gross_shares"] * shares_to_sell / current_shares
+                    cash += shares_to_sell * price * (1 - sell_cost)
+                    gross_cash += gross_shares_sold * price
+                    daily_turnover += shares_to_sell * price / prior_equity
+                    is_partial_exit = shares_to_sell < current_shares - 1e-12
                     trades.append({
                         "entry_date": item["entry_date"].strftime("%Y-%m-%d"),
                         "exit_date": date.strftime("%Y-%m-%d"),
@@ -200,32 +277,61 @@ def run_portfolio_backtest(
                         "gross_return": float(price / item["entry_price"] - 1),
                         "net_return": float(price * (1 - sell_cost) / (item["entry_price"] * (1 + buy_cost)) - 1),
                         "holding_days": int((date - item["entry_date"]).days),
-                        "exit_reason": "调出组合",
+                        "shares": shares_to_sell,
+                        "partial_exit": is_partial_exit,
+                        "exit_reason": "目标权重再平衡" if code in desired.index else "调出组合",
                     })
-                    del holdings[code]
-                # 再按打分顺序买入新入选股票；涨停或停牌则放弃本次买入并保留现金。
+                    item["shares"] -= shares_to_sell
+                    item["gross_shares"] -= gross_shares_sold
+                    if item["shares"] <= 1e-12:
+                        del holdings[code]
+                # 再按打分顺序补足目标股数；涨停或停牌时保留现金。
                 for code, weight in desired.items():
-                    if code in holdings:
+                    open_price = opens.get(code)
+                    if open_price is None or not np.isfinite(open_price) or open_price <= 0:
+                        unfilled_buys += 1
                         continue
-                    allocation = min(float(weight) * reference, cash)
-                    if allocation <= 0:
+                    price = float(open_price)
+                    current = holdings.get(code)
+                    current_shares = float(current["shares"]) if current else 0.0
+                    target_shares = float(weight) * target_budget / price
+                    shares_needed = max(0.0, target_shares - current_shares)
+                    if shares_needed <= 1e-12:
                         continue
                     if not bool(matrices["buyable"].loc[date].get(code, False)):
                         unfilled_buys += 1
                         continue
-                    price = float(opens[code])
-                    if not np.isfinite(price) or price <= 0:
+                    lot_size = lot_size_by_code.get(str(code)) if lot_size_by_code is not None else None
+                    if lot_size is not None:
+                        # 买入只取完整交易单位，资金不足时保留现金，不以零股补单。
+                        target_lots = int(np.floor(shares_needed / lot_size + 1e-12))
+                        affordable_shares = cash / (price * (1 + buy_cost))
+                        affordable_lots = int(np.floor(affordable_shares / lot_size))
+                        shares = float(max(0, min(target_lots, affordable_lots)) * lot_size)
+                        allocation = shares * price * (1 + buy_cost)
+                    else:
+                        allocation = min(shares_needed * price * (1 + buy_cost), cash)
+                        shares = allocation / (price * (1 + buy_cost)) if allocation > 0 else 0.0
+                    if allocation <= 0 or shares <= 1e-12:
                         unfilled_buys += 1
                         continue
-                    shares = allocation / (price * (1 + buy_cost))
+                    if shares < shares_needed - 1e-12:
+                        partial_buys += 1
                     gross_shares = allocation / price
-                    cash = max(0.0, cash - shares * price * (1 + buy_cost))
+                    cash = max(0.0, cash - allocation)
                     gross_cash -= gross_shares * price
                     daily_turnover += shares * price / prior_equity
-                    holdings[code] = {
-                        "shares": shares, "gross_shares": gross_shares,
-                        "entry_date": date, "entry_price": price,
-                    }
+                    if current:
+                        current["entry_price"] = (
+                            current_shares * current["entry_price"] + shares * price
+                        ) / (current_shares + shares)
+                        current["shares"] += shares
+                        current["gross_shares"] += gross_shares
+                    else:
+                        holdings[code] = {
+                            "shares": shares, "gross_shares": gross_shares,
+                            "entry_date": date, "entry_price": price,
+                        }
         close = matrices["valuation"].loc[date]
         position_value = gross_value = 0.0
         for code, item in holdings.items():
@@ -244,7 +350,8 @@ def run_portfolio_backtest(
             "turnover": daily_turnover,
         })
 
-    metrics = _metrics(trades, len(equity_path), equity_path)
+    # equity_path 的首日是信号收盘后的初始现金状态；有效收益区间从其后交易日开始。
+    metrics = _metrics(trades, max(len(equity_path) - 1, 1), equity_path)
     beginning, ending = matrices["valuation"].iloc[0], matrices["valuation"].iloc[-1]
     comparable = beginning.gt(0).fillna(False) & ending.notna()
     universe_return = float((ending[comparable] / beginning[comparable] - 1).mean()) if comparable.any() else None
@@ -262,13 +369,19 @@ def run_portfolio_backtest(
             "unrealized_return": float(price * (1 - sell_cost) / (item["entry_price"] * (1 + buy_cost)) - 1),
         })
     return {
-        "status": "多模型截面排序组合回测（含 T+1 与全部交易摩擦）",
+        "status": "多模型截面排序组合研究回测（含 T+1 与比例交易摩擦）",
         "metrics": metrics,
         "trades": trades,
         "daily_equity": equity_path,
         "open_positions": sorted(open_positions, key=lambda item: item["market_value"], reverse=True),
         "unfilled_buys": unfilled_buys,
         "unfilled_sells": unfilled_sells,
+        "partial_buys": partial_buys,
+        "lot_constraints_applied": lot_size_by_code is not None,
+        "share_lot_sizes": lot_size_by_code,
+        "fractional_shares_allowed": lot_size_by_code is None,
+        "initial_equity": float(initial_equity),
+        "capital_unit_note": "资金与行情价格使用同一货币单位；默认权益 1.0 仅适合标准化研究，整手回测应传入实际资金量。",
         "universe_equal_weight_return": universe_return,
         "costs": {
             "commission_rate_each_side": commission_rate,
@@ -290,7 +403,7 @@ def walk_forward_scores(
     model_names: Sequence[str] = MODEL_NAMES,
     progress: Any = None,
 ) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
-    """按区段滚动重训并对整个截面打分，融合多个模型的截面 Z 分数作为每日选股打分。"""
+    """按区段滚动重训并融合模型截面百分位，统一每日选股打分。"""
     dates = np.sort(panel["date"].unique())
     columns = ["date", "code", "score", *model_names]
     if start >= len(dates) or start < 0:
@@ -301,7 +414,7 @@ def walk_forward_scores(
         cutoff = pd.Timestamp(dates[block_start])
         block_end = min(block_start + retrain_every, len(dates))
         live = panel.loc[panel["date"].between(cutoff, pd.Timestamp(dates[block_end - 1]))]
-        block_frames = []
+        block_frames: dict[str, pd.DataFrame] = {}
         log_models = []
         for name in model_names:
             if progress:
@@ -317,17 +430,9 @@ def walk_forward_scores(
                 "mae": metrics.get("mae"), "validation_rule": metrics.get("validation_rule"),
             })
             if not predicted.empty:
-                block_frames.append(
-                    predicted[["date", "code", "prediction_zscore"]].rename(columns={"prediction_zscore": name})
-                )
+                block_frames[name] = predicted[["date", "code", "prediction_percentile"]]
         if block_frames:
-            merged = block_frames[0]
-            for frame in block_frames[1:]:
-                merged = merged.merge(frame, on=["date", "code"], how="outer")
-            available = [name for name in model_names if name in merged]
-            # 各模型的截面Z分数等权平均；单一模型可用时即为该模型得分。
-            merged["score"] = merged[available].mean(axis=1, skipna=True)
-            frames.append(merged[columns])
+            frames.append(fuse_prediction_percentiles(block_frames, model_names).reindex(columns=columns))
         training_log.append({
             "prediction_start": str(cutoff.date()),
             "trained_through": str(panel.loc[panel["date"] < cutoff, "date"].max().date()),
@@ -339,18 +444,32 @@ def walk_forward_scores(
     return scores.sort_values(["date", "code"]).reset_index(drop=True), training_log
 
 
-def trim_universe(histories: dict[str, pd.DataFrame], limit: int | None = None) -> tuple[dict[str, pd.DataFrame], dict[str, Any]]:
+def trim_universe(
+    histories: dict[str, pd.DataFrame], limit: int | None = None, as_of_date: Any = None
+) -> tuple[dict[str, pd.DataFrame], dict[str, Any]]:
     """超出上限时按成交额中位数保留流动性最好的股票，并明确报告被剔除的数量。"""
     limit = int(settings.PORTFOLIO_BACKTEST_MAX_STOCKS if limit is None else limit)
-    report = {"limit": limit, "requested": len(histories), "kept": len(histories), "trimmed": 0}
+    cutoff = pd.Timestamp(as_of_date) if as_of_date is not None else None
+    report = {
+        "limit": limit, "requested": len(histories), "kept": len(histories), "trimmed": 0,
+        "selection_as_of": str(cutoff.date()) if cutoff is not None else None,
+        "selection_policy": "按该日期可见历史流动性冻结股票池" if cutoff is not None else "按传入历史范围筛选股票池",
+    }
     if limit <= 0 or len(histories) <= limit:
         return histories, report
     liquidity = {}
     for code, history in histories.items():
-        amount = pd.to_numeric(history["amount"], errors="coerce") if "amount" in history else None
+        dated_history = history
+        if cutoff is not None:
+            if "date" not in history:
+                dated_history = history.iloc[0:0]
+            else:
+                dates = pd.to_datetime(history["date"], errors="coerce")
+                dated_history = history.loc[dates.le(cutoff)]
+        amount = pd.to_numeric(dated_history["amount"], errors="coerce") if "amount" in dated_history else None
         if amount is None or amount.notna().sum() == 0:
-            close = pd.to_numeric(history["close"], errors="coerce")
-            volume = pd.to_numeric(history["volume"], errors="coerce")
+            close = pd.to_numeric(dated_history["close"], errors="coerce") if "close" in dated_history else pd.Series(dtype=float)
+            volume = pd.to_numeric(dated_history["volume"], errors="coerce") if "volume" in dated_history else pd.Series(dtype=float)
             amount = close * volume
         median = amount.tail(60).median()
         liquidity[code] = float(median) if median is not None and np.isfinite(median) else 0.0
@@ -376,11 +495,22 @@ def run_portfolio_strategy(
     adjusted: bool = True,
     is_st_codes: dict[str, bool] | None = None,
     progress: Any = None,
+    initial_equity: float = 1.0,
+    lot_sizes: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     """滚动重训打分、构建前 N 名组合并做含摩擦回测的完整流程。"""
     if panel is None or panel.empty:
         return {"status": "缺少历史截面，无法运行组合回测", "metrics": None}
-    histories, universe_report = trim_universe(histories, universe_limit)
+    if lot_sizes is not None and adjusted:
+        raise ValueError("启用整手约束时必须使用未复权成交价格，请将 adjusted 设为 False。")
+    panel_dates = pd.DatetimeIndex(pd.to_datetime(panel["date"], errors="coerce").dropna().unique()).sort_values()
+    universe_as_of = panel_dates[start] if 0 <= start < len(panel_dates) else None
+    histories, universe_report = trim_universe(histories, universe_limit, as_of_date=universe_as_of)
+    universe_report["historical_membership_verified"] = False
+    universe_report["warning"] = (
+        "回测仅覆盖输入历史行情与训练截面的代码集合；未接入历史成分变更和退市数据，"
+        "结果可能存在幸存者偏差。"
+    )
     if universe_report["trimmed"]:
         # 打分必须与回测使用同一股票池，否则排序会选中没有行情、根本无法成交的股票。
         kept = set(histories)
@@ -397,27 +527,69 @@ def run_portfolio_strategy(
     if scores.empty:
         return {"status": "滚动重训未生成任何通过验证的截面打分，未产生组合", "metrics": None,
                 "training_log": training_log, "universe": universe_report}
-    weights, weight_report = portfolio_weights(scores, top_n=top_n, max_weight=max_weight)
     prices = prepare_price_panel(histories, is_st_codes=is_st_codes, adjusted=adjusted)
-    result = run_portfolio_backtest(prices, weights, rebalance_every=rebalance_every)
+    prices["date"] = pd.to_datetime(prices["date"], errors="coerce")
+    price_dates = pd.DatetimeIndex(sorted(prices["date"].dropna().unique()))
+    executable_dates = set(price_dates[:-1])
+    scores = scores.loc[pd.to_datetime(scores["date"]).isin(executable_dates)].copy()
+    if scores.empty:
+        return {"status": "没有同时具备下一交易日行情的信号，未产生组合", "metrics": None,
+                "training_log": training_log, "universe": universe_report}
+    score_start = pd.Timestamp(scores["date"].min())
+    score_end = pd.Timestamp(scores["date"].max())
+    execution_end = price_dates[price_dates > score_end][0]
+    prices = prices.loc[prices["date"].between(score_start, execution_end)].copy()
+    weights, weight_report = portfolio_weights(scores, top_n=top_n, max_weight=max_weight)
+    result = run_portfolio_backtest(
+        prices, weights, rebalance_every=rebalance_every, initial_equity=initial_equity,
+        lot_sizes=lot_sizes,
+    )
     if result.get("metrics") is None:
         return {**result, "training_log": training_log, "universe": universe_report, "portfolio": weight_report}
     benchmark_return = None
+    benchmark_start = None
+    benchmark_range = None
+    first_execution = price_dates[price_dates > score_start][0]
+    ending = pd.Timestamp(result["daily_equity"][-1]["date"])
     if benchmark is not None and not benchmark.empty:
         reference = benchmark.copy()
         reference["date"] = pd.to_datetime(reference["date"])
         reference = reference.sort_values("date").drop_duplicates("date", keep="last").set_index("date")
-        beginning, ending = pd.Timestamp(scores["date"].min()), pd.Timestamp(scores["date"].max())
-        if beginning in reference.index and ending in reference.index:
-            benchmark_return = float(reference.loc[ending, "close"] / reference.loc[beginning, "close"] - 1)
+        if "open" in reference and first_execution in reference.index and ending in reference.index:
+            benchmark_return = float(reference.loc[ending, "close"] / reference.loc[first_execution, "open"] - 1)
+            benchmark_start = str(first_execution.date())
+            benchmark_range = {
+                "start": benchmark_start, "start_price": "open",
+                "end": str(ending.date()), "end_price": "close",
+            }
     result.update(
         training_log=training_log,
         universe=universe_report,
         portfolio=weight_report,
-        score_range={"start": str(pd.Timestamp(scores["date"].min()).date()), "end": str(pd.Timestamp(scores["date"].max()).date()),
+        score_range={"start": str(score_start.date()), "end": str(score_end.date()),
                      "dates": int(scores["date"].nunique()), "scored_rows": int(len(scores))},
+        performance_range={
+            "signal_date": str(score_start.date()),
+            "start": str(first_execution.date()), "start_price": "open",
+            "start_state": "信号日收盘后持有现金，首笔订单在下一交易日开盘执行",
+            "end": str(ending.date()), "end_price": "close",
+            "dates": max(len(result["daily_equity"]) - 1, 0),
+            "equity_points": len(result["daily_equity"]),
+            "annualization_intervals": max(len(result["daily_equity"]) - 1, 1),
+        },
         rebalance_every=rebalance_every,
         benchmark_buy_hold_return=benchmark_return,
+        benchmark_start=benchmark_start,
+        benchmark_range=benchmark_range,
         horizon=horizon,
+        research_only=True,
+        validation_eligible=False,
+        validation_limitation="历史成分与退市股票数据尚未验证；该结果不得作为历史全市场策略验收。",
+        strategy_rules_aligned=False,
+        strategy_rules_limitation="本回测共用模型百分位排序，但未复现人工任务单的入场过滤、趋势退出与固定止损规则。",
+        share_lot_constraints_applied=lot_sizes is not None,
+        fractional_shares_allowed=lot_sizes is None,
+        initial_equity=float(initial_equity),
+        capital_unit_note="资金与行情价格使用同一货币单位；默认权益 1.0 仅适合标准化研究，整手回测应传入实际资金量。",
     )
     return result

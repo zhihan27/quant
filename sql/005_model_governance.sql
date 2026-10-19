@@ -49,8 +49,7 @@ COMMENT ON COLUMN public.quant_model_validation_log.passed_gates IS '逐道门�
 COMMENT ON COLUMN public.quant_model_validation_log.failed_gate IS '第一道未通过的门槛；全部通过时为 NULL';
 COMMENT ON COLUMN public.quant_model_validation_log.details IS '完整指标快照与数据血缘，含训练目标、窗口与状态说明';
 
--- 最终留出集：一个模型版本只允许一次评估。UNIQUE(model_version) 是「只跑一次」的真正闸门，
--- 两个管理员同时点也只能成功一个，不靠应用层判断。
+-- 最终留出集：固定留出起点跨模型版本也只允许评估一次；应用通过 advisory lock 串行化写入。
 CREATE TABLE IF NOT EXISTS public.quant_model_final_holdout (
     id            BIGSERIAL PRIMARY KEY,
     model_version TEXT        NOT NULL UNIQUE,
@@ -67,9 +66,9 @@ CREATE TABLE IF NOT EXISTS public.quant_model_final_holdout (
 CREATE INDEX IF NOT EXISTS quant_model_final_holdout_time_idx
     ON public.quant_model_final_holdout(evaluated_at DESC);
 
-COMMENT ON TABLE  public.quant_model_final_holdout IS '一次性最终留出集评估结果；同一 model_version 只能有一行';
+COMMENT ON TABLE  public.quant_model_final_holdout IS '最终留出集一次性评估结果；固定起点对应的协议只能评估一次';
 COMMENT ON COLUMN public.quant_model_final_holdout.context_id IS '被评估的那一份模型上下文的 ID；MODEL_VERSION 是常量，同版本下每次扫描都会换 context_id';
-COMMENT ON COLUMN public.quant_model_final_holdout.forced IS 'TRUE 表示是管理员用 --force 覆盖已有评估记录后写入的';
+COMMENT ON COLUMN public.quant_model_final_holdout.forced IS '兼容旧入口的标记；最终留出集协议禁止 --force 重评，因此新记录始终为 FALSE';
 COMMENT ON COLUMN public.quant_model_final_holdout.metrics IS '留出集的完整指标，含 Rank IC、HAC t、NDCG、Top 超额、Top-Bottom、换手率与费用后收益';
 
 -- 特征漂移。date + feature_name 唯一，重复扫描 UPSERT 不刷重复行。

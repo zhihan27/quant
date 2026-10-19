@@ -76,6 +76,9 @@ class PanelStore:
         stored["code"] = str(code).zfill(6)
         stored["stored_at"] = _now_text()
         stored["history_source"] = str((meta or {}).get("source", ""))
+        turnover_unit = (meta or {}).get("turnover_rate_unit")
+        if turnover_unit in ("percent", "fraction"):
+            stored["turnover_rate_unit"] = turnover_unit
         return _atomic_write(stored, self.history_path(code, adjustment, period))
 
     def read_history(self, code: str, adjustment: str = "qfq", period: str = "daily") -> pd.DataFrame | None:
@@ -84,7 +87,12 @@ class PanelStore:
         if not path.exists():
             return None
         try:
-            return pd.read_parquet(path)
+            frame = pd.read_parquet(path)
+            units = frame["turnover_rate_unit"].dropna().astype(str).unique() if "turnover_rate_unit" in frame else []
+            if len(units) == 1 and units[0] in ("percent", "fraction"):
+                frame.attrs["turnover_rate_unit"] = units[0]
+            frame.attrs["history_period"] = period
+            return frame
         except (OSError, ValueError) as exc:
             LOGGER.warning("读取 Parquet 历史失败 code=%s detail=%s", code, exc)
             return None

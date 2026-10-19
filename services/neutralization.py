@@ -77,6 +77,10 @@ def neutralize_cross_section(
         "dates": 0,
         "skipped_dates": 0,
         "factor_missing_dates": 0,
+        "thin_cross_section_dates": 0,
+        "exposure_missing_dates": 0,
+        "industry_missing_dates": 0,
+        "industry_missing_rows": 0,
         "removed_variance": {},
         "minimum_stocks": minimum_stocks,
     }
@@ -89,20 +93,32 @@ def neutralize_cross_section(
     design_names: list[str] = []
     processed = 0
     skipped = 0
+    thin_cross_section = 0
     factor_missing = 0
+    exposure_missing = 0
+    industry_missing = 0
+    industry_missing_rows = 0
     for date, index in result.groupby("date").groups.items():
         block = result.loc[index]
         exposures_valid = block[exposures].notna().all(axis=1)
         factors_valid = block[factors].notna().all(axis=1)
-        valid = exposures_valid & factors_valid
+        factor_exposure_valid = exposures_valid & factors_valid
+        valid = factor_exposure_valid.copy()
         if industry_values is not None:
-            valid &= block[industry_column].notna()
+            industry_valid = block[industry_column].notna()
+            industry_missing_rows += int((factor_exposure_valid & ~industry_valid).sum())
+            valid &= industry_valid
         sample = block.loc[valid]
         if len(sample) < minimum_stocks:
             skipped += 1
-            if int(exposures_valid.sum()) >= minimum_stocks:
-                # 暴露本身够用，只是共同样本被子集缺失的因子拖垮，需要与截面不足区分开。
+            if len(block) < minimum_stocks:
+                thin_cross_section += 1
+            elif int(exposures_valid.sum()) < minimum_stocks:
+                exposure_missing += 1
+            elif int(factor_exposure_valid.sum()) < minimum_stocks:
                 factor_missing += 1
+            elif industry_values is not None:
+                industry_missing += 1
             continue
         matrix, design_names = _design_matrix(sample, exposures, industry_column, minimum_industry_stocks)
         if matrix.shape[1] >= len(sample):
@@ -131,18 +147,39 @@ def neutralize_cross_section(
 
     report["dates"] = processed
     report["skipped_dates"] = skipped
+    report["thin_cross_section_dates"] = thin_cross_section
     report["factor_missing_dates"] = factor_missing
+    report["exposure_missing_dates"] = exposure_missing
+    report["industry_missing_dates"] = industry_missing
+    report["industry_missing_rows"] = industry_missing_rows
     report["design_terms"] = len(design_names)
     report["removed_variance"] = {column: float(np.mean(values)) if values else None for column, values in removed.items()}
     if processed == 0:
+        reasons = []
+        if thin_cross_section:
+            reasons.append(f"{thin_cross_section} 个交易日的原始截面不足最小股票数")
+        if exposure_missing:
+            reasons.append(f"{exposure_missing} 个交易日的暴露样本不足")
+        if factor_missing:
+            reasons.append(f"{factor_missing} 个交易日的因子共同样本不足")
+        if industry_missing:
+            reasons.append(f"{industry_missing} 个交易日的行业分类缺失")
         report["status"] = (
-            f"{factor_missing} 个交易日的因子存在整体缺失，共同样本不足，未生成中性化因子"
-            if factor_missing
-            else "没有满足最小截面要求的交易日，未生成中性化因子"
+            f"{'；'.join(reasons)}，未生成中性化因子"
+            if reasons else "没有满足最小截面要求的交易日，未生成中性化因子"
         )
     elif skipped:
-        reason = "截面不足或因子缺失" if factor_missing else "截面不足"
-        report["status"] = f"已中性化 {processed} 个交易日，{skipped} 个交易日{reason}被跳过"
+        reasons = []
+        if thin_cross_section:
+            reasons.append(f"原始截面不足 {thin_cross_section} 日")
+        if exposure_missing:
+            reasons.append(f"暴露样本不足 {exposure_missing} 日")
+        if factor_missing:
+            reasons.append(f"因子共同样本不足 {factor_missing} 日")
+        if industry_missing:
+            reasons.append(f"行业分类不足 {industry_missing} 日")
+        detail = "；".join(reasons) or f"截面或设计矩阵条件不满足 {skipped} 日"
+        report["status"] = f"已中性化 {processed} 个交易日，跳过原因：{detail}"
     else:
         report["status"] = f"已中性化 {processed} 个交易日的市值与行业暴露"
     report["note"] = "残差保留相对强弱信息；市值取流通市值近似历史值，行业使用当前分类，均非严格点时数据。"
@@ -159,39 +196,80 @@ def attach_market_cap_exposure(
     exposures: pd.DataFrame | None,
     share_column: str = "market_cap_float",
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """按流通股本与历史收盘价近似历史市值，构造中性化所需的市值与行业暴露。
-
-    公开行情源只提供当前市值，这里用「当前流通市值 ÷ 当前价 × 历史收盘价」近似历史市值，
-    并明确标注该近似忽略股本变动，属于非严格点时数据。
-    """
+    """只用带生效日期的暴露记录构造历史市值与行业分类。"""
     result = panel.copy()
-    report = {"status": "未接入市值与行业暴露", "codes_with_exposure": 0, "codes_total": int(result["code"].nunique()) if "code" in result else 0}
+    report = {
+        "status": "未接入点时市值与行业暴露", "codes_with_exposure": 0,
+        "codes_total": int(result["code"].nunique()) if "code" in result else 0,
+        "point_in_time": False, "industry_available": False,
+        "market_cap_coverage": 0.0, "industry_coverage": 0.0,
+    }
     result["log_market_cap"] = np.nan
     result["industry"] = None
     if exposures is None or exposures.empty or "code" not in result:
         return result, report
     reference = exposures.copy()
+    if "date" not in reference:
+        report.update(
+            status="暴露缺少生效日期，拒绝把当前市值或行业回填到历史截面",
+            limitation="需提供带有效日期的历史流通市值、价格与行业分类。",
+        )
+        return result, report
+    reference["date"] = pd.to_datetime(reference["date"], errors="coerce")
     reference["code"] = reference["code"].astype(str).str.zfill(6)
-    reference = reference.drop_duplicates("code", keep="last").set_index("code")
-    exposure_codes = set(reference.index)
-    share_value = None
-    if share_column in reference and "price" in reference:
-        prices = pd.to_numeric(reference["price"], errors="coerce")
-        caps = pd.to_numeric(reference[share_column], errors="coerce")
-        share_value = (caps / prices.where(prices > 0)).replace([np.inf, -np.inf], np.nan)
-    has_exposure = result["code"].isin(exposure_codes) & result["close"].gt(0)
-    if share_value is not None:
-        shares = result["code"].map(share_value)
-        result.loc[has_exposure, "log_market_cap"] = np.log((shares * result.loc[has_exposure, "close"]).where(lambda value: value > 0))
-    if "industry" in reference:
-        result.loc[has_exposure, "industry"] = result.loc[has_exposure, "code"].map(reference["industry"])
+    required = {"date", "code", share_column, "price"}
+    missing = required - set(reference.columns)
+    if missing:
+        report.update(
+            status=f"点时暴露缺少字段：{', '.join(sorted(missing))}",
+            limitation="需要生效日期、流通市值和对应价格；未使用非点时值替代。",
+        )
+        return result, report
+    reference = reference.dropna(subset=["date"]).sort_values(["date", "code"])
+    reference = reference.drop_duplicates(["date", "code"], keep="last")
+    source = result[["date", "code", "close"]].copy()
+    source["date"] = pd.to_datetime(source["date"], errors="coerce")
+    source["code"] = source["code"].astype(str).str.zfill(6)
+    source["_row"] = result.index
+    source = source.sort_values(["date", "code"])
+    matched = pd.merge_asof(
+        source,
+        reference.sort_values(["date", "code"]),
+        on="date",
+        by="code",
+        direction="backward",
+    ).set_index("_row").reindex(result.index)
+    prices = pd.to_numeric(matched["price"], errors="coerce")
+    caps = pd.to_numeric(matched[share_column], errors="coerce")
+    shares = (caps / prices.where(prices > 0)).replace([np.inf, -np.inf], np.nan)
+    historical_cap = shares * pd.to_numeric(result["close"], errors="coerce")
+    result["log_market_cap"] = np.log(historical_cap.where(historical_cap > 0))
+    industry_field_available = "industry" in matched
+    industry_available = False
+    industry_rows = 0
+    if industry_field_available:
+        result["industry"] = matched["industry"]
     available = int(result["log_market_cap"].notna().sum())
+    market_cap_coverage = available / len(result) if len(result) else 0.0
+    if industry_field_available:
+        industry_rows = int((result["industry"].notna() & result["log_market_cap"].notna()).sum())
+    industry_coverage = industry_rows / len(result) if len(result) else 0.0
+    industry_available = industry_rows > 0
     report.update(
-        codes_with_exposure=int(result.loc[has_exposure, "code"].nunique()),
+        codes_with_exposure=int(result.loc[result["log_market_cap"].notna(), "code"].nunique()),
         rows_with_market_cap=available,
-        status=f"已匹配 {int(result.loc[has_exposure, 'code'].nunique())} 只股票的市值暴露"
-        if available
-        else "暴露数据缺少可用市值，未生成中性化输入",
-        limitation="历史市值为流通股本×历史收盘价的近似，未使用严格点时股本与历史行业分类。",
+        rows_with_industry=industry_rows,
+        point_in_time=available > 0,
+        industry_available=industry_available,
+        market_cap_coverage=market_cap_coverage,
+        industry_coverage=industry_coverage,
+        status=(
+            f"已按生效日期匹配暴露；市值覆盖 {market_cap_coverage:.1%}，行业覆盖 {industry_coverage:.1%}"
+            if available and industry_available
+            else "历史行业分类无有效值，未生成中性化输入"
+            if available
+            else "暴露数据缺少可用市值，未生成中性化输入"
+        ),
+        limitation="市值按暴露日期的流通股数近似；行业分类使用该日期及此前最近记录。",
     )
     return result, report

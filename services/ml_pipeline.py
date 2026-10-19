@@ -15,14 +15,14 @@ from time import perf_counter
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 import numpy as np
 import pandas as pd
 
 from config import settings
 from services.dataframe_utils import column_values_without_attrs
-from services.extra_factors import apply_health_veto, attach_extra_factors
+from services.extra_factors import EXTRA_FACTOR_FAMILIES, apply_health_veto, attach_extra_factors
 from services.feature_engineering import FEATURE_COLUMNS, add_forward_returns, build_features, normalize_cross_section
 from services.neutralization import (
     NEUTRAL_PREFIX, attach_market_cap_exposure, neutralize_cross_section, neutralized_feature_columns,
@@ -31,6 +31,7 @@ from services.panel_store import PanelStore
 from services.style_factors import attach_style_factors, load_history, configuration_id, production_report_is_current
 from services.progress import interval_throttled, throttled
 from services.label_processing import winsorize_training_labels
+from services.strategy_scoring import fuse_prediction_percentiles
 from services.rank_model import (
     SCORE_KIND_RANK, SCORE_KIND_RETURN, evaluate_ndcg, make_ranker, summarize_importances,
 )
@@ -40,13 +41,13 @@ TARGET_KIND = "excess_return_vs_csi300"
 MINIMUM_STOCKS = 5
 MINIMUM_COVERAGE = 0.8
 MINIMUM_TRAIN_DATES = 80
+MINIMUM_FEATURE_COVERAGE_DATES = 20
 MINIMUM_OOS_DATES = 40
 MINIMUM_RANK_IC = 0.02
 MINIMUM_IC_T = 1.645
 # 排序目标的 NDCG 必须显著高于随机排序基线，才认为学到的是截面区分能力。
 MINIMUM_NDCG_RATIO = 1.05
 # 中性化因子覆盖率低于该比例时退回截面Z分数因子，避免样本被残差缺失过度削减。
-MINIMUM_NEUTRAL_COVERAGE = 0.5
 MODEL_NAMES = ("LightGBM", "XGBoost")
 HORIZONS = settings.MODEL_HORIZONS
 LOGGER = logging.getLogger("quant.ml")
@@ -107,6 +108,9 @@ def build_market_panel(
         labelled["code"] = str(code)
         columns = ["date", "code", "close", *FEATURE_COLUMNS]
         columns += [f"{prefix}_{horizon}" for horizon in HORIZONS for prefix in ("target", "forward_return", "label_end")]
+        columns += [f"{prefix}_{horizon}" for horizon in HORIZONS for prefix in (
+            "research_target", "research_forward_return", "research_label_end",
+        )]
         frames.append(labelled[columns])
     panel = pd.concat(frames, ignore_index=True).sort_values(["date", "code"]).reset_index(drop=True)
     # 新增因子先装配、财务健康否决先生效，之后才做截面标准化：被否决的标的不能参与自己所在截面的
@@ -120,42 +124,63 @@ def build_market_panel(
     model_features = [f"xs_{column}" for column in FEATURE_COLUMNS]
     neutralization: dict[str, Any] = {"status": "未启用市值与行业中性化，模型使用截面Z分数因子"}
     exposure_report: dict[str, Any] = {"status": "未接入市值与行业暴露"}
+    neutralization_blocked = False
     if exposures is not None and not exposures.empty:
         panel, exposure_report = attach_market_cap_exposure(panel, exposures)
-        panel, neutralization = neutralize_cross_section(panel, FEATURE_COLUMNS)
-        candidates = neutralized_feature_columns(panel, FEATURE_COLUMNS)
-        coverage = float(panel[candidates].notna().all(axis=1).mean()) if candidates else 0.0
-        if candidates and coverage >= MINIMUM_NEUTRAL_COVERAGE:
-            model_features = candidates
-            neutralization = {**neutralization, "model_features": len(candidates), "coverage": coverage}
-        else:
+        if (
+            exposure_report.get("point_in_time")
+            and exposure_report.get("industry_available")
+            and exposure_report.get("market_cap_coverage", 0.0) >= MINIMUM_COVERAGE
+            and exposure_report.get("industry_coverage", 0.0) >= MINIMUM_COVERAGE
+        ):
+            panel, neutralization = neutralize_cross_section(panel, FEATURE_COLUMNS)
+            model_features = neutralized_feature_columns(panel, FEATURE_COLUMNS)
+            coverage = float(panel[model_features].notna().all(axis=1).mean()) if model_features else 0.0
             neutralization = {
-                **neutralization, "coverage": coverage,
-                "status": f"{neutralization['status']}；中性化因子覆盖率 {coverage:.0%} 偏低，模型改用截面Z分数因子",
+                **neutralization, "model_features": len(model_features), "coverage": coverage,
+                "selection_policy": "训练折内按历史覆盖率筛选，不按全样本覆盖率切换",
             }
-    accepted = list(extra_report.get("accepted_columns") or [])
-    if accepted:
+        else:
+            neutralization_blocked = True
+            model_features = []
+            neutralization = {
+                "status": (
+                    "点时市值或历史行业暴露覆盖不足，已阻止该中性化配置训练；"
+                    f"市值覆盖 {exposure_report.get('market_cap_coverage', 0.0):.1%}，"
+                    f"行业覆盖 {exposure_report.get('industry_coverage', 0.0):.1%}"
+                ),
+                "exposure": exposure_report,
+            }
+    family_reports = extra_report.get("families") or {}
+    candidate_extra_columns = [
+        column
+        for family, columns in EXTRA_FACTOR_FAMILIES.items()
+        if family in family_reports and all(column in panel for column in columns)
+        for column in columns
+    ]
+    extra_report = {**extra_report, "model_candidate_columns": candidate_extra_columns}
+    if candidate_extra_columns:
         features: list[str] = []
         coverage = 0.0
         neutralized = bool(model_features) and model_features[0].startswith(NEUTRAL_PREFIX)
         # 基础因子做过中性化时新增因子也必须一起做，否则模型会绕过中性化，
         # 顺着新增因子把市值与行业暴露重新学回来。
-        if neutralized:
-            panel, extra_neutralization = neutralize_cross_section(panel, accepted)
-            candidates = neutralized_feature_columns(panel, accepted)
+        if neutralized and not neutralization_blocked:
+            panel, extra_neutralization = neutralize_cross_section(panel, candidate_extra_columns)
+            candidates = neutralized_feature_columns(panel, candidate_extra_columns)
             coverage = float(panel[candidates].notna().all(axis=1).mean()) if candidates else 0.0
-            if candidates and coverage >= MINIMUM_NEUTRAL_COVERAGE:
+            if candidates:
                 features = candidates
             extra_report = {**extra_report, "neutralization": {**extra_neutralization, "coverage": coverage}}
-        if not features:
+        if not features and not neutralization_blocked:
             # 树模型对特征的单调变换不敏感，这里统一做截面Z分数只为与基础因子保持同一口径；
-            # 中性化覆盖率不足时也走这条路，原因写进报告便于核对。
-            panel = normalize_cross_section(panel, accepted, MINIMUM_STOCKS, MINIMUM_COVERAGE)
-            features = [f"xs_{column}" for column in accepted if f"xs_{column}" in panel]
+            # 缺少可靠点时暴露时才使用截面Z分数，原因写进报告便于核对。
+            panel = normalize_cross_section(panel, candidate_extra_columns, MINIMUM_STOCKS, MINIMUM_COVERAGE)
+            features = [f"xs_{column}" for column in candidate_extra_columns if f"xs_{column}" in panel]
             if neutralized:
                 extra_report["neutralization"] = {
                     **extra_report["neutralization"],
-                    "status": f"新增因子中性化覆盖率 {coverage:.0%} 偏低，改用截面Z分数",
+                    "status": f"新增因子中性化整体覆盖率 {coverage:.0%}；保留候选列并在训练折内筛选",
                 }
         model_features = [*model_features, *features]
         extra_report = {**extra_report, "model_features": len(features)}
@@ -170,6 +195,8 @@ def build_market_panel(
         "neutralization_enabled": exposures is not None and not exposures.empty, **(style_options or {}),
     })
     model_features = [*model_features, *style_report["model_feature_columns"]]
+    if neutralization_blocked:
+        model_features = []
     panel.attrs["style_factors"] = style_report
     # 截面覆盖只针对本次成功取得历史的股票池，不能冒充历史全市场成分。
     panel.attrs["universe_codes"] = sorted(histories)
@@ -195,6 +222,15 @@ def normalize_predictions(frame: pd.DataFrame, prediction_column: str = "predict
     return result
 
 
+def fuse_normalized_predictions(
+    prediction_frames: dict[str, pd.DataFrame], model_names: Sequence[str] = MODEL_NAMES,
+) -> pd.DataFrame:
+    """按生产选股口径外连接各模型百分位，并对可用模型取均值。"""
+    return fuse_prediction_percentiles(prediction_frames, model_names).dropna(
+        subset=["score"]
+    ).sort_values(["date", "code"]).reset_index(drop=True)
+
+
 def evaluation_gates(metrics: dict[str, Any]) -> dict[str, Any]:
     """逐道门槛的通过情况与第一道未通过的门槛，供评估与监控共用一份判定。
 
@@ -210,6 +246,9 @@ def evaluation_gates(metrics: dict[str, Any]) -> dict[str, Any]:
     top, universe = metrics.get("top_excess_return"), metrics.get("universe_excess_return")
     spread = metrics.get("top_bottom_spread")
     ndcg_ratio = metrics.get("ndcg_ratio")
+    ndcg_at_20_ratio = metrics.get("ndcg_at_20_ratio")
+    top_20_net_excess = metrics.get("top_20_excess_net_return")
+    universe_net_excess = metrics.get("universe_net_excess_return")
     mae, baseline_mae = metrics.get("mae"), metrics.get("baseline_mae")
     # 每一项都显式判 None：监控读回的是落库/落盘后再取出的记录，
     # 未生成样本外指标时这些字段确实是空值，不能让 None 参与比较。
@@ -221,7 +260,17 @@ def evaluation_gates(metrics: dict[str, Any]) -> dict[str, Any]:
         "top_bottom": spread is not None and float(spread) > 0,
     }
     if ranking:
-        gates["ndcg"] = ndcg_ratio is not None and float(ndcg_ratio) > MINIMUM_NDCG_RATIO
+        gates["ndcg_at_20"] = (
+            ndcg_at_20_ratio is not None
+            and float(ndcg_at_20_ratio) > MINIMUM_NDCG_RATIO
+            and int(metrics.get("ndcg_at_20_days") or 0) >= MINIMUM_OOS_DATES
+        )
+        gates["top_20_net_excess"] = (
+            top_20_net_excess is not None
+            and universe_net_excess is not None
+            and float(top_20_net_excess) > max(0.0, float(universe_net_excess))
+            and int(metrics.get("top_20_dates") or 0) >= MINIMUM_OOS_DATES
+        )
     else:
         gates["mae"] = mae is not None and baseline_mae is not None and float(mae) < float(baseline_mae)
     failed = next((name for name, ok in gates.items() if not ok), None)
@@ -233,6 +282,7 @@ def evaluate_oos(
 ) -> dict[str, Any]:
     """计算每日Rank IC、HAC显著性、Top/Bottom收益与排序质量基线。"""
     from statsmodels.api import OLS
+    from services.backtest import cost_rates
 
     evaluation_columns = ["date", "code", "prediction", "actual", "baseline", "absolute_return"]
     clean = pd.DataFrame(
@@ -243,14 +293,34 @@ def evaluate_oos(
         subset=["prediction", "actual", "baseline", "absolute_return"]
     )
     required = max(MINIMUM_STOCKS, math.ceil((total_stocks or MINIMUM_STOCKS) * MINIMUM_COVERAGE))
+    buy_cost, sell_cost = cost_rates()
     rows = []
     eligible_indices = []
+    top_20_members: list[set[str]] = []
     for date, group in clean.groupby("date", sort=True):
         if group["code"].nunique() < required or group["prediction"].nunique() < 2 or group["actual"].nunique() < 2:
             continue
         ordered = group.sort_values("prediction", kind="stable")
         size = max(1, len(group) // 5)
         bottom, top = ordered.head(size), ordered.tail(size)
+        top_20 = ordered.tail(20) if len(ordered) >= 20 else ordered.iloc[0:0]
+        benchmark_return = group["absolute_return"] - group["actual"]
+        net_return = (1 + group["absolute_return"]) * (1 - sell_cost) / (1 + buy_cost) - 1
+        if len(top_20) == 20:
+            top_20_net_return = (
+                (1 + top_20["absolute_return"]) * (1 - sell_cost) / (1 + buy_cost) - 1
+            )
+            top_20_benchmark_return = (
+                top_20["absolute_return"] - top_20["actual"]
+            )
+            top_20_members.append(set(top_20["code"].astype(str)))
+            top_20_net_excess = float(top_20_net_return.mean() - top_20_benchmark_return.mean())
+            universe_net_excess = float(net_return.mean() - benchmark_return.mean())
+            top_20_net_mean = float(top_20_net_return.mean())
+        else:
+            top_20_net_excess = None
+            universe_net_excess = None
+            top_20_net_mean = None
         ic = float(group["prediction"].rank().corr(group["actual"].rank()))
         if not np.isfinite(ic):
             continue
@@ -259,18 +329,25 @@ def evaluate_oos(
             "top_excess_return": float(top["actual"].mean()), "bottom_excess_return": float(bottom["actual"].mean()),
             "top_return": float(top["absolute_return"].mean()), "bottom_return": float(bottom["absolute_return"].mean()),
             "universe_excess_return": float(group["actual"].mean()), "stocks": len(group),
+            "top_20_net_return": top_20_net_mean,
+            "top_20_excess_net_return": top_20_net_excess,
+            "universe_net_excess_return": universe_net_excess,
         })
         eligible_indices.extend(group.index.tolist())
     evaluated = clean.loc[eligible_indices]
     ranking = score_kind == SCORE_KIND_RANK
     metrics = {"dates": len(rows), "oos_samples": len(evaluated), "daily_groups": rows, "target_kind": TARGET_KIND,
                "score_kind": score_kind, "ndcg": None, "ndcg_random_baseline": None, "ndcg_ratio": None,
+               "ndcg_at_20": None, "ndcg_at_20_random_baseline": None, "ndcg_at_20_ratio": None,
+               "ndcg_at_20_days": 0, "top_20_net_return": None,
+               "top_20_excess_net_return": None, "universe_net_excess_return": None,
+               "top_20_dates": 0, "top_20_selection_turnover": None,
                "ndcg_protocol": settings.NDCG_PROTOCOL,
                "rank_ic": None, "rank_ic_hac_t": None, "top_excess_return": None, "bottom_excess_return": None,
                "top_return": None, "bottom_return": None, "top_bottom_spread": None, "mae": None, "baseline_mae": None,
                "validated": False, "validation_rule": (
-                   "排序目标：每日Rank IC>0.02且HAC t>1.645；NDCG@截面前20%高于随机排序基线5%以上；"
-                   "Top超额为正并优于池均值；Top-Bottom为正；至少40个样本外交易日"
+                   "排序目标：每日Rank IC>0.02且HAC t>1.645；NDCG@20高于随机排序基线5%以上；"
+                   "Top 20 扣费超额为正并优于池均值；Top-Bottom为正；至少40个样本外交易日"
                    if ranking else
                    "回归目标：MAE优于训练中位数基线；每日Rank IC>0.02且HAC t>1.645；Top超额为正并优于池均值；"
                    "Top-Bottom为正；至少40个样本外交易日")}
@@ -285,16 +362,40 @@ def evaluate_oos(
     mae = None if ranking else float((evaluated["prediction"] - evaluated["actual"]).abs().mean())
     baseline_mae = None if ranking else float((evaluated["baseline"] - evaluated["actual"]).abs().mean())
     quality = evaluate_ndcg(evaluated)
+    quality_at_20 = evaluate_ndcg(evaluated, k=20)
     ndcg, ndcg_baseline = quality["ndcg"], quality["ndcg_random_baseline"]
     ndcg_ratio = ndcg / ndcg_baseline if ndcg is not None and ndcg_baseline else None
+    ndcg_at_20_ratio = (
+        quality_at_20["ndcg"] / quality_at_20["ndcg_random_baseline"]
+        if quality_at_20["ndcg"] is not None and quality_at_20["ndcg_random_baseline"]
+        else None
+    )
     top = float(daily["top_excess_return"].mean())
     bottom = float(daily["bottom_excess_return"].mean())
     spread = top - bottom
     universe = float(daily["universe_excess_return"].mean())
+    top_20_daily = daily.dropna(subset=["top_20_net_return", "top_20_excess_net_return", "universe_net_excess_return"])
+    selection_turnover = [
+        1 - len(current & previous) / 20
+        for previous, current in zip(top_20_members, top_20_members[1:])
+    ]
     metrics.update(rank_ic=ic_mean, rank_ic_hac_t=float(ic_t) if ic_t is not None else None,
                    ic_test_status="有效" if ic_t is not None else "IC方差退化，拒绝推断显著性", mae=mae, baseline_mae=baseline_mae,
                    ndcg=ndcg, ndcg_random_baseline=ndcg_baseline, ndcg_days=quality["ndcg_days"],
                    ndcg_ratio=ndcg_ratio,
+                   ndcg_at_20=quality_at_20["ndcg"],
+                   ndcg_at_20_random_baseline=quality_at_20["ndcg_random_baseline"],
+                   ndcg_at_20_days=quality_at_20["ndcg_days"],
+                   ndcg_at_20_ratio=ndcg_at_20_ratio,
+                   top_20_net_return=(float(top_20_daily["top_20_net_return"].mean()) if not top_20_daily.empty else None),
+                   top_20_excess_net_return=(
+                       float(top_20_daily["top_20_excess_net_return"].mean()) if not top_20_daily.empty else None
+                   ),
+                   universe_net_excess_return=(
+                       float(top_20_daily["universe_net_excess_return"].mean()) if not top_20_daily.empty else None
+                   ),
+                   top_20_dates=int(len(top_20_daily)),
+                   top_20_selection_turnover=(float(np.mean(selection_turnover)) if selection_turnover else None),
                    top_excess_return=top, bottom_excess_return=bottom, top_bottom_spread=spread,
                    # 池均值超额原本只用在内联判定里、用完即弃；判定抽成 evaluation_gates 后
                    # 它必须随指标一起返回，落库后页面才能复核「Top 超额是否真的优于池均值」。
@@ -310,6 +411,21 @@ def _selection_key(result: dict[str, Any]) -> tuple[int, float]:
     metrics = result.get("oos_metrics") or {}
     rank_ic = metrics.get("rank_ic")
     return (1 if result.get("validated") else 0, float(rank_ic) if rank_ic is not None else -1.0)
+
+
+def _select_fold_features(
+    training: pd.DataFrame, feature_pool: Sequence[str], required_stocks: int,
+) -> list[str]:
+    """只根据当前训练窗口的截面覆盖选择特征。"""
+    available_columns = [column for column in feature_pool if column in training.columns]
+    if training.empty or not available_columns:
+        return []
+    coverage = training.groupby("date", sort=True)[available_columns].count()
+    qualified_dates = coverage.ge(required_stocks).sum(axis=0)
+    return [
+        column for column in available_columns
+        if int(qualified_dates[column]) >= MINIMUM_FEATURE_COVERAGE_DATES
+    ]
 
 
 def _prepare_validation_data(
@@ -333,18 +449,9 @@ def _prepare_validation_data(
     frame_preparation_seconds = perf_counter() - started
 
     required = max(MINIMUM_STOCKS, math.ceil(frame["code"].nunique() * MINIMUM_COVERAGE))
-    calibration_started = perf_counter()
-    if feature_pool and not frame.empty:
-        coverage = frame[feature_pool].notna().groupby(frame["date"], sort=True).sum()
-        calibration_dates = coverage.index[coverage.ge(required).any(axis=1)][:MINIMUM_TRAIN_DATES]
-        calibration = frame.loc[frame["date"].isin(calibration_dates)]
-        features = [
-            column for column in feature_pool
-            if calibration[column].notna().sum() >= MINIMUM_STOCKS * 20
-        ]
-    else:
-        features = []
-    feature_calibration_seconds = perf_counter() - calibration_started
+    # 保留完整候选池，具体入模列在每个训练折内单独确定。
+    features = feature_pool
+    feature_calibration_seconds = 0.0
     fingerprint_started = perf_counter()
     fingerprint_columns = ["date", "code", *features, target, endpoint, forward_return]
     row_hashes = pd.util.hash_pandas_object(
@@ -353,7 +460,7 @@ def _prepare_validation_data(
     input_fingerprint = hashlib.sha256(row_hashes.tobytes()).hexdigest()
     fingerprint_seconds = perf_counter() - fingerprint_started
     sample_filter_started = perf_counter()
-    filtered = frame.dropna(subset=[*features, target, endpoint])
+    filtered = frame.dropna(subset=[target, endpoint])
     if cutoff is not None:
         filtered = filtered.loc[filtered[endpoint].lt(cutoff)]
     # 后续拟合和预测只需实际入模列及本周期标签，不保留其他周期或诊断列。
@@ -633,17 +740,17 @@ def fit_panel_model(
         progress = throttled_progress
     prepared = _prepared or _prepare_validation_data(panel, horizon, cutoff, window)
     labelled = prepared["labelled"]
-    features = prepared["features"]
+    feature_pool = prepared["features"]
     dates = prepared["dates"]
     target, endpoint = prepared["target"], prepared["endpoint"]
     forward_return = prepared["forward_return"]
     if progress:
         progress(f"按交易日验证 {name} · {horizon}日 · 数据准备完成 · 已用 {perf_counter() - started:.1f} 秒")
-    if not features:
+    if not feature_pool:
         result = unavailable_model(name, horizon, "截面特征样本不足，未生成预测", objective=requested, window=window)
         result["execution"] = _execution_summary(
             name, horizon, requested, prepared, started, {}, [],
-            {"enabled": False, "hits": 0, "misses": 0, "reason": "没有可用特征"},
+            {"enabled": False, "hits": 0, "misses": 0, "reason": "没有候选特征"},
         )
         return result
     cache_enabled = bool(settings.VALIDATION_CACHE_ENABLED and model_factory is None)
@@ -663,15 +770,17 @@ def fit_panel_model(
             return _make_model(name)
         return make_ranker(name)
 
-    def _fit(estimator: Any, sample: pd.DataFrame, candidate: str) -> tuple[Any, dict[str, Any]]:
+    def _fit(
+        estimator: Any, sample: pd.DataFrame, candidate: str, selected_features: Sequence[str],
+    ) -> tuple[Any, dict[str, Any]]:
         labels = sample[target]
         processing = {"enabled": False, "reason": "排序目标保留原始标签，避免截尾产生并列名次"}
         if candidate == "regression":
             labels, processing = winsorize_training_labels(labels, sample["date"], minimum_stocks=MINIMUM_STOCKS)
         if hasattr(estimator, "fit_cross_section"):
-            estimator.fit_cross_section(sample[features], labels, sample["date"])
+            estimator.fit_cross_section(sample[list(selected_features)], labels, sample["date"])
         else:
-            estimator.fit(sample[features], labels)
+            estimator.fit(sample[list(selected_features)], labels)
         return estimator, processing
 
     def _estimator_parameter_identity(candidate: str) -> dict[str, Any]:
@@ -730,8 +839,8 @@ def fit_panel_model(
                 train_positions, test_positions = _fold_row_positions(prepared, fold_spec)
                 fold_prep_seconds = perf_counter() - fold_started
                 stage_seconds["fold_preparation"] += fold_prep_seconds
-                train_dates = labelled["date"].iloc[train_positions]
-                training_date_count = int(train_dates.nunique())
+                train_window = labelled.iloc[train_positions]
+                training_date_count = int(train_window["date"].nunique())
                 if training_date_count < MINIMUM_TRAIN_DATES:
                     fold_details.append({
                         "validation_segment": fold_number,
@@ -743,16 +852,64 @@ def fit_panel_model(
                         "fit_seconds": 0.0, "prediction_seconds": 0.0, "cache_source": "not_run",
                     })
                     continue
+                fold_features = _select_fold_features(
+                    train_window, feature_pool, prepared["required_stocks"],
+                )
+                if not fold_features:
+                    fold_details.append({
+                        "validation_segment": fold_number,
+                        "test_start": str(pd.Timestamp(dates[fold_spec["test_start_index"]]).date()),
+                        "test_end": str(pd.Timestamp(dates[fold_spec["test_stop_index"] - 1]).date()),
+                        "training_samples": len(train_window), "validation_samples": len(test_positions),
+                        "training_dates": training_date_count, "features": 0,
+                        "feature_columns": [], "threads": int(settings.TRAINING_N_JOBS),
+                        "status": "训练窗口内无达到覆盖门槛的特征，跳过该段",
+                        "preparation_seconds": fold_prep_seconds, "fit_seconds": 0.0,
+                        "prediction_seconds": 0.0, "cache_source": "not_run",
+                    })
+                    continue
+                train = train_window.loc[train_window[fold_features].notna().any(axis=1)]
+                training_date_count = int(train["date"].nunique())
+                if training_date_count < MINIMUM_TRAIN_DATES:
+                    fold_details.append({
+                        "validation_segment": fold_number,
+                        "test_start": str(pd.Timestamp(dates[fold_spec["test_start_index"]]).date()),
+                        "test_end": str(pd.Timestamp(dates[fold_spec["test_stop_index"] - 1]).date()),
+                        "training_samples": len(train), "validation_samples": len(test_positions),
+                        "training_dates": training_date_count, "features": len(fold_features),
+                        "feature_columns": fold_features, "threads": int(settings.TRAINING_N_JOBS),
+                        "status": "特征覆盖筛选后训练日期不足，跳过该段",
+                        "preparation_seconds": fold_prep_seconds, "fit_seconds": 0.0,
+                        "prediction_seconds": 0.0, "cache_source": "not_run",
+                    })
+                    continue
+                test_window = labelled.iloc[test_positions]
+                scorable_test = test_window[fold_features].notna().any(axis=1).to_numpy()
+                fold_test_positions = test_positions[scorable_test]
+                if not len(fold_test_positions):
+                    fold_details.append({
+                        "validation_segment": fold_number,
+                        "test_start": str(pd.Timestamp(dates[fold_spec["test_start_index"]]).date()),
+                        "test_end": str(pd.Timestamp(dates[fold_spec["test_stop_index"] - 1]).date()),
+                        "training_samples": len(train), "validation_samples": 0,
+                        "training_dates": training_date_count, "features": len(fold_features),
+                        "feature_columns": fold_features, "threads": int(settings.TRAINING_N_JOBS),
+                        "status": "验证窗口内没有可用特征值，跳过该段",
+                        "preparation_seconds": fold_prep_seconds, "fit_seconds": 0.0,
+                        "prediction_seconds": 0.0, "cache_source": "not_run",
+                    })
+                    continue
                 test_dates = pd.to_datetime(dates[fold_spec["test_start_index"]:fold_spec["test_stop_index"]])
                 test_start = pd.Timestamp(test_dates[0])
                 test_end = pd.Timestamp(test_dates[-1])
-                training_start = pd.Timestamp(train_dates.min())
-                training_end = pd.Timestamp(train_dates.max())
-                latest_training_label_end = pd.Timestamp(labelled[endpoint].iloc[train_positions].max())
+                training_start = pd.Timestamp(train["date"].min())
+                training_end = pd.Timestamp(train["date"].max())
+                latest_training_label_end = pd.Timestamp(train[endpoint].max())
                 environment = _runtime_environment()
+                fold_prepared = {**prepared, "features": fold_features}
                 cache_key = _validation_cache_key(
-                    name, horizon, candidate, window, fold_number, fold_spec, prepared,
-                    len(train_positions), len(test_positions), environment, model_parameters,
+                    name, horizon, candidate, window, fold_number, fold_spec, fold_prepared,
+                    len(train), len(fold_test_positions), environment, model_parameters,
                 ) if validation_cache is not None else None
                 cached = None
                 lookup_seconds = 0.0
@@ -790,9 +947,8 @@ def fit_panel_model(
                 if cached is not None:
                     predictions = cached["predictions"]
                 else:
-                    train = labelled.iloc[train_positions]
                     fit_started = perf_counter()
-                    model, processing = _fit(_estimator(candidate), train, candidate)
+                    model, processing = _fit(_estimator(candidate), train, candidate, fold_features)
                     fit_seconds = perf_counter() - fit_started
                     stage_seconds["native_fit"] += fit_seconds
                     if progress:
@@ -801,7 +957,7 @@ def fit_panel_model(
                             f"预测 · 已用 {perf_counter() - started:.1f} 秒"
                         )
                     prediction_started = perf_counter()
-                    test_features = labelled.loc[:, features].iloc[test_positions]
+                    test_features = labelled.loc[:, fold_features].iloc[fold_test_positions]
                     predictions = np.asarray(model.predict(test_features), dtype=float)
                     prediction_seconds = perf_counter() - prediction_started
                     stage_seconds["prediction"] += prediction_seconds
@@ -814,12 +970,12 @@ def fit_panel_model(
                         write_seconds = perf_counter() - write_started
                         stage_seconds["cache_write"] += write_seconds
                 fold = pd.DataFrame({
-                    "date": labelled["date"].to_numpy()[test_positions],
-                    "code": labelled["code"].to_numpy()[test_positions],
+                    "date": labelled["date"].to_numpy()[fold_test_positions],
+                    "code": labelled["code"].to_numpy()[fold_test_positions],
                 })
                 fold["prediction"] = predictions
-                fold["actual"] = labelled[target].to_numpy()[test_positions]
-                fold["absolute_return"] = labelled[forward_return].to_numpy()[test_positions]
+                fold["actual"] = labelled[target].to_numpy()[fold_test_positions]
+                fold["absolute_return"] = labelled[forward_return].to_numpy()[fold_test_positions]
                 fold["baseline"] = baseline
                 oos.append(fold)
                 fold_details.append({"validation_segment": fold_number,
@@ -828,8 +984,9 @@ def fit_panel_model(
                                      "training_dates": training_date_count,
                                      "latest_training_label_end": str(latest_training_label_end.date()),
                                      "test_start": str(test_start.date()), "test_end": str(test_end.date()),
-                                     "training_samples": len(train_positions), "validation_samples": len(test_positions),
-                                     "features": len(features), "threads": int(settings.TRAINING_N_JOBS),
+                                     "training_samples": len(train), "validation_samples": len(fold_test_positions),
+                                     "features": len(fold_features), "feature_columns": fold_features,
+                                     "threads": int(settings.TRAINING_N_JOBS),
                                      "fit_seconds": fit_seconds, "prediction_seconds": prediction_seconds,
                                      "preparation_seconds": fold_prep_seconds, "cache_lookup_seconds": lookup_seconds,
                                      "cache_write_seconds": write_seconds, "cache_source": cache_source,
@@ -851,11 +1008,14 @@ def fit_panel_model(
             metrics["folds"] = [
                 {key: detail[key] for key in (
                     "trained_through", "trained_from", "training_dates", "latest_training_label_end",
-                    "test_start", "test_end", "label_processing",
+                    "test_start", "test_end", "feature_columns", "label_processing",
                 )}
                 for detail in fold_details if "trained_through" in detail
             ]
-            result.update(oos_metrics=metrics, features_used=features,
+            result.update(oos_metrics=metrics, features_used=sorted({
+                              column for detail in fold_details
+                              for column in detail.get("feature_columns", [])
+                          }),
                           regression_loss=settings.REGRESSION_LOSS if candidate == "regression" else None,
                           validation_retrain_days=validation_block,
                           label_processing={"folds": [
@@ -870,16 +1030,28 @@ def fit_panel_model(
                 return result
             final_start = max(0, len(dates) - window) if window > 0 else 0
             final_mask = prepared["date_positions"] >= final_start
-            final = labelled.iloc[np.flatnonzero(final_mask)]
+            final_window = labelled.iloc[np.flatnonzero(final_mask)]
+            final_features = _select_fold_features(
+                final_window, feature_pool, prepared["required_stocks"],
+            )
+            if not final_features:
+                raise ValueError("最终训练窗口内没有达到覆盖门槛的特征")
+            final = final_window.loc[final_window[final_features].notna().any(axis=1)]
+            if final["date"].nunique() < MINIMUM_TRAIN_DATES:
+                raise ValueError("最终训练窗口特征覆盖后的有效日期不足")
+            prepared["features"] = final_features
             if progress:
                 progress(f"按交易日验证 {name} · {horizon}日 · {candidate} · 最终拟合 · 已用 {perf_counter() - started:.1f} 秒")
             final_started = perf_counter()
-            model, final_processing = _fit(_estimator(candidate), final, candidate)
+            model, final_processing = _fit(_estimator(candidate), final, candidate, final_features)
             stage_seconds["final_fit"] = perf_counter() - final_started
             result["label_processing"]["final"] = final_processing
-            importance = np.asarray(getattr(model, "feature_importances_", np.zeros(len(features))), dtype=float)
+            importance = np.asarray(
+                getattr(model, "feature_importances_", np.zeros(len(final_features))), dtype=float,
+            )
             result.update(validated=True, status="通过样本外基线、Rank IC与分组收益检验", estimator=model,
-                          feature_importance=summarize_importances(features, importance))
+                          features_used=final_features,
+                          feature_importance=summarize_importances(final_features, importance))
         except ImportError as exc:
             result["status"] = f"模型依赖缺失：{exc.name}"
         except (ValueError, RuntimeError, TypeError) as exc:
@@ -892,7 +1064,8 @@ def fit_panel_model(
         LOGGER.info(
             "按交易日验证完成 model=%s horizon=%d objective=%s validated=%s stocks=%d features=%d samples=%d "
             "threads=%d elapsed=%.2fs cache_hits=%d cache_misses=%d stages=%s",
-            name, horizon, candidate, result.get("validated"), prepared["total_stocks"], len(features), len(labelled),
+            name, horizon, candidate, result.get("validated"), prepared["total_stocks"],
+            len(prepared["features"]), len(labelled),
             settings.TRAINING_N_JOBS, result["execution"]["elapsed_seconds"],
             cache_summary["hits"], cache_summary["misses"], stage_seconds,
         )
@@ -921,14 +1094,21 @@ def predict_panel(model: dict[str, Any], panel: pd.DataFrame) -> pd.DataFrame:
     columns = ["date", "code", "prediction", "prediction_zscore", "prediction_percentile", "model_rank"]
     if not model.get("validated") or "estimator" not in model:
         return pd.DataFrame(columns=columns)
-    features = model["features_used"]
-    valid = panel.dropna(subset=features)
+    features = list(model.get("features_used") or [])
+    if not features or panel is None or panel.empty:
+        return pd.DataFrame(columns=columns)
+    values = panel.reindex(columns=features).apply(pd.to_numeric, errors="coerce")
+    values = values.replace([np.inf, -np.inf], np.nan)
+    scorable = values.notna().any(axis=1)
+    valid = panel.loc[scorable].copy()
+    values = values.loc[scorable]
     required = max(MINIMUM_STOCKS, math.ceil(panel["code"].nunique() * MINIMUM_COVERAGE))
     valid = valid.loc[valid.groupby("date")["code"].transform("nunique").ge(required)]
     if valid.empty:
         return pd.DataFrame(columns=columns)
+    values = values.loc[valid.index]
     predictions = valid[["date", "code"]].copy()
-    predictions["prediction"] = np.asarray(model["estimator"].predict(valid[features]), dtype=float)
+    predictions["prediction"] = np.asarray(model["estimator"].predict(values), dtype=float)
     return normalize_predictions(predictions).dropna(subset=["prediction_zscore"])
 
 
@@ -948,7 +1128,7 @@ def final_holdout_context_fields() -> dict[str, Any]:
         if path.exists():
             try:
                 loaded = json.loads(path.read_text(encoding="utf-8"))
-                report = loaded if isinstance(loaded, dict) and loaded.get("model_version") == settings.MODEL_VERSION else None
+                report = loaded if isinstance(loaded, dict) else None
             except (OSError, ValueError):
                 LOGGER.exception("读取最终留出集报告失败，按未评估处理")
     if not report:
@@ -957,6 +1137,16 @@ def final_holdout_context_fields() -> dict[str, Any]:
             "final_holdout_result": None,
             "final_holdout_start": settings.FINAL_HOLDOUT_START if enabled else None,
             "final_holdout_end": settings.FINAL_HOLDOUT_END if enabled else None,
+            "final_holdout_protocol_consumed": False,
+        }
+    if report.get("model_version") != settings.MODEL_VERSION:
+        return {
+            "final_holdout_evaluated": False,
+            "final_holdout_result": None,
+            "final_holdout_start": report.get("holdout_start"),
+            "final_holdout_end": report.get("holdout_end"),
+            "final_holdout_protocol_consumed": True,
+            "final_holdout_protocol_model_version": report.get("model_version"),
         }
     summary = report.get("summary") or {}
     return {
@@ -993,6 +1183,37 @@ def train_market_context(
     )
     if panel_out is not None:
         panel_out["panel"] = panel
+    if panel.empty:
+        configured_window = settings.TRAINING_WINDOW_DAYS if window is None else window
+        style_report = panel.attrs.get("style_factors") or {}
+        context = {
+            "context_id": uuid.uuid4().hex, "model_version": settings.MODEL_VERSION,
+            "target_kind": TARGET_KIND, "created_at": datetime.now().astimezone().isoformat(),
+            "reference_date": None, "universe_codes": sorted(histories), "source": metadata or {},
+            "models": {}, "predictions": {}, "reference_closes": {},
+            "objective_mode": objective or settings.DEFAULT_OBJECTIVE_MODE,
+            "training_window_days": configured_window,
+            "exposures": panel.attrs.get("exposures"),
+            "neutralization": panel.attrs.get("neutralization"),
+            "extra_factors": panel.attrs.get("extra_factors"),
+            "health_veto": panel.attrs.get("health_veto"),
+            "style_factors": style_report,
+            "model_feature_columns": panel.attrs.get("model_feature_columns", []),
+            "feature_configuration_id": style_report.get("configuration_id"),
+            "status": "风险否决后候选池为空，未训练或发布模型",
+            "limitation": "财务健康否决后无可交易截面；未产生模型预测。",
+            **final_holdout_context_fields(),
+        }
+        for horizon in HORIZONS:
+            context["models"][horizon] = [
+                unavailable_model(
+                    name, horizon, "风险否决后无可交易样本，未训练模型",
+                    objective=objective, window=configured_window,
+                )
+                for name in MODEL_NAMES
+            ]
+            context["predictions"][horizon] = {}
+        return context
     latest_date = panel["date"].max()
     live = panel.loc[panel["date"].eq(latest_date)]
     window = int(settings.TRAINING_WINDOW_DAYS if window is None else window)

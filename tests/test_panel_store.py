@@ -58,6 +58,16 @@ class PanelStoreTests(unittest.TestCase):
         self.assertEqual(self.store.history_codes(), ["600000"])
         self.assertIsNone(self.store.read_history("999999"))
 
+    def test_history_round_trip_keeps_turnover_unit(self):
+        frame = _history()
+        frame["turnover_rate"] = 0.5
+        self.store.write_history(
+            "600000", frame, meta={"source": "单元测试", "turnover_rate_unit": "percent"}
+        )
+        restored = self.store.read_history("600000")
+        self.assertEqual(restored.attrs["turnover_rate_unit"], "percent")
+        self.assertTrue((restored["turnover_rate_unit"] == "percent").all())
+
     def test_panel_round_trip_and_summary(self):
         panel = _panel()
         self.store.save_panel(panel, version="test", context_id="ctx")
@@ -130,8 +140,9 @@ class NeutralizationTests(unittest.TestCase):
         result, report = neutralize_cross_section(panel, ["momentum_5"], minimum_stocks=20)
         self.assertEqual(report["dates"], 0)
         self.assertEqual(report["skipped_dates"], 2)
+        self.assertEqual(report["thin_cross_section_dates"], 2)
         self.assertTrue(result["neutral_momentum_5"].isna().all())
-        self.assertIn("没有满足最小截面要求", report["status"])
+        self.assertIn("原始截面不足最小股票数", report["status"])
 
     def test_missing_factor_is_distinguished_from_thin_cross_section(self):
         panel = _panel(day_count=2, stock_count=21)
@@ -140,7 +151,18 @@ class NeutralizationTests(unittest.TestCase):
         _, report = neutralize_cross_section(panel, ["momentum_5", "momentum_20"])
         self.assertEqual(report["dates"], 0)
         self.assertEqual(report["factor_missing_dates"], 2)
-        self.assertIn("因子存在整体缺失", report["status"])
+        self.assertIn("因子共同样本不足", report["status"])
+
+    def test_missing_industry_is_not_misreported_as_missing_factors(self):
+        panel = _panel(day_count=1, stock_count=25)
+        panel["log_market_cap"] = np.log(panel["market_cap_float"])
+        panel["industry"] = None
+        _result, report = neutralize_cross_section(panel, ["momentum_5"])
+        self.assertEqual(report["dates"], 0)
+        self.assertEqual(report["factor_missing_dates"], 0)
+        self.assertEqual(report["industry_missing_dates"], 1)
+        self.assertEqual(report["industry_missing_rows"], 25)
+        self.assertIn("行业分类缺失", report["status"])
 
     def test_missing_exposure_column_returns_report_only(self):
         panel = _panel()

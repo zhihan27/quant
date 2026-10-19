@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from config import settings
+from services.strategy_scoring import validated_model_percentile
 from services.portfolio import summarize_positions
 
 
@@ -57,8 +58,9 @@ def ranking_snapshot(records: list[dict[str, Any]], reference_date: str | None) 
     for item in records:
         models = (item.get("analysis") or {}).get("models") or {}
         validated = [model for model in models.get(20, []) if model.get("validated")
+                     and model.get("target_kind") == "excess_return_vs_csi300"
                      and _number(model.get("prediction_percentile")) is not None]
-        score = sum(float(model["prediction_percentile"]) for model in validated) / len(validated) if validated else None
+        score = validated_model_percentile(validated)
         features = item.get("features") or {}
         quote = item.get("quote") or {}
         plan = (item.get("analysis") or {}).get("trade_plan") or {}

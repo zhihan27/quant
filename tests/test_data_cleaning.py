@@ -45,10 +45,11 @@ class CleaningTests(unittest.TestCase):
         bars.loc[5:24, "volume"] = 0.0
         cleaned, report = clean_daily_history(bars, code="600000", adjusted=True)
         self.assertTrue(cleaned.loc[10, "is_suspended"])
-        self.assertTrue(cleaned.loc[20, "is_long_suspension"])
+        self.assertFalse(cleaned.loc[23, "is_long_suspension"])
+        self.assertTrue(cleaned.loc[24, "is_long_suspension"])
         self.assertFalse(cleaned.loc[4, "is_suspended"])
         self.assertEqual(report["suspended_bars"], 20)
-        self.assertEqual(report["long_suspension_bars"], 20)
+        self.assertEqual(report["long_suspension_bars"], 1)
         self.assertEqual(report["usable_bars"], 5)
         self.assertIn("连续停牌", report["long_suspension_rule"])
         for column in FLAG_COLUMNS:
@@ -94,9 +95,17 @@ class CleaningTests(unittest.TestCase):
 
     def test_new_listing_gap_is_not_treated_as_anomaly(self):
         bars = _bars([10.0, 30.0, 33.0, 36.0, 40.0, 44.0, 48.0, 52.0])
-        cleaned, report = clean_daily_history(bars, code="300001", adjusted=True)
+        cleaned, report = clean_daily_history(
+            bars, code="300001", adjusted=True, listing_date=bars["date"].iloc[0],
+        )
         self.assertEqual(report["adjustment_gap_bars"], 0)
         self.assertTrue(cleaned.loc[1, "is_usable"])
+
+    def test_history_window_start_is_not_assumed_to_be_listing_date(self):
+        bars = _bars([10.0, 30.0, 33.0, 36.0, 40.0, 44.0, 48.0, 52.0])
+        cleaned, report = clean_daily_history(bars, code="300001", adjusted=True)
+        self.assertTrue(cleaned.loc[1, "is_adjustment_gap"])
+        self.assertEqual(report["limit_free_bars"], 0)
 
     def test_invalid_input_is_rejected(self):
         with self.assertRaises(ValueError):

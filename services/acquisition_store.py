@@ -33,7 +33,7 @@ LOGGER = logging.getLogger("quant.acquisition")
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 SNAPSHOT_ID_PATTERN = re.compile(r"^[0-9A-Za-z_-]{8,64}$")
 COMPLETED_STATUSES = ("collecting", "failed")
-STORAGE_COLUMNS = ("stored_at", "history_source", "code")
+STORAGE_COLUMNS = ("stored_at", "history_source", "turnover_rate_unit", "code")
 # 采集选项里决定同一份截面数据能否复用的字段；训练目标与窗口不参与指纹，
 # 因为同一份快照允许用不同目标/窗口重复训练。
 FINGERPRINT_FIELDS = (
@@ -231,6 +231,12 @@ def _validate_history(
     cleaned = _completed_history(frame, reference_date)
     if cleaned.empty:
         return None, "历史行情在快照截面前为空，请重新采集该股"
+    unit = frame.attrs.get("turnover_rate_unit")
+    if unit not in ("percent", "fraction") and "turnover_rate_unit" in frame:
+        units = frame["turnover_rate_unit"].dropna().astype(str).unique()
+        unit = units[0] if len(units) == 1 else None
+    if unit in ("percent", "fraction"):
+        cleaned.attrs["turnover_rate_unit"] = unit
     latest = pd.to_datetime(cleaned["date"]).max().strftime("%Y-%m-%d")
     if latest < reference_date:
         return None, f"历史行情仅到 {latest}，未覆盖快照截面日 {reference_date}"

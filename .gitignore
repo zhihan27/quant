@@ -21,3 +21,4 @@ config/database.local.json
 /.playwright-mcp/
 /xuqiu.txt
 /feature.txt
+/短线交易模块设计大纲.md

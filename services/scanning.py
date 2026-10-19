@@ -12,6 +12,7 @@ import pandas as pd
 from config import settings
 from services.market_data import MarketDataError, MarketDataService
 from services.rank_model import SCORE_KIND_RANK
+from services.strategy_scoring import validated_model_percentile
 from services.universe import filter_universe, load_reference
 
 LOGGER = logging.getLogger("quant.scanning")
@@ -108,7 +109,7 @@ def rank_candidates(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     valid_records = [item for item in records if not item.get("error")]
     if not valid_records:
         return records
-    factor_columns = ["momentum_20", "momentum_60", "trend_strength", "relative_strength_20", "volatility_20"]
+    factor_columns = ["momentum_20", "momentum_60", "trend_strength", "volatility_20"]
     for item in valid_records:
         item["rank_parts"] = {}
     dates = pd.Series({index: str(item.get("analysis", {}).get("prediction_reference_date", "未提供")) for index, item in enumerate(valid_records)})
@@ -157,13 +158,10 @@ def rank_candidates(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
             and model.get("target_kind") == "excess_return_vs_csi300"
             and model.get("prediction_percentile") is not None and np.isfinite(model["prediction_zscore"])
         ]
-        item["ranking_eligible"] = bool(validated) and item["factor_cross_section_score"] is not None
-        model_scores = [100 * model["prediction_percentile"] for model in validated]
-        item["model_score"] = float(np.mean(model_scores)) if model_scores else None
-        item["cross_section_score"] = (
-            0.4 * item["factor_cross_section_score"] + 0.6 * item["model_score"]
-            if item["ranking_eligible"] else None
-        )
+        percentile_score = validated_model_percentile(models)
+        item["ranking_eligible"] = percentile_score is not None
+        item["model_score"] = 100 * percentile_score if percentile_score is not None else None
+        item["cross_section_score"] = item["model_score"]
         if not item["ranking_eligible"]:
             item["reason"] = "模型未通过验证，仅展示因子观察结果"
     return sorted(

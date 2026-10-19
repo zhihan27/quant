@@ -24,6 +24,7 @@ def _bars(closes: np.ndarray, band: float, turnover: float = 0.5) -> pd.DataFram
     frame["amount"] = frame["close"] * frame["volume"]
     # 行情源以百分比给出换手率，0.5 即 0.5%。
     frame["turnover_rate"] = turnover
+    frame.attrs["turnover_rate_unit"] = "percent"
     frame["code"] = "600519"
     return frame
 
@@ -209,28 +210,45 @@ class NoLookaheadTests(unittest.TestCase):
 
 class TurnoverFractionTests(unittest.TestCase):
     def test_percent_scale_is_converted(self) -> None:
+        converted = turnover_fraction(pd.Series([0.5, 0.8]), unit="percent")
+        np.testing.assert_allclose(converted.to_numpy(), [0.005, 0.008])
+
+    def test_canonical_percent_scale_is_used_without_distribution_guessing(self) -> None:
+        converted = turnover_fraction(pd.Series([0.005, 0.008]), unit="percent")
+        np.testing.assert_allclose(converted.to_numpy(), [0.00005, 0.00008])
+
+    def test_appending_future_values_does_not_reinterpret_history(self) -> None:
+        history = pd.Series([1.0, 2.0, 3.0])
+        before = turnover_fraction(history, unit="percent")
+        after = turnover_fraction(
+            pd.concat([history, pd.Series([0.001, 0.002, 0.003])], ignore_index=True), unit="percent"
+        )
+        np.testing.assert_allclose(before.to_numpy(), after.iloc[:len(history)].to_numpy())
+
+    def test_unknown_unit_is_not_inferred(self) -> None:
         converted = turnover_fraction(pd.Series([0.5, 0.8]))
+        self.assertTrue(converted.isna().all())
+
+    def test_fraction_unit_requires_explicit_metadata(self) -> None:
+        converted = turnover_fraction(pd.Series([0.005, 0.008]), unit="fraction")
         np.testing.assert_allclose(converted.to_numpy(), [0.005, 0.008])
 
-    def test_fraction_scale_is_left_alone(self) -> None:
-        converted = turnover_fraction(pd.Series([0.005, 0.008]))
-        np.testing.assert_allclose(converted.to_numpy(), [0.005, 0.008])
-
-    def test_scale_split_point_is_pinned(self) -> None:
-        """0.05 是判定的分界：恰好在界上按小数处理，越界即按百分比除以 100。"""
-        at_boundary = turnover_fraction(pd.Series([0.05]))
-        past_boundary = turnover_fraction(pd.Series([0.06]))
-        self.assertAlmostEqual(float(at_boundary.iloc[0]), 0.05, places=9)
-        self.assertAlmostEqual(float(past_boundary.iloc[0]), 0.0006, places=9)
+    def test_history_without_unit_metadata_does_not_create_chip_factors(self) -> None:
+        history = _flat()
+        history.attrs.pop("turnover_rate_unit")
+        factors, distribution, report = chip_distribution(history)
+        self.assertTrue(factors[CHIP_FACTOR_COLUMNS].isna().all().all())
+        self.assertTrue(distribution.empty)
+        self.assertIn("单位未登记", report["status"])
 
     def test_values_are_clipped_into_range(self) -> None:
         """越界的换手率截断到区间端点：超过 100% 记满仓换手，负数记当日无成交。"""
-        converted = turnover_fraction(pd.Series([150.0, -1.0]))
+        converted = turnover_fraction(pd.Series([150.0, -1.0]), unit="percent")
         self.assertAlmostEqual(float(converted.iloc[0]), 1.0, places=9)
         self.assertAlmostEqual(float(converted.iloc[1]), 0.0, places=9)
 
     def test_missing_series_is_not_guessed(self) -> None:
-        converted = turnover_fraction(pd.Series([np.nan, np.nan]))
+        converted = turnover_fraction(pd.Series([np.nan, np.nan]), unit="percent")
         self.assertTrue(converted.isna().all())
 
 

@@ -171,20 +171,26 @@ def health_flag(z: pd.Series, ocf_to_profit: pd.Series) -> tuple[pd.Series, pd.S
 
 
 def compute_financial_factors(facts: pd.DataFrame) -> pd.DataFrame:
-    """逐股计算 PIT 财务因子，输出带生效日 ``available_from`` 的长表。
+    """逐股计算带数值修订可得时点的财务因子。
 
-    生效日取该行计算中实际回看窗口内最晚的公告日，确保 ASOF 对齐后每个交易日只用已公开数据。
+    生效日取该行计算中实际回看窗口内最晚的 value_available_at，不能用首次公告日
+    替代报表数值的修订可得时间。
     """
-    required = {"code", "report_period", "ann_date"}
+    required = {"code", "report_period", "ann_date", "value_available_at"}
     missing = required - set(facts.columns)
     if missing:
+        if "value_available_at" in missing:
+            raise ValueError("财务因子缺少报表数值修订可得时间，拒绝按首次公告日近似点时数据。")
         raise ValueError(f"财务因子缺少字段：{', '.join(sorted(missing))}")
     if facts.empty:
         return pd.DataFrame(columns=["code", "report_period", "available_from", *FINANCIAL_FACTOR_COLUMNS, *FLAG_COLUMNS])
     frame = facts.copy()
+    if frame["value_available_at"].isna().any():
+        raise ValueError("财务因子缺少报表数值修订可得时间，拒绝按首次公告日近似点时数据。")
     frame["code"] = frame["code"].astype(str).str.zfill(6)
     frame["report_period"] = pd.to_datetime(frame["report_period"])
     frame["ann_date"] = pd.to_datetime(frame["ann_date"])
+    frame["value_available_at"] = pd.to_datetime(frame["value_available_at"])
     frame = frame.sort_values(["code", "report_period"])
     frames = [_factors_for_code(code, group) for code, group in frame.groupby("code", sort=True)]
     combined = pd.concat(frames, ignore_index=True)
@@ -241,22 +247,22 @@ def _factors_for_code(code: str, group: pd.DataFrame) -> pd.DataFrame:
             "fundamental_altman_z": z,
             "fundamental_health_flag": flag,
             "fundamental_health_veto": veto,
-            "available_from": _available_from(indexed["ann_date"]),
+            "available_from": _available_from(indexed["value_available_at"]),
         },
         index=indexed.index,
     )
     return _assemble(code, result)
 
 
-def _available_from(ann_dates: pd.Series) -> pd.Series:
-    """回看窗口内最晚的公告日；窗口内有报告期缺公告日时该行留空，不放行未公开数据。"""
-    values = pd.to_datetime(ann_dates).to_numpy()
+def _available_from(value_dates: pd.Series) -> pd.Series:
+    """回看窗口内最晚的财务数值可得日。"""
+    values = pd.to_datetime(value_dates).to_numpy()
     result: list[Any] = []
     for position in range(len(values)):
         window = values[max(0, position - _LOOKBACK_PERIODS + 1) : position + 1]
         window = window[~pd.isna(window)]
         result.append(window.max() if window.size else pd.NaT)
-    return pd.Series(result, index=ann_dates.index, dtype="datetime64[ns]")
+    return pd.Series(result, index=value_dates.index, dtype="datetime64[ns]")
 
 
 def _assemble(code: str, result: pd.DataFrame) -> pd.DataFrame:

@@ -109,7 +109,8 @@ class ChecklistTests(unittest.TestCase):
             "code": "600001", "quote": quote, "entry_trade_status": "可正常评估",
             "features": {"date": pd.Timestamp("2026-10-16"), "close": 10,
                          "volume": 10000, "amount": 5e7, "ma20_gap": 0.05},
-            "analysis": {"models": {20: [{"validated": True, "prediction_percentile": 0.9}]}, "trade_plan": plan},
+            "analysis": {"models": {20: [{"validated": True, "target_kind": "excess_return_vs_csi300",
+                                             "prediction_percentile": 0.9}]}, "trade_plan": plan},
         }], "2026-10-16")
         result = self.run_checklist([], self.scan(rows))
         self.assertEqual(result["buy"][0]["参考价格"], 10)

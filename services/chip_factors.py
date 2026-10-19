@@ -26,32 +26,26 @@ from services.progress import throttled
 LOGGER = logging.getLogger("quant.chip")
 
 CHIP_FACTOR_COLUMNS = ["chip_cost_range_width", "chip_winner_rate"]
-# 换手率在免费行情源里以百分比给出（0.5 表示 0.5%）；低于该中位数时按小数口径处理。
-_TURNOVER_PERCENT_MEDIAN = 0.05
+# 日线适配层统一将换手率保存为百分数值（0.5 表示 0.5%）。
 
 
-def turnover_fraction(turnover_rate: Any) -> pd.Series:
-    """把换手率统一为 0~1 的比例；无法判定口径或缺失时返回缺失值，不猜测。"""
+def turnover_fraction(turnover_rate: Any, unit: str | None = None) -> pd.Series:
+    """按明确单位换算为比例；单位缺失或未知时返回缺失值，不猜测。"""
     values = pd.to_numeric(turnover_rate, errors="coerce")
-    positive = values.where(values > 0)
-    median = positive.median()
-    if pd.notna(median) and float(median) > _TURNOVER_PERCENT_MEDIAN:
+    if not isinstance(values, pd.Series):
+        values = pd.Series(values)
+    if unit == "percent":
         values = values / 100.0
+    elif unit != "fraction":
+        return pd.Series(np.nan, index=values.index, dtype=float)
     return values.clip(lower=0.0, upper=1.0)
 
 
 def _average_price(frame: pd.DataFrame) -> pd.Series:
-    """当日成交均价优先取成交额/成交量，缺失时退回高低收三价均值。"""
-    if "amount" in frame and "volume" in frame:
-        amount = pd.to_numeric(frame["amount"], errors="coerce")
-        volume = pd.to_numeric(frame["volume"], errors="coerce")
-        vwap = (amount / volume.where(volume > 0)).replace([np.inf, -np.inf], np.nan)
-    else:
-        vwap = pd.Series(np.nan, index=frame.index, dtype=float)
-    fallback = pd.concat(
+    """用高低收三价均值估算当日成本中心，避免混用不一致的成交单位和复权口径。"""
+    return pd.concat(
         [frame["high"], frame["low"], frame["close"]], axis=1
     ).mean(axis=1)
-    return vwap.where(vwap > 0, fallback)
 
 
 def _triangle_weights(centers: np.ndarray, low: float, high: float, peak: float, mass: float) -> np.ndarray:
@@ -126,6 +120,7 @@ def chip_distribution(
         raise ValueError("成本区间覆盖率必须在 0 与 1 之间。")
 
     frame = history.copy()
+    turnover_unit = history.attrs.get("turnover_rate_unit")
     frame["date"] = pd.to_datetime(frame["date"], errors="raise")
     frame = frame.sort_values("date").reset_index(drop=True)
     if frame["date"].duplicated().any():
@@ -135,7 +130,10 @@ def chip_distribution(
     closes = pd.to_numeric(frame["close"], errors="coerce").to_numpy(dtype=float)
     averages = _average_price(frame).to_numpy(dtype=float)
     usable = frame["is_usable"].astype(bool).to_numpy() if "is_usable" in frame else np.ones(len(frame), dtype=bool)
-    turnover = turnover_fraction(frame["turnover_rate"]).to_numpy(dtype=float) if "turnover_rate" in frame else np.full(len(frame), np.nan)
+    turnover = (
+        turnover_fraction(frame["turnover_rate"], turnover_unit).to_numpy(dtype=float)
+        if "turnover_rate" in frame else np.full(len(frame), np.nan)
+    )
     # 停牌与复权异常 K 线不产生新筹码，也不衰减历史筹码：当日实际无成交。
     valid = usable & np.isfinite(highs) & np.isfinite(lows) & np.isfinite(closes) & (closes > 0) & (highs >= lows)
 
@@ -179,8 +177,8 @@ def chip_distribution(
         lower_price = _quantile_price(centers, cumulative, (1 - coverage) / 2)
         upper_price = _quantile_price(centers, cumulative, 1 - (1 - coverage) / 2)
         widths[position] = (upper_price - lower_price) / day_close
-        below = int(np.searchsorted(centers, day_close, side="right"))
-        winners[position] = float(cumulative[min(below, len(centers) - 1)])
+        at_or_below = int(np.searchsorted(centers, day_close, side="right"))
+        winners[position] = float(cumulative[at_or_below - 1]) if at_or_below > 0 else 0.0
 
     result = frame[["date"]].copy()
     result["code"] = str(history["code"].iloc[0]).zfill(6) if "code" in history and len(history) else None
@@ -197,10 +195,15 @@ def chip_distribution(
         "bars": int(len(frame)),
         "accumulated_bars": int(accumulated),
         "factor_bars": int(np.isfinite(widths).sum()),
-        "turnover_source": "换手率（缺失时该日不新增筹码）" if "turnover_rate" in frame else "缺少换手率字段，未产生因子",
+        "turnover_source": (
+            f"换手率（{turnover_unit}）" if turnover_unit in ("percent", "fraction")
+            else "换手率缺少已登记单位，未新增筹码"
+        ) if "turnover_rate" in frame else "缺少换手率字段，未产生因子",
         "status": (
             f"筹码分布已计算 {int(np.isfinite(widths).sum())} 个交易日"
             if np.isfinite(widths).sum()
+            else "换手率单位未登记，未产生筹码因子"
+            if "turnover_rate" in frame and turnover_unit not in ("percent", "fraction")
             else f"有效历史不足 {minimum_bars} 个交易日，未产生筹码因子"
         ),
         "rule": f"三角加权堆积 + 换手衰减，取 {coverage:.0%} 筹码覆盖区间宽度与现价位置计算获利盘比例。",

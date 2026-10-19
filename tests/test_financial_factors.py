@@ -36,6 +36,7 @@ def _facts(code: str = "600000", ann_dates: dict[str, str] | None = None) -> pd.
                 "report_period": period,
                 "report_kind": "annual" if within_year == 4 else ("q1" if within_year == 1 else ("semi" if within_year == 2 else "q3")),
                 "ann_date": ann,
+                "value_available_at": ann,
                 "TOTAL_OPERATE_INCOME": 100.0 * within_year,
                 "DEDUCT_PARENT_NETPROFIT": 10.0 * within_year,
                 "PARENT_NETPROFIT": 12.0 * within_year,
@@ -87,6 +88,18 @@ class FactorValueTests(unittest.TestCase):
     def setUp(self) -> None:
         self.factors = compute_financial_factors(_facts())
         self.last = self.factors.iloc[-1]
+
+    def test_missing_value_revision_time_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "修订可得时间"):
+            compute_financial_factors(_facts().drop(columns=["value_available_at"]))
+
+    def test_effective_date_uses_value_revision_time(self) -> None:
+        facts = _facts()
+        revised_at = pd.Timestamp("2025-02-15")
+        facts.loc[facts["report_period"].eq(pd.Timestamp("2024-12-31")), "value_available_at"] = revised_at
+        factors = compute_financial_factors(facts)
+        final = factors.loc[factors["report_period"].eq(pd.Timestamp("2024-12-31"))].iloc[0]
+        self.assertEqual(pd.Timestamp(final["available_from"]), revised_at)
 
     def test_ttm_roe_uses_deducted_profit_and_average_equity(self) -> None:
         # 单季扣非 10 连续四季 → TTM 40；归母净资产恒为 500 → 平均 500。

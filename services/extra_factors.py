@@ -64,13 +64,22 @@ def build_extra_factors(
     if "financial" in wanted:
         facts = load_fundamental_facts(store, codes)
         if facts is None or facts.empty:
-            report["financial"] = {"status": "本地尚无 PIT 财务面板，请先建库", "rows": 0}
+            report["financial"] = {"status": "本地尚无 PIT 财务面板，也没有可验证的点时财务面板", "rows": 0}
+        elif (
+            "value_available_at" not in facts
+            or pd.to_datetime(facts["value_available_at"], errors="coerce").isna().any()
+        ):
+            report["financial"] = {
+                "status": "报表数值缺少修订可得时间，已禁用财务因子与健康否决",
+                "rows": int(len(facts)), "point_in_time_verified": False,
+            }
         else:
             factors = compute_financial_factors(facts)
             report["financial"] = {
                 "rows": int(len(factors)),
                 "codes": int(factors["code"].nunique()) if not factors.empty else 0,
-                "status": "PIT 财务因子已按公告日计算",
+                "status": "带数值修订可得时间的点时财务因子已计算",
+                "point_in_time_verified": True,
             }
             if not factors.empty:
                 collected["financial"] = factors
@@ -142,10 +151,13 @@ def apply_health_veto(panel: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]
         }
     kept = panel.loc[~vetoed].reset_index(drop=True)
     if kept.empty:
-        # 否决掉全部标的等于整条链路无数据可算，此时如实放弃否决并说明原因，不假装算出了结果。
-        return panel, {
-            "status": "财务健康否决会清空整个面板，已放弃否决以免无数据可算",
-            "rows": total, "vetoed": count, "veto_rate": 1.0, "applied": False,
+        kept.attrs = dict(panel.attrs)
+        codes = int(panel.loc[vetoed, "code"].astype(str).nunique()) if "code" in panel else 0
+        dates = int(panel.loc[vetoed, "date"].nunique()) if "date" in panel else 0
+        return kept, {
+            "status": f"财务健康否决已排除全部 {count} 行候选（{codes} 只股票、{dates} 个交易日），无可交易面板",
+            "rows": total, "vetoed": count, "veto_rate": 1.0,
+            "codes": codes, "dates": dates, "applied": True,
         }
     kept.attrs = dict(panel.attrs)
     codes = int(panel.loc[vetoed, "code"].astype(str).nunique()) if "code" in panel else 0

@@ -62,6 +62,7 @@ def clean_daily_history(
     is_st: bool = False,
     adjusted: bool = False,
     long_suspension_days: int | None = None,
+    listing_date: Any = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """标注停牌、一字涨跌停与前复权异常跳空，返回清洗后的行情及可追溯报告。
 
@@ -87,20 +88,28 @@ def clean_daily_history(
     # 停牌：无成交量或缺失价格；停牌当日仍保留用于持仓估值。
     suspended = frame["volume"].isna() | frame["volume"].le(0) | frame[["open", "high", "low", "close"]].isna().any(axis=1)
 
+    if listing_date is None and "listing_date" in frame:
+        listed = pd.to_datetime(frame["listing_date"], errors="coerce").dropna()
+        listing_date = listed.iloc[0] if not listed.empty else None
+    listing_stamp = pd.to_datetime(listing_date, errors="coerce") if listing_date is not None else pd.NaT
+    limit_free = pd.Series(False, index=frame.index)
+    if pd.notna(listing_stamp):
+        listing_sessions = frame.loc[frame["date"].ge(listing_stamp), "date"].head(5)
+        limit_free = frame["date"].isin(listing_sessions)
+
     # 一字板：全天无价格振幅且已触及涨跌停，属于流动性锁定状态，不能假设成交。
     amplitude = frame["high"] - frame["low"]
     flat = amplitude.le(np.maximum(0.01, frame["close"].abs() * 0.001))
-    locked_up = flat & returns.ge(limits * 0.98) & previous_close.gt(0)
-    locked_down = flat & returns.le(-limits * 0.98) & previous_close.gt(0)
+    locked_up = flat & returns.ge(limits * 0.98) & previous_close.gt(0) & ~limit_free
+    locked_down = flat & returns.le(-limits * 0.98) & previous_close.gt(0) & ~limit_free
 
     suspension_days = int(long_suspension_days if long_suspension_days is not None else settings.LONG_SUSPENSION_DAYS)
     runs = (suspended != suspended.shift()).cumsum()
-    run_length = suspended.groupby(runs).transform("size")
+    run_length = suspended.groupby(runs).cumsum()
     long_suspension = suspended & run_length.ge(suspension_days)
 
     # 前复权序列不应出现超过涨跌幅制度的价格跳空；出现即视为复权口径不一致或源数据异常。
-    # 新股上市前 5 个交易日与恢复上市无涨跌幅限制，无法用该规则判断，明确跳过。
-    limit_free = pd.Series(frame.index < 6, index=frame.index)
+    # 仅在真实上市日期可用时豁免上市前五个交易日，不能把行情窗口起点误当上市日。
     gap = returns.abs().gt(limits * settings.ADJUSTMENT_GAP_TOLERANCE + 0.01)
     adjustment_gap = gap & previous_close.gt(0) & ~suspended & ~limit_free
     if not adjusted:
@@ -125,8 +134,9 @@ def clean_daily_history(
         "locked_up_bars": int(frame["is_locked_up"].sum()),
         "locked_down_bars": int(frame["is_locked_down"].sum()),
         "adjustment_gap_bars": int(frame["is_adjustment_gap"].sum()),
+        "limit_free_bars": int(limit_free.sum()),
         "usable_bars": int(frame["is_usable"].sum()),
-        "gap_rule": "跨日涨跌幅超过该板块上限的 1.2 倍并超过 1%，按复权口径异常处理；上市前 6 根 K 线不参与判定",
+        "gap_rule": "跨日涨跌幅超过该板块上限的 1.2 倍并超过 1%，按复权口径异常处理；仅对已知上市日期后的前 5 个交易日豁免",
         "long_suspension_rule": f"连续停牌达到 {suspension_days} 个交易日即标记，长期停牌股票不进入当日截面",
     }
     return frame, report

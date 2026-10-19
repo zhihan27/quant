@@ -9,6 +9,7 @@ from config import settings
 from services.data_cleaning import open_price_fillable
 from services.feature_engineering import FEATURE_COLUMNS
 from services.ml_pipeline import build_market_panel
+from services.ml_pipeline import fuse_normalized_predictions
 from services.portfolio_backtest import (
     _price_matrices, portfolio_weights, prepare_price_panel, run_portfolio_backtest,
     run_portfolio_strategy, trim_universe,
@@ -169,6 +170,48 @@ class PortfolioExecutionTests(unittest.TestCase):
         self.assertLess(final["equity"], final["gross_equity"])
         self.assertGreater(result["metrics"]["gross_return"], result["metrics"]["total_return"])
 
+    def test_existing_position_is_rebalanced_to_target_weight(self):
+        bars = _bars(days=5, codes=("600000",))
+        dates = sorted(bars["date"].unique())
+        # 买入后收盘翻倍，下一次开盘应卖出超出 5% 目标的部分。
+        jump = bars["date"].eq(dates[1]) & bars["code"].eq("600000")
+        bars.loc[jump, ["close", "high"]] = [20.0, 20.4]
+        later = bars["date"].gt(dates[1]) & bars["code"].eq("600000")
+        bars.loc[later, ["open", "close", "high", "low", "previous_close"]] = [
+            20.0, 20.0, 20.4, 19.6, 20.0,
+        ]
+        weights = _weights({date: {"600000": 0.05} for date in dates})
+        result = run_portfolio_backtest(bars, weights)
+        rebalance = [trade for trade in result["trades"] if trade["exit_reason"] == "目标权重再平衡"]
+        self.assertTrue(rebalance)
+        self.assertTrue(all(trade["partial_exit"] for trade in rebalance))
+        day_two = result["daily_equity"][2]
+        self.assertAlmostEqual(day_two["position_value"] / day_two["equity"], 0.05, delta=0.001)
+
+    def test_cash_limited_orders_are_partial_and_never_borrow(self):
+        bars = _bars(days=5)
+        dates = sorted(bars["date"].unique())
+        weights = _weights({dates[0]: {"600000": 0.8, "600001": 0.8}})
+        result = run_portfolio_backtest(bars, weights)
+        self.assertGreater(result["partial_buys"], 0)
+        self.assertTrue(all(day["cash"] >= -1e-12 for day in result["daily_equity"]))
+
+    def test_model_fusion_uses_union_and_available_scores(self):
+        date = pd.Timestamp("2024-01-02")
+        frames = {
+            "A": pd.DataFrame({"date": [date, date, date], "code": ["a", "b", "c"],
+                                 "prediction_percentile": [0.0, 0.5, 1.0]}),
+            "B": pd.DataFrame({"date": [date, date, date], "code": ["b", "c", "d"],
+                                 "prediction_percentile": [0.2, 0.8, 1.0]}),
+        }
+        fused = fuse_normalized_predictions(frames, ("A", "B"))
+        self.assertEqual(set(fused["code"]), {"a", "b", "c", "d"})
+        scores = fused.set_index("code")["score"]
+        self.assertEqual(scores["a"], 0.0)
+        self.assertEqual(scores["b"], 0.35)
+        self.assertEqual(scores["c"], 0.9)
+        self.assertEqual(scores["d"], 1.0)
+
     def test_exit_records_round_trip_cost(self):
         bars = _bars(days=8)
         dates = sorted(bars["date"].unique())
@@ -235,6 +278,10 @@ class PricePanelTests(unittest.TestCase):
         self.assertEqual(len(kept), 2)
         self.assertEqual(report["trimmed"], 2)
         self.assertEqual(sorted(kept), ["600002", "600003"])
+        histories["600000"].loc[3:, "volume"] = 1_000_000.0
+        kept_as_of, point_in_time = trim_universe(histories, limit=1, as_of_date=dates[2])
+        self.assertEqual(sorted(kept_as_of), ["600003"])
+        self.assertEqual(point_in_time["selection_as_of"], str(dates[2].date()))
         _, untouched = trim_universe(histories, limit=10)
         self.assertEqual(untouched["trimmed"], 0)
         self.assertEqual(untouched["kept"], 4)
@@ -259,7 +306,8 @@ def _strategy_inputs(stocks=40, days=620, signal=True):
             "date": dates, "open": close, "high": close * 1.01, "low": close * 0.99, "close": close,
             "volume": volume, "amount": volume * close, "turnover_rate": 1.0 + stock * 0.1,
         })
-    benchmark = pd.DataFrame({"date": dates, "close": 3000.0 * np.cumprod(1 + 0.0006 + 0.003 * np.sin(np.arange(days) * 0.7))})
+    benchmark_close = 3000.0 * np.cumprod(1 + 0.0006 + 0.003 * np.sin(np.arange(days) * 0.7))
+    benchmark = pd.DataFrame({"date": dates, "open": benchmark_close, "close": benchmark_close})
     return histories, benchmark
 
 

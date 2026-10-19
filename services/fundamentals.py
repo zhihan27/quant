@@ -517,7 +517,7 @@ def build_fundamental_panel(
     refresh: bool = False,
     client: FundamentalDataClient | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """构建并落盘 PIT 财务面板，返回长表与覆盖报告。
+    """构建并落盘财务报表面板，返回长表与点时可用性报告。
 
     已存在分区且未要求刷新的股票会被跳过，重复运行只补增量，避免每次都全量重拉。
     """
@@ -525,11 +525,17 @@ def build_fundamental_panel(
     pending = codes if refresh else [code for code in codes if store.read_partition(PARTITION_NAME, code) is None]
     if not pending:
         existing = load_fundamental_facts(store, codes)
-        return (existing if existing is not None else pd.DataFrame()), {
-            "status": f"本地已有 {len(codes)} 只股票的财务面板，未重新拉取",
+        existing = existing if existing is not None else pd.DataFrame()
+        verified = _point_in_time_verified(existing)
+        return existing, {
+            "status": (
+                f"本地已有 {len(codes)} 只股票的点时财务面板，未重新拉取"
+                if verified else f"本地已有 {len(codes)} 只股票的财务报表面板，但数值修订时点未验证"
+            ),
             "codes_requested": len(codes),
             "codes_built": 0,
             "periods": len(periods),
+            "point_in_time_verified": verified,
         }
     if progress:
         progress(f"正在获取 {len(pending)} 只股票的公告日历与报表数值")
@@ -544,6 +550,7 @@ def build_fundamental_panel(
     combined = load_fundamental_facts(store, codes)
     if combined is None:
         combined = pd.DataFrame()
+    verified = _point_in_time_verified(combined)
     report = {
         "codes_requested": len(codes),
         "codes_built": len(written),
@@ -553,13 +560,20 @@ def build_fundamental_panel(
         "values": values_report,
         "announcement_lag_days": announcement_lag_summary(merged),
         "status": (
-            f"PIT 财务面板已落盘 {len(written)} 只股票、{len(periods)} 个报告期"
+            f"点时财务面板已落盘 {len(written)} 只股票、{len(periods)} 个报告期"
+            if written and verified
+            else f"财务报表面板已落盘 {len(written)} 只股票，但报表数值修订时点未验证"
             if written
             else "未取得可用的公告日与报表数值配对，未生成财务面板"
         ),
+        "point_in_time_verified": verified,
         "limitation": (
             "公告日取巨潮资讯首次披露时间；东财 NOTICE_DATE 在历史区间存在系统性错位，故未采用。"
-            "仅有同时取得公告日与报表数值的 (代码, 报告期) 会被保留，缺一即视为不可用。"
+            "仅有同时取得公告日与报表数值的 (代码, 报告期) 会被保留。"
+            + (
+                "已按每条报表数值的修订可得时间计算生效日。"
+                if verified else "当前数值接口不提供修订可得时间，现有数据不能验证为真正的点时财务值。"
+            )
         ),
     }
     return combined, report
@@ -680,10 +694,23 @@ def fundamental_panel_summary(store: PanelStore) -> dict[str, Any]:
     facts = load_fundamental_facts(store)
     if facts is None or facts.empty:
         return {"codes": len(codes), "rows": 0, "status": "尚未构建 PIT 财务面板"}
+    verified = _point_in_time_verified(facts)
     return {
         "codes": len(codes),
         "rows": int(len(facts)),
         "first_period": str(pd.to_datetime(facts["report_period"]).min().date()),
         "last_period": str(pd.to_datetime(facts["report_period"]).max().date()),
-        "status": f"本地 PIT 财务面板覆盖 {len(codes)} 只股票、{len(facts)} 条报告期记录",
+        "status": (
+            f"本地点时财务面板覆盖 {len(codes)} 只股票、{len(facts)} 条报告期记录"
+            if verified else f"本地财务报表面板覆盖 {len(codes)} 只股票、{len(facts)} 条记录；修订时点未验证"
+        ),
+        "point_in_time_verified": verified,
     }
+
+
+def _point_in_time_verified(facts: pd.DataFrame) -> bool:
+    """只有每条报表值都有明确修订可得时点，才把财务面板标记为点时数据。"""
+    if facts is None or facts.empty or "value_available_at" not in facts:
+        return False
+    available_at = pd.to_datetime(facts["value_available_at"], errors="coerce")
+    return bool(available_at.notna().all())

@@ -53,15 +53,16 @@ from config import settings
 from services import alerting, drift_monitor, model_monitor
 from services.backtest import cost_rates
 from services.database import DatabaseError, QuantRepository
-from services.ml_pipeline import HORIZONS, MODEL_NAMES, evaluate_oos, fit_panel_model, load_context
+from services.ml_pipeline import (
+    HORIZONS, MINIMUM_COVERAGE, MINIMUM_STOCKS, MODEL_NAMES, SCORE_KIND_RANK, evaluate_oos, fit_panel_model,
+    fuse_normalized_predictions, load_context, normalize_predictions,
+)
 from services.model_monitor import finite_or_none
 
 LOGGER = logging.getLogger("quant.model_governance")
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 
-# 留出集里 Top 组合的取法，与 evaluate_oos 内部逐日取「前 1/5」完全一致。
-# 两处口径必须相同，否则「留出集 Rank IC」与「留出集换手率」描述的会是两个不同的组合。
-TOP_FRACTION_DIVISOR = 5
+# 留出集换手率与生产组合共用固定 Top N 口径。
 # 换手率与费用后收益只在主周期上出：它是「非重叠持仓期」的指标，
 # 5 日与 60 日各出一份只是噪音，而且 60 日在留出集里凑不出几个完整持仓期。
 TURNOVER_HORIZON = 20
@@ -121,14 +122,16 @@ def training_baseline(
     return baseline
 
 
-def _top_members(group: pd.DataFrame) -> set[str]:
+def _top_members(group: pd.DataFrame, top_n: int) -> set[str]:
     ordered = group.sort_values("prediction", kind="stable")
-    size = max(1, len(ordered) // TOP_FRACTION_DIVISOR)
+    size = min(int(top_n), len(ordered))
+    if size <= 0:
+        return set()
     return set(ordered.tail(size)["code"].astype(str))
 
 
 def portfolio_turnover(
-    evaluation: pd.DataFrame, horizon: int = TURNOVER_HORIZON,
+    evaluation: pd.DataFrame, horizon: int = TURNOVER_HORIZON, top_n: int | None = None,
 ) -> dict[str, Any]:
     """留出集上 Top 组合的换手率与费用后收益。纯函数。
 
@@ -145,19 +148,22 @@ def portfolio_turnover(
     """
     if evaluation is None or evaluation.empty:
         return {"status": "留出集没有可用样本，未计算换手率与费用后收益", "periods": 0}
+    top_n = int(settings.PORTFOLIO_TOP_N if top_n is None else top_n)
+    if top_n < 1:
+        raise ValueError("留出集 Top N 必须为正整数。")
     buy_cost, sell_cost = cost_rates()
     frame = evaluation.copy()
     frame["date"] = pd.to_datetime(frame["date"])
     dates = sorted(frame["date"].unique())
     # 按持仓期采样，并丢掉最后一个不完整持仓期：它的前向收益本来就不该被当成已实现。
-    sampled = dates[:: int(horizon)]
+    sampled = [dates[index] for index in range(0, max(0, len(dates) - int(horizon)), int(horizon))]
     per_period: list[dict[str, Any]] = []
     previous: set[str] | None = None
     for date in sampled:
         group = frame.loc[frame["date"].eq(date)]
         if group.empty:
             continue
-        members = _top_members(group)
+        members = _top_members(group, top_n)
         if not members:
             continue
         turnover = 0.0 if previous is None else len(members - previous) / len(members)
@@ -183,7 +189,7 @@ def portfolio_turnover(
         "status": "已计算",
         "horizon": int(horizon),
         "periods": len(per_period),
-        "top_fraction": f"截面预测前 1/{TOP_FRACTION_DIVISOR}",
+        "top_n": top_n,
         "average_turnover": average_turnover,
         "annualized_turnover": average_turnover * 252.0 / float(horizon),
         "gross_excess_return": gross,
@@ -227,57 +233,118 @@ def build_holdout_evaluation(
     for horizon in HORIZONS:
         target, endpoint = f"target_{horizon}", f"label_end_{horizon}"
         line = {"horizon": horizon, "usable": False, "status": "", "metrics": None,
-                "training": None, "train_baseline": None}
+                "training": None, "train_baseline": None, "model_results": {}}
         if target not in frame.columns:
-            line["status"] = f"面板中没有 {target} 列，该周期无法评估"
+            reason = f"面板中没有 {target} 列，该周期无法评估"
+            line["status"] = reason
+            for model_name in MODEL_NAMES:
+                line["model_results"][model_name] = {
+                    "model": model_name, "usable": False, "status": reason, "metrics": None,
+                    "training": None, "train_baseline": None,
+                }
+            line["ensemble"] = {
+                "usable": False, "status": reason, "metrics": None,
+            }
             results[str(horizon)] = line
             continue
-        if progress:
-            progress(f"正在训练 {horizon} 日冻结模型（只用留出集之前的数据）")
-        frozen = fit_panel_model(frame, MODEL_NAMES[0], horizon, objective=objective, window=window, cutoff=start)
-        if not frozen.get("validated") or "estimator" not in frozen:
-            line["status"] = f"冻结模型未通过训练期验证，留出集评估未进行：{frozen.get('status')}"
-            results[str(horizon)] = line
-            continue
-        features = list(frozen["features_used"])
-        baseline = training_baseline(frame, start, target, endpoint, features=features, window=window)
-        subset = holdout.dropna(subset=[*features, target])
-        if settings.FINAL_HOLDOUT_END:
-            # 设了终点时，标签也必须落在终点之内，否则「留出集」会把终点之后的行情算进来。
-            subset = subset.loc[subset[endpoint] <= end]
-        if subset.empty or subset["date"].nunique() < 2:
-            line["status"] = "留出集内可用样本不足，无法评估"
-            results[str(horizon)] = line
-            continue
-        evaluation = subset[["date", "code"]].copy()
-        evaluation["prediction"] = np.asarray(frozen["estimator"].predict(subset[features]), dtype=float)
-        evaluation["actual"] = subset[target].to_numpy()
-        evaluation["absolute_return"] = subset[f"forward_return_{horizon}"].to_numpy()
-        evaluation["baseline"] = baseline
-        evaluations[str(horizon)] = evaluation
-        metrics = evaluate_oos(
-            evaluation, horizon, total_stocks=int(subset["code"].nunique()), score_kind=frozen["score_kind"],
+        evaluation_by_model: dict[str, pd.DataFrame] = {}
+        normalized_by_model: dict[str, pd.DataFrame] = {}
+        for model_name in MODEL_NAMES:
+            if progress:
+                progress(f"正在训练 {horizon} 日 {model_name} 冻结模型（只用留出集之前的数据）")
+            frozen = fit_panel_model(frame, model_name, horizon, objective=objective, window=window, cutoff=start)
+            model_line = {"model": model_name, "usable": False, "status": "", "metrics": None,
+                          "training": None, "train_baseline": None}
+            if not frozen.get("validated") or "estimator" not in frozen:
+                model_line["status"] = f"冻结模型未通过训练期验证，留出集评估未进行：{frozen.get('status')}"
+                line["model_results"][model_name] = model_line
+                continue
+            features = list(frozen["features_used"])
+            baseline = training_baseline(frame, start, target, endpoint, features=features, window=window)
+            subset = holdout.dropna(subset=[*features, target])
+            if settings.FINAL_HOLDOUT_END:
+                # 设了终点时，标签也必须落在终点之内，否则「留出集」会把终点之后的行情算进来。
+                subset = subset.loc[subset[endpoint] <= end]
+            required = max(MINIMUM_STOCKS, int(np.ceil(holdout["code"].nunique() * MINIMUM_COVERAGE)))
+            enough_coverage = subset.groupby("date")["code"].transform("nunique").ge(required)
+            subset = subset.loc[enough_coverage]
+            if subset.empty or subset["date"].nunique() < 2:
+                model_line["status"] = "留出集内可用样本不足，无法评估"
+                line["model_results"][model_name] = model_line
+                continue
+            evaluation = subset[["date", "code"]].copy()
+            evaluation["prediction"] = np.asarray(frozen["estimator"].predict(subset[features]), dtype=float)
+            evaluation["actual"] = subset[target].to_numpy()
+            evaluation["absolute_return"] = subset[f"forward_return_{horizon}"].to_numpy()
+            evaluation["baseline"] = baseline
+            evaluation_by_model[model_name] = evaluation
+            normalized_by_model[model_name] = normalize_predictions(
+                evaluation[["date", "code", "prediction"]]
+            ).dropna(subset=["prediction_zscore"])
+            metrics = evaluate_oos(
+                evaluation, horizon, total_stocks=int(subset["code"].nunique()), score_kind=frozen["score_kind"],
+            )
+            folds = (frozen.get("oos_metrics") or {}).get("folds") or []
+            available_dates = int(frozen.get("training_dates") or 0)
+            model_line.update(
+                usable=True,
+                status=frozen.get("status"),
+                # 逐日明细必须留在这里：报告使用 allow_nan=False 落盘，因此只保留汇总指标。
+                metrics={key: value for key, value in metrics.items() if key != "daily_groups"},
+                train_baseline=baseline,
+                training={
+                    "available_dates": available_dates,
+                    "window_days": window,
+                    "window_sufficient": bool(window <= 0 or available_dates >= window),
+                    "first_fold_from": folds[0].get("trained_from") if folds else None,
+                    "last_fold_through": folds[-1].get("trained_through") if folds else None,
+                },
+            )
+            line["model_results"][model_name] = model_line
+        ensemble = {"usable": False, "status": "并非所有配置模型均有可用留出预测", "metrics": None}
+        fused = fuse_normalized_predictions(normalized_by_model, MODEL_NAMES)
+        if not fused.empty:
+            truth = pd.concat(
+                [
+                    evaluation[["date", "code", "actual", "absolute_return", "baseline"]]
+                    for evaluation in evaluation_by_model.values()
+                ],
+                ignore_index=True,
+            ).drop_duplicates(["date", "code"], keep="first")
+            ensemble_evaluation = truth.merge(fused[["date", "code", "score"]],
+                                              on=["date", "code"], how="inner", validate="one_to_one")
+            ensemble_evaluation["prediction"] = ensemble_evaluation["score"]
+            score_models = [name for name in MODEL_NAMES if name in normalized_by_model]
+            ensemble_metrics = evaluate_oos(
+                ensemble_evaluation, horizon, total_stocks=int(ensemble_evaluation["code"].nunique()),
+                score_kind=SCORE_KIND_RANK,
+            )
+            ensemble.update(
+                usable=True,
+                status="按生产选股口径外连接可用模型的逐日百分位并取均值",
+                model_names=score_models,
+                metrics={key: value for key, value in ensemble_metrics.items() if key != "daily_groups"},
+            )
+            evaluations[str(horizon)] = ensemble_evaluation
+        line["ensemble"] = ensemble
+        summary_model = next(
+            (name for name in MODEL_NAMES if line["model_results"].get(name, {}).get("usable")), None
         )
-        folds = (frozen.get("oos_metrics") or {}).get("folds") or []
-        available_dates = int(frozen.get("training_dates") or 0)
-        line.update(
-            usable=True,
-            status=frozen.get("status"),
-            # 逐日明细必须留在这里：报告会用 allow_nan=False 落盘，逐日行里任何一个非有限值
-            # 都会让整份报告写不出去，而它除了本函数内的换手率（走 evaluations 的 DataFrame，
-            # 不读这里）没有别的读者。落在 horizons 里还会让每次评估的 JSON 白白大一截。
-            metrics={key: value for key, value in metrics.items() if key != "daily_groups"},
-            train_baseline=baseline,
-            training={
-                "available_dates": available_dates,
-                "window_days": window,
-                # 如实写明窗口够不够。逐股历史按 count=1200 根日线采集，
-                # 留出集起点越早，留出集之前的可训练历史越短，很可能凑不满配置的窗口。
-                "window_sufficient": bool(window <= 0 or available_dates >= window),
-                "first_fold_from": folds[0].get("trained_from") if folds else None,
-                "last_fold_through": folds[-1].get("trained_through") if folds else None,
-            },
-        )
+        if summary_model is not None:
+            summary = line["model_results"][summary_model]
+            line.update(
+                usable=True, status=summary["status"], metrics=summary["metrics"],
+                training=summary["training"], train_baseline=summary["train_baseline"],
+                summary_model=summary_model,
+            )
+            if not ensemble["usable"]:
+                evaluations[str(horizon)] = evaluation_by_model[summary_model]
+        else:
+            reasons = [
+                f"{name}：{result['status']}"
+                for name, result in line["model_results"].items()
+            ]
+            line["status"] = "；".join(reasons) or "所有冻结模型均未生成可用留出评估"
         results[str(horizon)] = line
 
     usable = {key: value for key, value in results.items() if value["usable"]}
@@ -289,9 +356,25 @@ def build_holdout_evaluation(
         turnover = portfolio_turnover(evaluations[str(TURNOVER_HORIZON)], TURNOVER_HORIZON)
     else:
         turnover = {"status": f"留出集内 {TURNOVER_HORIZON} 日周期不可用，未计算换手率与费用后收益"}
-    passed = all(bool(value["metrics"].get("validated")) for value in usable.values())
-    worst = next((key for key, value in sorted(usable.items(), key=lambda item: int(item[0]))
-                  if not value["metrics"].get("validated")), None)
+    model_checks = [
+        (key, name, model_result)
+        for key, value in sorted(results.items(), key=lambda item: int(item[0]))
+        for name, model_result in value["model_results"].items()
+    ]
+    ensemble_checks = [
+        (key, "ensemble", value["ensemble"])
+        for key, value in sorted(results.items(), key=lambda item: int(item[0]))
+        if "ensemble" in value
+    ]
+    all_checks = sorted(model_checks + ensemble_checks, key=lambda item: (int(item[0]), item[1]))
+    passed = bool(all_checks) and all(
+        bool(model_result["usable"] and model_result["metrics"].get("validated"))
+        for _, _, model_result in all_checks
+    )
+    failed = next((item for item in all_checks
+                   if not item[2]["usable"] or not item[2]["metrics"].get("validated")), None)
+    worst = failed[0] if failed else None
+    failed_model = failed[1] if failed else None
     return {
         "model_version": (context or {}).get("model_version") or settings.MODEL_VERSION,
         "context_id": (context or {}).get("context_id"),
@@ -303,13 +386,30 @@ def build_holdout_evaluation(
         "training_window_days": window,
         "passed": bool(passed),
         "failed_horizon": worst,
+        "failed_model": failed_model,
+        "models": list(MODEL_NAMES),
         "horizons": results,
         "turnover": turnover,
         "summary": finite_or_none({
             "holdout_dates": holdout_dates,
             "passed": bool(passed),
             "failed_horizon": worst,
+            "failed_model": failed_model,
             "rank_ic": {key: value["metrics"].get("rank_ic") for key, value in usable.items()},
+            "model_rank_ic": {
+                name: {
+                    key: model_result["metrics"].get("rank_ic") if model_result["usable"] else None
+                    for key, value in results.items()
+                    for model_result in [value["model_results"].get(name, {})]
+                    if model_result
+                }
+                for name in MODEL_NAMES
+            },
+            "ensemble_rank_ic": {
+                key: value["ensemble"]["metrics"].get("rank_ic") if value["ensemble"]["usable"] else None
+                for key, value in results.items()
+                if "ensemble" in value
+            },
             "ndcg_ratio": {key: value["metrics"].get("ndcg_ratio") for key, value in usable.items()},
             "top_excess_return": {key: value["metrics"].get("top_excess_return") for key, value in usable.items()},
             "after_cost_return": turnover.get("after_cost_return"),
@@ -322,9 +422,10 @@ def build_holdout_evaluation(
         "notes": [
             "留出集为「评估专用」：冻结模型只用留出集之前的数据训练，日常生产模型按滚动窗口使用全量历史，"
             "因此本报告衡量的是建模流程，不是今天线上那个模型。",
+            "逐一报告配置内各模型；留出集报告本身不能证明研发人员此前未查看该区间或未据此选择方案。",
             "换手率与费用后收益按每 20 个交易日采样的非重叠持仓期计算，单边换手口径为成员变更比例；"
             "费率与回测、组合回测同源（services/backtest.py::cost_rates）。",
-            "本报告未使用任何留出集数据做过调参、超参搜索或因子选择。",
+            "冻结模型训练不使用留出区间；本报告无法证明函数外的研发活动未查看或使用该区间。",
         ],
     }
 
@@ -367,24 +468,14 @@ def evaluate_final_holdout(
 ) -> dict[str, Any]:
     """在所有模型冻结后运行一次的最终留出集评估。
 
-    防重复评估的真正闸门是 ``quant_model_final_holdout`` 上的 ``UNIQUE(model_version)``：
-    两个管理员同时点也只有一个能成功，应用层的判断只是为了不白跑一遍训练。
-
-    ``force=True`` 走 UPDATE 覆盖，并写一条治理审计——强制重评属于管理员操作，
-    必须留下是谁、什么时候做的。
+    固定留出期按起点加数据库事务级 advisory lock 实现一次性评估，跨模型版本也不允许重跑。
+    force 参数为兼容旧入口保留，但不能覆盖已经查看过的最终留出集。
     """
     if not settings.ENABLE_FINAL_HOLDOUT:
         raise FinalHoldoutError(
             "最终留出集未启用（settings.ENABLE_FINAL_HOLDOUT 为 False），拒绝评估。"
         )
     version = model_version or settings.MODEL_VERSION
-    existing = final_holdout_record(repository, version)
-    if existing and not force:
-        raise FinalHoldoutError(
-            f"模型版本 {version} 已于 {existing['evaluated_at']:%Y-%m-%d %H:%M} 完成最终留出集评估"
-            f"（通过={existing['passed']}）。留出集只允许评估一次，"
-            "确需重评请使用 --force 并在页面上确认。"
-        )
     if context is None or panel is None:
         loaded_context, loaded_panel = load_context(include_panel=True)
         if not loaded_context or loaded_panel is None or loaded_panel.empty:
@@ -396,40 +487,54 @@ def evaluate_final_holdout(
             f"当前模型上下文的版本是 {context.get('model_version')}，与请求评估的 {version} 不一致。"
         )
 
-    report = build_holdout_evaluation(panel, context, progress=progress)
-    report["operator"] = operator or ""
-    report["forced"] = bool(force and existing)
-    payload = finite_or_none(report)
     from psycopg.types.json import Jsonb
 
     with repository.connect() as connection:
-        if existing and force:
-            connection.execute(
-                "UPDATE public.quant_model_final_holdout SET context_id=%s, holdout_start=%s, holdout_end=%s, "
-                "evaluated_at=now(), operator=%s, forced=TRUE, passed=%s, metrics=%s, report_path=%s "
-                "WHERE model_version=%s",
-                (report["context_id"], report["holdout_start"], report["holdout_end"], operator or "",
-                 bool(report["passed"]), Jsonb(payload), str(_report_path()), version),
-            )
-        else:
-            row = connection.execute(
-                "INSERT INTO public.quant_model_final_holdout"
-                "(model_version,context_id,holdout_start,holdout_end,operator,forced,passed,metrics,report_path) "
-                "VALUES (%s,%s,%s,%s,%s,FALSE,%s,%s,%s) ON CONFLICT (model_version) DO NOTHING RETURNING id",
-                (version, report["context_id"], report["holdout_start"], report["holdout_end"],
-                 operator or "", bool(report["passed"]), Jsonb(payload), str(_report_path())),
-            ).fetchone()
-            if row is None:
+        connection.execute("SELECT pg_advisory_xact_lock(76625018433586)")
+        start = pd.Timestamp(settings.FINAL_HOLDOUT_START).date()
+        report_path = _report_path()
+        if report_path.exists():
+            try:
+                prior_report = json.loads(report_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
                 raise FinalHoldoutError(
-                    f"模型版本 {version} 的留出集评估记录已被另一个进程写入，本次结果未保存。"
+                    "最终留出集报告文件存在但无法验证；为避免重复查看留出集，拒绝重评。"
+                ) from exc
+            if not isinstance(prior_report, dict):
+                raise FinalHoldoutError("最终留出集报告格式异常，拒绝重评。")
+            if prior_report.get("holdout_start") == str(start):
+                raise FinalHoldoutError(
+                    f"最终留出集起点 {start} 已有报告文件记录；即使数据库记录缺失也不能重评。"
                 )
+        existing = connection.execute(
+            "SELECT * FROM public.quant_model_final_holdout WHERE holdout_start=%s "
+            "ORDER BY evaluated_at LIMIT 1",
+            (start,),
+        ).fetchone()
+        if existing:
+            raise FinalHoldoutError(
+                f"最终留出集起点 {start} 已由模型版本 {existing['model_version']} 评估。"
+                "为避免反复查看同一留出集，--force 也不能重评或覆盖。"
+            )
+        report = build_holdout_evaluation(panel, context, progress=progress)
+        report["operator"] = operator or ""
+        report["forced"] = False
+        payload = finite_or_none(report)
+        row = connection.execute(
+            "INSERT INTO public.quant_model_final_holdout"
+            "(model_version,context_id,holdout_start,holdout_end,operator,forced,passed,metrics,report_path) "
+            "VALUES (%s,%s,%s,%s,%s,FALSE,%s,%s,%s) ON CONFLICT (model_version) DO NOTHING RETURNING id",
+            (version, report["context_id"], report["holdout_start"], report["holdout_end"],
+             operator or "", bool(report["passed"]), Jsonb(payload), str(_report_path())),
+        ).fetchone()
+        if row is None:
+            raise FinalHoldoutError(f"模型版本 {version} 已存在留出集记录，本次结果未保存。")
     _write_report(payload)
     log_governance_event(
-        repository, "强制重新评估最终留出集" if (existing and force) else "最终留出集评估",
+        repository, "最终留出集评估",
         operator=operator, model_version=version, context_id=report["context_id"],
         after={"passed": report["passed"], "holdout_start": report["holdout_start"],
                "holdout_end": report["holdout_end"]},
-        note="force 覆盖了已有评估记录" if (existing and force) else None,
     )
     return payload
 

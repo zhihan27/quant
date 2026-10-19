@@ -13,9 +13,10 @@ import pandas as pd
 from config import settings
 from services.feature_engineering import FEATURE_COLUMNS, add_forward_returns, normalize_cross_section
 from services.ml_pipeline import (
-    TARGET_KIND, _fold_row_positions, _memory_metrics, _prepare_validation_data, _validation_cache_key,
+    HORIZONS, MODEL_NAMES, TARGET_KIND, _fold_row_positions, _memory_metrics, _prepare_validation_data,
+    _select_fold_features, _validation_cache_key,
     evaluate_oos, fit_panel_model,
-    load_context, models_for_stock, normalize_predictions, predict_panel, save_context, unavailable_model,
+    load_context, models_for_stock, normalize_predictions, predict_panel, save_context, train_market_context, unavailable_model,
 )
 from services.stock_scoring import analyze_stock, walk_forward_predictions
 
@@ -53,24 +54,50 @@ class _ExactModel:
 class LabelAndNormalizationTests(unittest.TestCase):
     """验证市场上涨时落后股票仍产生负超额标签。"""
 
+    def test_relative_strength_is_not_a_duplicate_model_input(self):
+        self.assertNotIn("relative_strength_20", FEATURE_COLUMNS)
+
+    def test_empty_vetoed_panel_does_not_train_or_persist(self):
+        panel = pd.DataFrame(columns=["date", "code", "close"])
+        panel.attrs.update({
+            "health_veto": {"status": "财务健康否决已排除全部候选"},
+            "model_feature_columns": [],
+        })
+        panel_output = {}
+        with patch("services.ml_pipeline.build_market_panel", return_value=panel), \
+                patch("services.ml_pipeline.save_context") as save_context_mock:
+            context = train_market_context({}, pd.DataFrame(), persist=True, panel_out=panel_output)
+        self.assertIs(panel_output["panel"], panel)
+        self.assertIn("未训练或发布模型", context["status"])
+        self.assertEqual(set(context["models"]), set(HORIZONS))
+        self.assertTrue(all(len(context["models"][horizon]) == len(MODEL_NAMES) for horizon in HORIZONS))
+        save_context_mock.assert_not_called()
+
     def test_labels_are_benchmark_excess_and_last_rows_are_unknown(self):
         dates = pd.bdate_range("2024-01-01", periods=20)
-        stock = pd.DataFrame({"date": dates, "close": 100 * 1.01 ** np.arange(20)})
-        benchmark = pd.DataFrame({"date": dates, "close": 100 * 1.02 ** np.arange(20)})
+        stock = pd.DataFrame({
+            "date": dates, "open": 100 * 1.005 ** np.arange(20), "close": 100 * 1.01 ** np.arange(20),
+        })
+        benchmark = pd.DataFrame({
+            "date": dates, "open": 100 * 1.002 ** np.arange(20), "close": 100 * 1.02 ** np.arange(20),
+        })
         result = add_forward_returns(stock, (5,), benchmark)
-        self.assertAlmostEqual(result.loc[0, "target_5"], 1.01**5 - 1.02**5)
-        self.assertLess(result.loc[0, "target_5"], 0)
-        self.assertTrue(result["target_5"].tail(5).isna().all())
-        self.assertEqual(result.loc[0, "label_end_5"], dates[5])
+        self.assertAlmostEqual(result.loc[0, "target_5"], 1.005**5 - 1.002**5)
+        self.assertGreater(result.loc[0, "target_5"], 0)
+        self.assertTrue(result["target_5"].tail(6).isna().all())
+        self.assertEqual(result.loc[0, "label_end_5"], dates[6])
+        self.assertAlmostEqual(result.loc[0, "research_target_5"], 1.01**5 - 1.02**5)
+        self.assertEqual(result.loc[0, "research_label_end_5"], dates[5])
         self.assertTrue(add_forward_returns(stock, (5,))["target_5"].isna().all())
 
-    def test_missing_endpoint_never_shifts_stock_horizon(self):
+    def test_missing_intermediate_open_refuses_execution_label(self):
         dates = pd.bdate_range("2024-01-01", periods=15)
-        benchmark = pd.DataFrame({"date": dates, "close": 100.0})
-        stock = pd.DataFrame({"date": dates, "close": np.arange(15) + 100.0}).drop(index=5)
+        benchmark = pd.DataFrame({"date": dates, "open": 100.0, "close": 100.0})
+        stock = pd.DataFrame({"date": dates, "open": np.arange(15) + 100.0,
+                              "close": np.arange(15) + 100.0}).drop(index=5)
         result = add_forward_returns(stock, (5,), benchmark)
         self.assertTrue(pd.isna(result.loc[0, "target_5"]))
-        self.assertEqual(result.loc[1, "label_end_5"], dates[6])
+        self.assertTrue(pd.isna(result.loc[0, "label_end_5"]))
 
     def test_feature_zscore_is_computed_per_date(self):
         dates = pd.bdate_range("2024-01-01", periods=2)
@@ -112,10 +139,52 @@ class PanelValidationTests(unittest.TestCase):
         frame["absolute_return"] = frame["actual"] + 0.01
         return frame
 
+    def test_later_feature_is_selected_only_after_training_coverage_is_sufficient(self):
+        dates = pd.bdate_range("2024-01-01", periods=45)
+        frame = pd.DataFrame({
+            "date": np.repeat(dates, 10),
+            "code": np.tile([str(stock).zfill(6) for stock in range(10)], len(dates)),
+            "xs_base": np.tile(np.arange(10, dtype=float), len(dates)),
+            "xs_late_chip": np.nan,
+        })
+        frame.loc[frame["date"].ge(dates[20]), "xs_late_chip"] = np.tile(
+            np.arange(10, dtype=float), int(frame["date"].ge(dates[20]).sum() / 10),
+        )
+        feature_pool = ["xs_base", "xs_late_chip"]
+        early_training = frame.loc[frame["date"].le(dates[19])]
+        later_training = frame.loc[frame["date"].le(dates[44])]
+
+        self.assertEqual(_select_fold_features(early_training, feature_pool, 8), ["xs_base"])
+        self.assertEqual(
+            _select_fold_features(later_training, feature_pool, 8),
+            ["xs_base", "xs_late_chip"],
+        )
+
+    def test_walk_forward_folds_admit_late_feature_after_mature_history_accumulates(self):
+        panel = _panel(days=420, stocks=10)
+        dates = pd.DatetimeIndex(panel["date"].drop_duplicates())
+        panel["xs_late_chip"] = np.where(
+            panel["date"].ge(dates[180]), panel["xs_momentum_5"] * 2, np.nan,
+        )
+        panel.attrs["model_feature_columns"] = [
+            *(f"xs_{column}" for column in FEATURE_COLUMNS), "xs_late_chip",
+        ]
+
+        result = fit_panel_model(
+            panel, "LightGBM", 20, lambda _: _ExactModel(), objective="regression",
+        )
+        folds = result["oos_metrics"]["folds"]
+
+        self.assertNotIn("xs_late_chip", folds[0]["feature_columns"])
+        self.assertTrue(any("xs_late_chip" in fold["feature_columns"] for fold in folds[1:]))
+        self.assertIn("xs_late_chip", result["features_used"])
+
     def test_rank_ic_and_top_bottom_accept_correct_order(self):
         result = evaluate_oos(self.evaluation_frame(), 20, 10)
         self.assertTrue(result["validated"])
         self.assertGreater(result["rank_ic"], 0.9)
+        self.assertIsNotNone(result["ndcg_at_20"])
+        self.assertEqual(result["ndcg_at_20_days"], result["ndcg_days"])
         self.assertGreater(result["top_excess_return"], 0)
         self.assertLess(result["bottom_excess_return"], 0)
 

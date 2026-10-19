@@ -10,7 +10,7 @@ import pandas as pd
 from services.chip_factors import CHIP_FACTOR_COLUMNS
 from services.feature_engineering import FEATURE_COLUMNS
 from services.financial_factors import FINANCIAL_FACTOR_COLUMNS
-from services.ml_pipeline import build_market_panel
+from services.ml_pipeline import _select_fold_features, build_market_panel
 
 # 截面中性化要求单日至少 20 只股票，否则每日截面会被整体跳过、退化成 Z 分数。
 STOCKS = 24
@@ -33,24 +33,24 @@ def _histories() -> dict[str, pd.DataFrame]:
         frame["low"] = frame["close"] * 0.99
         frame["amount"] = frame["close"] * frame["volume"]
         frame["turnover_rate"] = 1.0
+        frame.attrs["turnover_rate_unit"] = "percent"
         histories[str(stock).zfill(6)] = frame
     return histories
 
 
-def _exposures(codes: list[str]) -> pd.DataFrame:
-    """逐股一行：当前价与流通市值用于回推历史市值，行业用于哑变量哑编码。
+def _exposures(codes: list[str], dates: pd.DatetimeIndex) -> pd.DataFrame:
+    """逐股逐日的点时流通市值和行业，用于验证中性化整段历史。
 
     行业分成 3 组、每组 8 只，满足中性化对单一行业最少 2 只股票的要求。
     """
-    return pd.DataFrame(
-        [
-            {
-                "code": code, "price": 10.0, "market_cap_float": 1e9 * (position + 1),
-                "industry": f"行业{position % 3}",
-            }
-            for position, code in enumerate(codes)
-        ]
-    )
+    return pd.DataFrame([
+        {
+            "date": date, "code": code, "price": 10.0,
+            "market_cap_float": 1e9 * (position + 1), "industry": f"行业{position % 3}",
+        }
+        for position, code in enumerate(codes)
+        for date in dates
+    ])
 
 
 def _financial_factors(codes: list[str], vetoed: set[str]) -> pd.DataFrame:
@@ -108,7 +108,8 @@ class ExtraFactorIntegrationTests(unittest.TestCase):
 
     def test_extra_factors_are_neutralized_alongside_base_factors(self) -> None:
         """基础因子做了中性化时新增因子不能只做 Z 分数，否则会把市值与行业暴露重新带进模型。"""
-        exposures = _exposures(sorted(self.histories))
+        dates = pd.DatetimeIndex(self.histories[sorted(self.histories)[0]]["date"])
+        exposures = _exposures(sorted(self.histories), dates)
         panel = build_market_panel(
             self.histories, self.benchmark, exposures=exposures, extra_factors={"chip": self.histories}
         )
@@ -120,8 +121,8 @@ class ExtraFactorIntegrationTests(unittest.TestCase):
         self.assertIn("neutralization", panel.attrs["extra_factors"])
         self.assertGreater(panel.attrs["extra_factors"]["neutralization"]["coverage"], 0.5)
 
-    def test_family_below_coverage_is_excluded_from_features(self) -> None:
-        """日内因子只覆盖最后一天时整族不达标，模型仍只用基础因子。"""
+    def test_late_family_coverage_is_selected_inside_each_training_fold(self) -> None:
+        """日内族仅在末日有值时保留为候选，但不能进入此前的训练折。"""
         dates = pd.bdate_range("2023-01-02", periods=DAYS)
         intraday = pd.DataFrame(
             {
@@ -137,8 +138,12 @@ class ExtraFactorIntegrationTests(unittest.TestCase):
             self.histories, self.benchmark, extra_factors={"intraday": intraday}
         )
         features = panel.attrs["model_feature_columns"]
-        self.assertEqual(features, [f"xs_{column}" for column in FEATURE_COLUMNS])
+        self.assertEqual(features[:len(FEATURE_COLUMNS)], [f"xs_{column}" for column in FEATURE_COLUMNS])
+        self.assertTrue(all(f"xs_{column}" in features for column in intraday.columns[2:]))
         self.assertFalse(panel.attrs["extra_factors"]["decisions"]["intraday"]["accepted"])
+        early = panel.loc[panel["date"] < dates[-1]]
+        selected = _select_fold_features(early, features, 8)
+        self.assertFalse(any(name.startswith("xs_intraday_") for name in selected))
 
     def test_missing_financial_data_never_vetoes(self) -> None:
         """没有 PIT 财务面板时一股都不否决：未知不等于不健康。"""
