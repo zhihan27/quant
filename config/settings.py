@@ -81,8 +81,7 @@ BOARD_PREFIXES = {
 # 比股票池过滤用的具体号段更宽，故不并入 BOARD_PREFIXES。
 BSE_LIMIT_PREFIXES = ("4", "8", "92")
 MARKET_INDEX_CODE = "000300"
-# 基础输入因子集合发生变化，避免继续加载含重复动量特征的旧模型。
-MODEL_VERSION = "2.6.0"
+MODEL_VERSION = "2.4.0"
 NDCG_PROTOCOL = "random-permutation-expectation-v2"
 
 # 选股页统一请求市值与估值候选；通用训练入口保持关闭，生产入模仍须通过独立验收。
