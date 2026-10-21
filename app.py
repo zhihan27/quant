@@ -6,6 +6,7 @@ import streamlit as st
 
 from config import settings
 from services.auth_ui import current_account, require_login
+from services.runtime import get_monitor
 from services.ui_helpers import apply_page_style
 
 st.set_page_config(page_title="A股量化研究", page_icon="📈", layout="wide", initial_sidebar_state="expanded")
@@ -26,6 +27,7 @@ navigation = [
     st.Page(project / "pages" / "2_量化选股.py", title="量化选股", icon=":material/filter_alt:", url_path="selection"),
     st.Page(project / "pages" / "3_自选与持仓.py", title="自选与持仓", icon=":material/account_balance_wallet:", url_path="portfolio"),
     st.Page(project / "pages" / "4_盘中监控.py", title="盘中监控", icon=":material/monitoring:", url_path="monitor"),
+    st.Page(project / "pages" / "7_短线研究.py", title="短线研究", icon=":material/trending_up:", url_path="short-term"),
 ]
 if account and account["is_admin"]:
     navigation.append(
@@ -36,6 +38,7 @@ if account and account["is_admin"]:
     )
 page = st.navigation(navigation, position="sidebar" if account else "hidden")
 require_login()
+get_monitor()
 
 # 模型目标升级后清除会话中的旧结果，避免显示旧版绝对收益预测。
 if st.session_state.get("result_model_version") != settings.MODEL_VERSION:

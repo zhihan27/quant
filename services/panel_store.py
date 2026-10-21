@@ -217,6 +217,43 @@ class PanelStore:
     def save_universe_status(self, frame: pd.DataFrame) -> Path:
         return _atomic_write(frame, self.universe_dir / "status.parquet")
 
+    def save_point_in_time_snapshot(self, name: str, frame: pd.DataFrame) -> Path:
+        """按点时主数据类型保存不可变快照，不覆盖既有观察。"""
+        required_columns = {
+            "membership": {"code", "date", "available_at", "is_member", "source"},
+            "security_status": {
+                "code", "date", "available_at", "is_listed", "is_st",
+                "is_suspended", "is_limit_up", "is_limit_down", "source",
+            },
+        }
+        if name not in required_columns:
+            raise ValueError("点时快照类型仅支持 membership 或 security_status。")
+        missing = required_columns[name].difference(frame.columns)
+        if missing:
+            raise ValueError(f"点时快照缺少字段：{'、'.join(sorted(missing))}。")
+        if frame.empty:
+            raise ValueError("点时快照不能为空。")
+        snapshot_id = uuid4().hex
+        path = self.universe_dir / "point_in_time" / name / f"{snapshot_id}.parquet"
+        return _atomic_write(frame, path)
+
+    def load_point_in_time_history(self, name: str) -> pd.DataFrame | None:
+        """读取不可变点时快照集合；跳过损坏文件并记录来源文件名。"""
+        if name not in ("membership", "security_status"):
+            raise ValueError("点时快照类型仅支持 membership 或 security_status。")
+        directory = self.universe_dir / "point_in_time" / name
+        if not directory.is_dir():
+            return None
+        frames = []
+        for path in sorted(directory.glob("*.parquet")):
+            try:
+                frame = pd.read_parquet(path)
+                frame["snapshot_file"] = path.name
+                frames.append(frame)
+            except (OSError, ValueError) as exc:
+                LOGGER.warning("点时快照读取失败 path=%s detail=%s", path.name, exc)
+        return pd.concat(frames, ignore_index=True) if frames else None
+
     # ---------------------------------------------------------------- DuckDB
     @staticmethod
     def duckdb_available() -> bool:

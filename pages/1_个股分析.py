@@ -10,6 +10,7 @@ import pandas as pd
 import streamlit as st
 
 from config import settings
+from config.short_term import SHORT_TERM_STRATEGY_ID
 from services.backtest import run_backtest, save_backtest_run
 from services.database import DatabaseError
 from services.market_data import MarketDataError, completed_daily_history, history_is_current
@@ -114,6 +115,14 @@ if st.query_params.get("code") and st.session_state.get("query_code") != st.quer
     st.session_state["selected_code"] = st.query_params.get("code")
     st.session_state["search_results"] = pd.DataFrame()
     st.session_state.pop("match_selection", None)
+
+if st.query_params.get("strategy_id") == SHORT_TERM_STRATEGY_ID:
+    horizon = st.query_params.get("horizon", "未知")
+    run_id = st.query_params.get("run_id", "未知")
+    st.info(
+        f"短线研究上下文：H={horizon} 个交易间隔 · 运行 {str(run_id)[:12]}。"
+        "本页原有中期模型不会因此切换；请按短线研究页的冻结排名与状态解释结果。"
+    )
 
 with st.form("stock_search_form"):
     search_columns = st.columns([5, 1, 1], vertical_alignment="bottom")

@@ -106,6 +106,7 @@ class IntradayDataService:
             "code": code, "name": parts[0], "price": price, "previous_close": previous,
             "change_pct": (price / previous - 1) * 100 if previous and previous > 0 else None,
             "open": _number(parts[1]), "high": _number(parts[4]), "low": _number(parts[5]),
+            "best_bid": _number(parts[6]), "best_ask": _number(parts[7]),
             "volume_lots": (_number(parts[8]) or 0) / 100, "amount_yuan": _number(parts[9]),
             "source": "新浪财经行情快照", "quote_time": timestamp.isoformat(), "fetched_at": now.isoformat(),
             "quote_valid": 0 <= age <= 20,
@@ -131,6 +132,7 @@ class IntradayDataService:
         return {
             "code": code, "name": data.get("f58", code), "price": price / scale, "previous_close": previous,
             "change_pct": ((price / scale) / previous - 1) * 100 if previous else None,
+            "best_bid": None, "best_ask": None,
             "volume_lots": _number(data.get("f47")), "amount_yuan": _number(data.get("f48")),
             "source": "东方财富行情快照", "quote_time": timestamp.isoformat() if timestamp else None,
             "fetched_at": now.isoformat(), "quote_valid": 0 <= age <= 20,
